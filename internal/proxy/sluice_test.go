@@ -153,6 +153,8 @@ func TestProxyGeneratedResponsesCarryVia(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/sluice/unknown", nil),
 		httptest.NewRequest(http.MethodConnect, "/api/v10/gateway", nil),
 		httptest.NewRequest(http.MethodGet, "/api/v10/channels/%2e%2e/messages", nil),
+		httptest.NewRequest(http.MethodGet, "/sluice/healthz", nil),
+		httptest.NewRequest(http.MethodGet, "/sluice/health/upstream", nil),
 	} {
 		recorder := httptest.NewRecorder()
 		proxy.ServeHTTP(recorder, rejected)
@@ -226,6 +228,7 @@ func TestPathTraversalIsRejectedBeforeRouting(t *testing.T) {
 		"/api/v10/channels/1/../../users/@me",
 		"/api/v10/channels/%2e%2e/users/@me",
 		"/api/v10/channels/a%2Fb/messages",
+		"/api/v10/webhooks/123456789012345678/token%3Fwait=true",
 	} {
 		if response := serve(proxy, http.MethodGet, path, "", nil); response.Code != http.StatusBadRequest {
 			t.Errorf("%s: status %d, want 400", path, response.Code)
@@ -233,6 +236,80 @@ func TestPathTraversalIsRejectedBeforeRouting(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("%d rejected paths reached Discord", calls.Load())
+	}
+}
+
+func TestRepeatedSlashesRouteLikeDiscord(t *testing.T) {
+	var calls atomic.Int64
+	var forwarded atomic.Value
+	proxy := newTestProxy(t, testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		forwarded.Store(request.URL.EscapedPath())
+		return jsonResponse(request, http.StatusNotFound, `{"message": "Unknown Webhook", "code": 10015}`), nil
+	})))
+	for range 2 {
+		if response := serve(proxy, http.MethodPost, "/api//v10/webhooks/123456789012345678/token", "", nil); response.Code != http.StatusNotFound {
+			t.Fatalf("status %d, want 404", response.Code)
+		}
+	}
+	if got := forwarded.Load(); got != "/api/v10/webhooks/123456789012345678/token" {
+		t.Fatalf("Discord was sent %v", got)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("Discord was called %d times; the doubled slash hid the webhook from its guard", calls.Load())
+	}
+}
+
+func TestQueuedRequestsToADeletedWebhookShortCircuit(t *testing.T) {
+	var calls atomic.Int64
+	proxy := newTestProxy(t, testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		return jsonResponse(request, http.StatusNotFound, `{"message": "Unknown Webhook", "code": 10015}`), nil
+	})))
+	statuses := make(chan int, 8)
+	var senders sync.WaitGroup
+	for range cap(statuses) {
+		senders.Add(1)
+		go func() {
+			defer senders.Done()
+			statuses <- serve(proxy, http.MethodPost, "/api/v10/webhooks/123456789012345678/token", "", nil).Code
+		}()
+	}
+	senders.Wait()
+	close(statuses)
+	for status := range statuses {
+		if status != http.StatusNotFound {
+			t.Fatalf("status %d, want 404", status)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("Discord was called %d times for one deleted webhook", calls.Load())
+	}
+}
+
+func TestCredentialStateOnlyFollowsCredentialRoutes(t *testing.T) {
+	proxy := newTestProxy(t, testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(request.URL.Path, "/users/@me") {
+			return jsonResponse(request, http.StatusUnauthorized, `{"message": "401: Unauthorized", "code": 0}`), nil
+		}
+		return jsonResponse(request, http.StatusOK, `{}`), nil
+	})))
+	webhook, authorization := "/api/v10/webhooks/123456789012345678/token", "Bot "+fakeBotToken
+	state, err := proxy.client(identify(authorization))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.end()
+
+	if response := serve(proxy, http.MethodPost, webhook, authorization, nil); response.Code != http.StatusOK || state.metricsLabel() != "Unverified" {
+		t.Fatalf("a webhook call vouched for the bot token: status %d, label %q", response.Code, state.metricsLabel())
+	}
+	if response := serve(proxy, http.MethodGet, "/api/v10/users/@me", authorization, nil); response.Code != http.StatusUnauthorized {
+		t.Fatalf("users/@me answered %d, want 401", response.Code)
+	}
+	if response := serve(proxy, http.MethodPost, webhook, authorization, nil); response.Code != http.StatusOK {
+		t.Fatalf("an invalid bot token blocked a webhook call Discord authenticates by its path token: status %d", response.Code)
 	}
 }
 

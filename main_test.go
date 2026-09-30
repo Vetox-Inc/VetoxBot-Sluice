@@ -2,8 +2,25 @@ package main
 
 import (
 	"log/slog"
+	"os"
+	"strings"
 	"testing"
 )
+
+func TestMalformedDotEnvDoesNotEchoItsContents(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const secret = "not-a-real-cluster-secret"
+	if err := os.WriteFile(".env", []byte("BROKEN LINE\nCLUSTER_SECRET="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := loadDotEnv()
+	if err == nil {
+		t.Fatal("a malformed .env was accepted")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the error echoes the file: %v", err)
+	}
+}
 
 func TestParseLogLevelAcceptsNirnLevelNames(t *testing.T) {
 	for value, want := range map[string]slog.Level{

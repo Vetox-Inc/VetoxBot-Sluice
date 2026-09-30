@@ -42,7 +42,7 @@ similar base-URL option; otherwise, remap the host.
 
 Sluice forwards the method, path, query, headers and body as sent. Like any reverse proxy, it rewrites `Host`, drops
 hop-by-hop, `Forwarded` and `X-Forwarded-*` headers, and supplies a `User-Agent` when the client sends none. A path
-without the `/api` prefix is forwarded under it.
+without the `/api` prefix is forwarded under it, and repeated slashes are collapsed, as Discord does.
 
 ## Security
 
@@ -91,9 +91,9 @@ handle 429s.
 - **Invalid-request budget.** Sluice counts 401, 403 and non-shared 429 responses over a rolling 10 minutes and stops
   sending new requests at 9,500, answering `503` until old responses age out. In a cluster, each node gets an equal
   share: 9,500 divided by `CLUSTER_MAX_NODES`.
-- **Invalid tokens.** After a 401 on a route the token authenticates, later requests with that token get a 401 from
-  Sluice without reaching Discord. Webhook-token and interaction routes never mark a token invalid.
-  `DISABLE_401_LOCK=true` turns this off.
+- **Invalid tokens.** After a 401 on a route the token authenticates, later requests on such routes get a 401 from
+  Sluice without reaching Discord. Webhook-token and interaction calls, which Discord authenticates by the token in
+  their path, neither mark a token invalid nor are refused because of one. `DISABLE_401_LOCK=true` turns this off.
 - **Deleted webhooks.** Once Discord reports a webhook as unknown (code 10015) or its token as invalid (code 50027),
   Sluice answers further calls to that webhook itself for an hour. Other 404s pass through.
 - **Cloudflare blocks.** Discord's own responses carry `Via: 1.1 google`, so a 429 or 403 without it came from
@@ -136,7 +136,7 @@ path) also carry `X-Sluice-Proxy-Error: true`.
 | `408` | A Discord attempt exceeded `REQUEST_TIMEOUT`, or the request's `QUEUE_TIMEOUT` expired. |
 | `502` | Discord could not be reached or returned an unusable response. |
 | `503` | Sluice could not safely take the request: a full queue, exhausted capacity or invalid-request budget, an unavailable peer, or shutdown. Carries `Retry-After: 1`. |
-| `400` | `CONNECT`, protocol upgrades, and paths containing dot segments or encoded separators. |
+| `400` | `CONNECT`, protocol upgrades, and paths containing dot segments, encoded separators or an encoded `?`. |
 
 If a deadline expires after Discord's response headers were forwarded, Sluice aborts the stream, because the status
 can no longer change.
@@ -178,7 +178,7 @@ and alerts.
 | `sluice_requests_routed_sent`, `_received`, `_error` | none | Requests forwarded between cluster nodes |
 
 `clientId` is a bot's user ID once Discord has accepted its token, and `Unverified` before that. Bearer and
-unauthenticated traffic show as `Bearer` and `NoAuth`, and bots past the first 1,024 share `Other`. Route labels are
+unauthenticated traffic show as `Bearer` and `NoAuth`, and once the label has 1,024 values, further bots share `Other`. Route labels are
 normalised and capped, so cardinality stays bounded. [grafana/sluice-dashboard.json](grafana/sluice-dashboard.json) is
 an importable Grafana dashboard for either metric prefix.
 

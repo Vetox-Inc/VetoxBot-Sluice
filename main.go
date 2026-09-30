@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -203,10 +204,17 @@ func run() error {
 }
 
 func loadDotEnv() error {
-	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+	err := godotenv.Load()
+	var pathError *fs.PathError
+	switch {
+	case err == nil || errors.Is(err, os.ErrNotExist):
+		return nil
+	case errors.As(err, &pathError):
 		return fmt.Errorf("load .env: %w", err)
+	default:
+		// The parser's message quotes the rest of the file, secrets included.
+		return errors.New("load .env: the file is malformed; check its quoting and variable names")
 	}
-	return nil
 }
 
 func newProxyServer(address string, handler http.Handler, requestLifetime time.Duration) *http.Server {

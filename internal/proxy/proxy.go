@@ -259,6 +259,7 @@ func (p *Proxy) upstreamProblem(now time.Time) string {
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	collapseSlashes(request.URL)
 	switch request.URL.Path {
 	case "/sluice/healthz", "/nirn/healthz":
 		select {
@@ -268,6 +269,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			if p.clusterOverCapacity.Load() {
 				writeUnavailable(writer, "cluster exceeds CLUSTER_MAX_NODES")
 			} else {
+				markGenerated(writer.Header())
 				writer.WriteHeader(http.StatusOK)
 			}
 		}
@@ -276,6 +278,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		if problem := p.upstreamProblem(time.Now()); problem != "" {
 			writeUnavailable(writer, problem)
 		} else {
+			markGenerated(writer.Header())
 			writer.WriteHeader(http.StatusOK)
 		}
 		return
@@ -413,10 +416,14 @@ func writeUnavailable(writer http.ResponseWriter, message string) {
 func writeProxyError(writer http.ResponseWriter, message string, status int) {
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.Header().Set(proxyErrorHeader, "true")
-	writer.Header().Set("Generated-By-Proxy", "true")
-	writer.Header().Set("Via", sluiceVia)
+	markGenerated(writer.Header())
 	writer.WriteHeader(status)
 	_, _ = writer.Write([]byte(message + "\n"))
+}
+
+func markGenerated(header http.Header) {
+	header.Set("Generated-By-Proxy", "true")
+	header.Set("Via", sluiceVia)
 }
 
 func (p *Proxy) sweepLoop() {

@@ -40,7 +40,7 @@ Disables HTTP/2 on outbound connections when `true`. It does not affect the inbo
 
 ### `DISCORD_API_URL`
 
-Base URL requests are forwarded to. Default: `https://discord.com`. Point it at a mock or staging server for testing. It must use `https` unless the host is loopback, and must not include a path. Never use `discordapp.com`, which rejects API v10.
+Base URL requests are forwarded to. Default: `https://discord.com`. Point it at a mock or staging server for testing. It must use `https` unless the host is loopback, and must not include a path. Never use `discordapp.com`, which rejects API v10. A mock must send `Via` on its 429 and 403 responses, or set `CLOUDFLARE_BAN_DETECTION=false`, because Sluice reads a 429 or 403 without `Via` as a Cloudflare block and pauses all traffic.
 
 ## Scheduling and retries
 
@@ -119,7 +119,7 @@ Limits must be positive integers. A bot-ID override takes precedence over a fing
 
 ### `DISABLE_401_LOCK`
 
-When `false`, the first ordinary authenticated 401 marks that credential invalid and later requests fail locally with Discord-shaped 401 responses. Interaction endpoints and webhook-token routes are excluded, because their 401s judge the token in the path rather than the credential. Default: `false`.
+When `false`, the first ordinary authenticated 401 marks that credential invalid and later requests fail locally with Discord-shaped 401 responses. Interaction endpoints and webhook-token routes are excluded both ways: their 401s judge the token in the path rather than the credential, so they never mark it invalid and are never refused because of it. Default: `false`.
 
 Set this to `true` only if credentials can become valid again without changing their token. Cached validity is reclaimed after the credential has been inactive and unblocked for more than 10 minutes.
 
@@ -133,7 +133,7 @@ When `true`, a 429 or 403 without Discord's `Via` header, meaning Cloudflare ans
 
 Enables Prometheus metrics and serves them on `/metrics`. When `false`, Sluice disables that listener and skips the request histogram, active-request gauge, and cluster-routing observations. Error-level logs may still increment the process-local error counter. Default: `true`.
 
-`sluice_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its `clientId` label is the bot's user ID once Discord has accepted that token, `Unverified` until then, and `Bearer` or `NoAuth` for other traffic; after 1,024 distinct bots, further ones share `Other`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
+`sluice_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its `clientId` label is the bot's user ID once Discord has accepted that token, `Unverified` until then, and `Bearer` or `NoAuth` for other traffic; once the label has 1,024 values, further bots share `Other`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
 
 `sluice_failures_total{reason}` counts bounded proxy failure reasons, including `queue_timeout`, `upstream_timeout`, `upstream_error`, `peer_error`, and `rate_limit_deadline`.
 

@@ -101,13 +101,23 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		return nil, fmt.Errorf("missing request scheduler metadata")
 	}
 	queuedAt := time.Now()
-	if metadata.webhookKey != "" {
-		if failure, blocked := t.proxy.webhooks.lookup(metadata.webhookKey, queuedAt); blocked {
-			if t.proxy.config.EnableMetrics {
-				WebhookShortCircuits.Inc()
-			}
-			return failure.response(request), nil
+	// Checked again before every attempt, so requests queued behind the one that found the
+	// webhook gone never reach Discord either.
+	shortCircuitWebhook := func(now time.Time) *http.Response {
+		if metadata.webhookKey == "" {
+			return nil
 		}
+		failure, blocked := t.proxy.webhooks.lookup(metadata.webhookKey, now)
+		if !blocked {
+			return nil
+		}
+		if t.proxy.config.EnableMetrics {
+			WebhookShortCircuits.Inc()
+		}
+		return failure.response(request)
+	}
+	if response := shortCircuitWebhook(queuedAt); response != nil {
+		return response, nil
 	}
 	if pause := t.proxy.cloudflare.retryAfter(queuedAt); pause > 0 {
 		return cloudflarePauseResponse(request, pause), nil
@@ -144,7 +154,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	}
 
 	validationHeld := false
-	if !metadata.interaction && metadata.state.validity.Load() == clientUnknown {
+	if metadata.credentialScoped && metadata.state.validity.Load() == clientUnknown {
 		if err := metadata.state.validation.acquire(queueContext); err != nil {
 			return nil, contextCauseOrError(queueContext, err)
 		}
@@ -160,7 +170,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 	}()
 
-	if metadata.state.validity.Load() == clientInvalid {
+	if metadata.credentialScoped && metadata.state.validity.Load() == clientInvalid {
 		return unauthorizedResponse(request), nil
 	}
 
@@ -206,6 +216,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 		}
 
+		if response := shortCircuitWebhook(time.Now()); response != nil {
+			return response, nil
+		}
 		if pause := t.proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
 			return cloudflarePauseResponse(request, pause), nil
 		}
@@ -273,12 +286,10 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			t.proxy.config.Disable401Lock,
 		)
 		if validationHeld {
-			// A 401 on a webhook-token route judges that token, not the credential being validated.
-			switch {
-			case response.StatusCode != http.StatusUnauthorized || metadata.credentialScoped && t.proxy.config.Disable401Lock:
-				metadata.state.validity.Store(clientValid)
-			case metadata.credentialScoped:
+			if response.StatusCode == http.StatusUnauthorized && !t.proxy.config.Disable401Lock {
 				metadata.state.validity.Store(clientInvalid)
+			} else {
+				metadata.state.validity.Store(clientValid)
 			}
 			metadata.state.validation.release()
 			validationHeld = false

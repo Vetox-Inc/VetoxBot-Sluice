@@ -248,12 +248,12 @@ func isInteractionEndpoint(path string) bool {
 	return len(parts) >= 3 && parts[0] == majorWebhooks && strings.HasPrefix(parts[2], interactionTokenPrefix)
 }
 
-// isCleanDiscordPath rejects dot segments and encoded separators, which could make Discord
-// resolve a different route from the one this proxy rate-limited.
+// isCleanDiscordPath rejects dot segments, encoded separators and encoded question marks, which
+// could make Discord resolve a different route from the one this proxy rate-limited.
 func isCleanDiscordPath(u *url.URL) bool {
 	for _, segment := range strings.Split(u.EscapedPath(), "/") {
 		decoded, err := url.PathUnescape(segment)
-		if err != nil || decoded == "." || decoded == ".." || strings.ContainsAny(decoded, "/\\") {
+		if err != nil || decoded == "." || decoded == ".." || strings.ContainsAny(decoded, "/\\?") {
 			return false
 		}
 	}
@@ -268,6 +268,17 @@ func ensureAPIPrefix(u *url.URL) {
 	u.Path = "/api" + u.Path
 	if u.RawPath != "" {
 		u.RawPath = "/api" + u.RawPath
+	}
+}
+
+// collapseSlashes merges repeated slashes as Discord does, so a client base URL ending in "/"
+// is classified as the route Discord will serve.
+func collapseSlashes(u *url.URL) {
+	for strings.Contains(u.Path, "//") {
+		u.Path = strings.ReplaceAll(u.Path, "//", "/")
+	}
+	for strings.Contains(u.RawPath, "//") {
+		u.RawPath = strings.ReplaceAll(u.RawPath, "//", "/")
 	}
 }
 

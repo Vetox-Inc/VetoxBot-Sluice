@@ -41,7 +41,8 @@ ignored, with a warning at startup.
 
 These behaviours are new:
 
-- A 401 marks a token invalid only on routes that token authenticates. Webhook-token and interaction routes never do.
+- A bot token is judged only by routes it authenticates: webhook-token and interaction calls neither mark it invalid nor
+  are refused because of it.
 - Calls to a webhook Discord reported as unknown (code 10015) or invalid (code 50027) are answered by Sluice for an
   hour.
 - A 429 or 403 without Discord's `Via` header pauses all outbound traffic for its `Retry-After`. Set
@@ -84,5 +85,6 @@ Sluice's engine is Melonly's rewrite, so its scheduling, settings, clustering an
 - Metrics default to the `sluice_` prefix; `METRICS_NAMESPACE=nirn_proxy` restores yours. `clientId` holds bot user IDs
   instead of `Bot`.
 - `Forwarded` and `X-Forwarded-*` headers are no longer sent to Discord.
+- Repeated slashes in a path are collapsed as Discord does, and paths with an encoded `?` are rejected.
 - New: the 401 scope rule, webhook fail-fast, Cloudflare-block detection, `/sluice/health/upstream`, `DISCORD_API_URL`,
   `CLUSTER_ADVERTISE_ADDR`, `LOG_FORMAT`, `METRICS_NAMESPACE`, and the metrics listed above.

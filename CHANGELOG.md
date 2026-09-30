@@ -26,7 +26,8 @@ The first release as Sluice, continuing nirn-proxy 1.3.3 on Melonly-Moderation's
 - Renamed from nirn-proxy. Metrics default to the `sluice_` prefix, and `/sluice/healthz` joins `/nirn/healthz`.
 - Logging uses Go's `log/slog`, redacts credentials from every field, and can write JSON.
 - An upstream timeout answers `408`, as nirn-proxy documented.
-- A 401 on a webhook-token or interaction route no longer marks a bot's token invalid.
+- A bot token is judged only by routes it authenticates: webhook-token and interaction calls neither mark it valid or
+  invalid nor are refused because of it.
 - The `clientId` metric label holds a bot's user ID once Discord accepts its token.
 - Every response Sluice generates carries `Via: 1.1 sluice` besides `generated-by-proxy: true`, except the
   Cloudflare-pause 429.
@@ -39,7 +40,9 @@ Compared with nirn-proxy 1.3.3:
 - Channel creation no longer shares one queue across every guild, nor `/channels/:id` across every channel.
 - Reaction paths with encoded characters such as `#` reach Discord intact.
 - The global limit is taken when a request is sent, not when it arrives.
-- `Forwarded` and `X-Forwarded-*` headers no longer reach Discord, and paths with dot segments or encoded separators
-  are rejected.
+- `Forwarded` and `X-Forwarded-*` headers no longer reach Discord, and paths with dot segments, encoded separators or an
+  encoded `?` are rejected.
+- Repeated slashes, which a base URL ending in `/` produces, are collapsed, so those requests keep their channel, guild
+  and webhook limits.
 - Non-numeric identifiers in routes such as templates and activity instances no longer create a bucket and a metric
   label each.
