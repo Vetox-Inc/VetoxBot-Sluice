@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -49,15 +50,17 @@ func main() {
 
 func printUsage() {
 	output := flag.CommandLine.Output()
-	fmt.Fprintf(output, "Sluice %s, a Discord REST rate-limit proxy.\n\nUsage: sluice [--version]\n\n", proxy.Version)
-	fmt.Fprintln(output, "Configuration comes from environment variables and an optional .env file:")
+	var usage strings.Builder
+	fmt.Fprintf(&usage, "Sluice %s, a Discord REST rate-limit proxy.\n\nUsage: sluice [--version]\n\n", proxy.Version)
+	usage.WriteString("Configuration comes from environment variables and an optional .env file:\n")
 	for _, group := range settingGroups {
-		fmt.Fprintf(output, "\n  %s\n", group.title)
+		fmt.Fprintf(&usage, "\n  %s\n", group.title)
 		for _, name := range group.names {
-			fmt.Fprintf(output, "    %s\n", name)
+			fmt.Fprintf(&usage, "    %s\n", name)
 		}
 	}
-	fmt.Fprintf(output, "\nDefaults and details: %s\n", configReferenceURL)
+	fmt.Fprintf(&usage, "\nDefaults and details: %s\n", configReferenceURL)
+	_, _ = io.WriteString(output, usage.String())
 }
 
 func run() error {

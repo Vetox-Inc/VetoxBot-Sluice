@@ -1,0 +1,37 @@
+version: 2
+project_name: sluice
+
+builds:
+  - id: sluice
+    main: .
+    binary: sluice
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/Vetox-Inc/VetoxBot-Sluice/internal/proxy.Version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64, arm]
+    goarm: ["7"]
+    ignore:
+      - { goos: darwin, goarch: arm }
+      - { goos: windows, goarch: arm }
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: sluice
+    formats: [tar.gz]
+    format_overrides:
+      - { goos: windows, formats: [zip] }
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    files: [LICENSE, README.md, CONFIG.md]
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+release:
+  github:
+    owner: Vetox-Inc
+    name: VetoxBot-Sluice

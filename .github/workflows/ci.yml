@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
 
 permissions:
@@ -9,14 +10,62 @@ permissions:
 
 jobs:
   test:
+    name: Test (Go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.26.x", "1.27.x"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
-      - run: test -z "$(gofmt -l .)"
-      - run: go mod tidy -diff
-      - run: go build ./...
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
-      - run: go test -race -count=1 -timeout=90s ./...
+      - run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+  vulnerabilities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "1.27.x"
+
+  package:
+    name: Build and pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+      - uses: anchore/sbom-action/download-syft@v0
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node scripts/pack-test.mjs
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          build-args: VERSION=ci

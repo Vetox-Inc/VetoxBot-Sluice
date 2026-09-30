@@ -1,0 +1,42 @@
+{
+  "name": "@vetox-bot/sluice",
+  "version": "0.0.0-dev",
+  "description": "Discord REST rate-limit proxy, the maintained successor to nirn-proxy, shipped as a native binary",
+  "keywords": [
+    "discord",
+    "discord-api",
+    "rate-limit",
+    "ratelimit",
+    "proxy",
+    "rest",
+    "nirn-proxy"
+  ],
+  "license": "GPL-3.0-only",
+  "author": "Vetox Inc.",
+  "homepage": "https://github.com/Vetox-Inc/VetoxBot-Sluice#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vetox-Inc/VetoxBot-Sluice.git",
+    "directory": "npm/sluice"
+  },
+  "bugs": {
+    "url": "https://github.com/Vetox-Inc/VetoxBot-Sluice/issues"
+  },
+  "bin": {
+    "sluice": "bin/sluice.js"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "bin",
+    "index.js",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {}
+}

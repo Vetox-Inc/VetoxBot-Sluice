@@ -1,0 +1,12 @@
+version: "2"
+
+linters:
+  settings:
+    staticcheck:
+      # The defaults, plus ST1005 (error strings may start with the proper noun "Discord")
+      # and QF1006 (a style suggestion, not a defect).
+      checks: ["all", "-ST1000", "-ST1003", "-ST1005", "-ST1016", "-ST1020", "-ST1021", "-ST1022", "-QF1006"]
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck]

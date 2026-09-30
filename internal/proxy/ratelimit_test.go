@@ -91,7 +91,8 @@ func TestCooldownExtensionWakesDeadlineAwareWaiters(t *testing.T) {
 func TestInvalidRequestGuardReservesAndExpiresCapacity(t *testing.T) {
 	now := time.Now()
 	guard := newInvalidRequestGuard(2, time.Minute)
-	if !guard.reserve(now) || !guard.reserve(now) || guard.reserve(now) {
+	first, second, third := guard.reserve(now), guard.reserve(now), guard.reserve(now)
+	if !first || !second || third {
 		t.Fatal("guard did not bound concurrent potential invalid responses")
 	}
 	guard.complete(now, false)

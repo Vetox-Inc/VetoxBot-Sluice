@@ -33,13 +33,13 @@ var (
 type proxyBufferPool struct{ pool sync.Pool }
 
 func (p *proxyBufferPool) Get() []byte {
-	if buffer := p.pool.Get(); buffer != nil {
-		return buffer.([]byte)
+	if buffer, ok := p.pool.Get().(*[]byte); ok {
+		return *buffer
 	}
 	return make([]byte, 32*1024)
 }
 
-func (p *proxyBufferPool) Put(buffer []byte) { p.pool.Put(buffer) }
+func (p *proxyBufferPool) Put(buffer []byte) { p.pool.Put(&buffer) }
 
 type cleanupBody struct {
 	io.ReadCloser
