@@ -292,11 +292,11 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	defer p.inFlight.release(1)
 	if strings.HasPrefix(request.URL.Path, "/sluice/") || strings.HasPrefix(request.URL.Path, "/nirn/") {
-		http.NotFound(writer, request)
+		writeProxyError(writer, "unknown proxy endpoint", http.StatusNotFound)
 		return
 	}
 	if request.Method == http.MethodConnect || isUpgradeRequest(request) {
-		http.Error(writer, "protocol upgrades are not supported", http.StatusBadRequest)
+		writeProxyError(writer, "protocol upgrades are not supported", http.StatusBadRequest)
 		return
 	}
 	if !isCleanDiscordPath(request.URL) {

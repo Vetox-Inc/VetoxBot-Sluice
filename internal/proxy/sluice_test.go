@@ -147,6 +147,19 @@ func TestProxyGeneratedResponsesCarryVia(t *testing.T) {
 	if header := cloudflarePauseResponse(request, time.Second).Header; header.Get("Via") != "" {
 		t.Fatalf("Cloudflare pause response carries Via: %v", header)
 	}
+
+	proxy := newTestProxy(t, testConfig(nil))
+	for _, rejected := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/sluice/unknown", nil),
+		httptest.NewRequest(http.MethodConnect, "/api/v10/gateway", nil),
+		httptest.NewRequest(http.MethodGet, "/api/v10/channels/%2e%2e/messages", nil),
+	} {
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, rejected)
+		if recorder.Header().Get("Via") != sluiceVia || recorder.Header().Get("Generated-By-Proxy") != "true" {
+			t.Fatalf("%s %s answered %d with headers %v", rejected.Method, rejected.URL.Path, recorder.Code, recorder.Header())
+		}
+	}
 }
 
 func TestRequestsReachDiscordIntact(t *testing.T) {
