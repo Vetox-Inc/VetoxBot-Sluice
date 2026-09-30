@@ -76,7 +76,7 @@ func MetricsPathFromBucket(route string) string {
 
 	result := path.String()
 	if !utf8.ValidString(result) {
-		logger.Warn("Non utf-8 path detected, Prometheus only supports utf-8, invalid runes will be replaced with @ in metrics. Path: " + result)
+		logger.Warn("Non-UTF-8 path detected; invalid runes become @ in metric labels", "path", result)
 		result = strings.ToValidUTF8(result, "@")
 	}
 	return result

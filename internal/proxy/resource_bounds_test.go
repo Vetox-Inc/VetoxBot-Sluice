@@ -317,14 +317,14 @@ func TestInFlightAdmissionRejectsExcessButBypassesHealth(t *testing.T) {
 	}
 
 	healthResponse := httptest.NewRecorder()
-	proxy.ServeHTTP(healthResponse, httptest.NewRequest(http.MethodGet, "/nirn/healthz", nil))
+	proxy.ServeHTTP(healthResponse, httptest.NewRequest(http.MethodGet, "/sluice/healthz", nil))
 	if healthResponse.Code != http.StatusOK {
 		t.Fatalf("health under saturation = %d, want 200", healthResponse.Code)
 	}
 	secondResponse := httptest.NewRecorder()
 	proxy.ServeHTTP(secondResponse, httptest.NewRequest(http.MethodGet, "/api/v10/gateway", nil))
-	if secondResponse.Code != http.StatusServiceUnavailable || secondResponse.Header().Get("X-Nirn-Proxy-Error") != "true" {
-		t.Fatalf("saturated response = %d error=%q, want 503/true", secondResponse.Code, secondResponse.Header().Get("X-Nirn-Proxy-Error"))
+	if secondResponse.Code != http.StatusServiceUnavailable || secondResponse.Header().Get(proxyErrorHeader) != "true" {
+		t.Fatalf("saturated response = %d error=%q, want 503/true", secondResponse.Code, secondResponse.Header().Get(proxyErrorHeader))
 	}
 
 	close(release)

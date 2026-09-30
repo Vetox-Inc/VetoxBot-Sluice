@@ -1,17 +1,25 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"regexp"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
 )
+
+// DefaultMetricsNamespace prefixes every metric unless METRICS_NAMESPACE overrides it;
+// "nirn_proxy" reproduces nirn-proxy's metric names exactly.
+const DefaultMetricsNamespace = "sluice"
 
 const (
 	maxMetricsRouteLabels     = 1024
@@ -23,47 +31,99 @@ const (
 )
 
 var (
-	ErrorCounter = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "nirn_proxy_error",
-		Help: "The total number of errors when processing requests",
-	})
-	ProxyFailures = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "nirn_proxy_failures_total",
-		Help: "Proxy failures by bounded reason",
-	}, []string{"reason"})
+	ErrorCounter        prometheus.Counter
+	ProxyFailures       *prometheus.CounterVec
+	RequestHistogram    *prometheus.HistogramVec
+	ConnectionsOpen     *prometheus.GaugeVec
+	RequestsRoutedSent  prometheus.Counter
+	RequestsRoutedRecv  prometheus.Counter
+	RequestsRoutedError prometheus.Counter
 
-	RequestHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "nirn_proxy_requests",
-		Help:    "Request histogram",
-		Buckets: []float64{.1, .25, 1, 2.5, 5, 20},
-	}, []string{"method", "status", "route", "clientId"})
-
-	ConnectionsOpen = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "nirn_proxy_open_connections",
-		Help: "Gauge for requests currently active in the proxy handler",
-	}, []string{"method", "route"})
-
-	RequestsRoutedSent = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "nirn_proxy_requests_routed_sent",
-		Help: "Counter for requests routed from this node into other nodes",
-	})
-
-	RequestsRoutedRecv = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "nirn_proxy_requests_routed_received",
-		Help: "Counter for requests received from other nodes",
-	})
-
-	RequestsRoutedError = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "nirn_proxy_requests_routed_error",
-		Help: "Counter for failed requests routed from this node",
-	})
-
-	registerMetrics sync.Once
+	metricsRegistry *prometheus.Registry
 	metricsRoutes   = newRouteLabelLimiter(maxMetricsRouteLabels)
 
-	logger          = newLogger()
-	loggerHookRegex = regexp.MustCompile(`(/(?:webhooks|interactions)/[^/?\s]+/)[^/?\s]+`)
+	logger = NewLogger(os.Stderr, slog.LevelInfo, "text")
+
+	credentialPatterns = []struct {
+		pattern     *regexp.Regexp
+		replacement string
+	}{
+		{regexp.MustCompile(`(/(?:webhooks|interactions)/[^/?\s]+/)[^/?\s]+`), "$1:token"},
+		{regexp.MustCompile(`(?i)\b(Bot|Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}`), "$1 :token"},
+		{regexp.MustCompile(`[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}`), ":token"},
+	}
 )
+
+func init() {
+	ConfigureMetrics(DefaultMetricsNamespace)
+}
+
+type metricSet struct {
+	registry        *prometheus.Registry
+	errors          prometheus.Counter
+	failures        *prometheus.CounterVec
+	requests        *prometheus.HistogramVec
+	openConnections *prometheus.GaugeVec
+	routedSent      prometheus.Counter
+	routedReceived  prometheus.Counter
+	routedError     prometheus.Counter
+}
+
+func newMetricSet(namespace string) metricSet {
+	set := metricSet{
+		registry: prometheus.NewRegistry(),
+		errors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "error",
+			Help: "The total number of errors when processing requests",
+		}),
+		failures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "failures_total",
+			Help: "Proxy failures by bounded reason",
+		}, []string{"reason"}),
+		requests: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Name: "requests",
+			Help:    "Request histogram",
+			Buckets: []float64{.1, .25, 1, 2.5, 5, 20},
+		}, []string{"method", "status", "route", "clientId"}),
+		openConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "open_connections",
+			Help: "Gauge for requests currently active in the proxy handler",
+		}, []string{"method", "route"}),
+		routedSent: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "requests_routed_sent",
+			Help: "Counter for requests routed from this node into other nodes",
+		}),
+		routedReceived: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "requests_routed_received",
+			Help: "Counter for requests received from other nodes",
+		}),
+		routedError: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "requests_routed_error",
+			Help: "Counter for failed requests routed from this node",
+		}),
+	}
+	set.registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		set.errors, set.failures, set.requests, set.openConnections,
+		set.routedSent, set.routedReceived, set.routedError,
+	)
+	return set
+}
+
+// ConfigureMetrics replaces the exported metrics with a set under namespace. Call it
+// once at startup, before the proxy serves traffic.
+func ConfigureMetrics(namespace string) {
+	set := newMetricSet(namespace)
+	metricsRegistry = set.registry
+	ErrorCounter = set.errors
+	ProxyFailures = set.failures
+	RequestHistogram = set.requests
+	ConnectionsOpen = set.openConnections
+	RequestsRoutedSent = set.routedSent
+	RequestsRoutedRecv = set.routedReceived
+	RequestsRoutedError = set.routedError
+}
 
 type routeLabelLimiter struct {
 	mu    sync.Mutex
@@ -109,47 +169,60 @@ func metricsMethodLabel(method string) string {
 	}
 }
 
-type GlobalHook struct{}
-
-func newLogger() *logrus.Logger {
-	configured := logrus.New()
-	configured.AddHook(&GlobalHook{})
-	return configured
-}
-
-func (*GlobalHook) Levels() []logrus.Level {
-	return logrus.AllLevels
-}
-
-func (*GlobalHook) Fire(entry *logrus.Entry) error {
-	entry.Message = redactLogSecrets(entry.Message)
-	for _, field := range []string{"path", "route", logrus.ErrorKey} {
-		switch value := entry.Data[field].(type) {
-		case string:
-			entry.Data[field] = redactLogSecrets(value)
-		case error:
-			entry.Data[field] = redactLogSecrets(value.Error())
-		}
+// NewLogger returns a logger that redacts Discord credentials from the message and every
+// attribute, and counts error-level records. format is "text" or "json".
+func NewLogger(output io.Writer, level slog.Leveler, format string) *slog.Logger {
+	options := &slog.HandlerOptions{Level: level, ReplaceAttr: redactAttr}
+	var handler slog.Handler
+	if format == "json" {
+		handler = slog.NewJSONHandler(output, options)
+	} else {
+		handler = slog.NewTextHandler(output, options)
 	}
-	if logrus.ErrorLevel >= entry.Level {
+	return slog.New(errorCountingHandler{handler})
+}
+
+func SetLogger(replacement *slog.Logger) {
+	logger = replacement
+}
+
+type errorCountingHandler struct{ slog.Handler }
+
+func (h errorCountingHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Level >= slog.LevelError {
 		ErrorCounter.Inc()
 	}
-	return nil
+	return h.Handler.Handle(ctx, record)
+}
+
+func (h errorCountingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return errorCountingHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h errorCountingHandler) WithGroup(name string) slog.Handler {
+	return errorCountingHandler{h.Handler.WithGroup(name)}
+}
+
+func redactAttr(_ []string, attr slog.Attr) slog.Attr {
+	switch attr.Value.Kind() {
+	case slog.KindString:
+		attr.Value = slog.StringValue(redactLogSecrets(attr.Value.String()))
+	case slog.KindAny:
+		attr.Value = slog.StringValue(redactLogSecrets(fmt.Sprint(attr.Value.Any())))
+	}
+	return attr
 }
 
 func redactLogSecrets(value string) string {
-	return loggerHookRegex.ReplaceAllString(value, "$1:token")
-}
-
-func SetLogger(replacement *logrus.Logger) {
-	logger = replacement
-	logger.AddHook(&GlobalHook{})
+	for _, credential := range credentialPatterns {
+		value = credential.pattern.ReplaceAllString(value, credential.replacement)
+	}
+	return value
 }
 
 func NewMetricsServer(addr string) *http.Server {
-	registerMetrics.Do(func() { prometheus.MustRegister(RequestHistogram) })
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}))
 	return newAuxiliaryServer(addr, mux)
 }
 

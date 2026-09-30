@@ -1,6 +1,6 @@
 # Configuration
 
-All variables are optional in stand-alone mode. Enabling clustering requires the secret and TLS files described below. Nirn also loads a local `.env` file when present. Invalid values and listener bind failures stop startup instead of silently degrading the service.
+All variables are optional in stand-alone mode. Enabling clustering requires the secret and TLS files described below. Sluice also loads a local `.env` file when present. Invalid values and listener bind failures stop startup instead of silently degrading the service.
 
 Durations are integer milliseconds. Boolean settings should be `true` or `false`.
 
@@ -8,7 +8,11 @@ Durations are integer milliseconds. Boolean settings should be `true` or `false`
 
 ### `LOG_LEVEL`
 
-Logrus level: `panic`, `fatal`, `error`, `warn`, `info`, `debug`, or `trace`. Default: `info`.
+One of nirn-proxy's level names: `trace`, `debug`, `info`, `warn`, `error`, `fatal` or `panic`. `trace` logs as `debug`; `fatal` and `panic` log as `error`. Default: `info`.
+
+### `LOG_FORMAT`
+
+`text` writes one `key=value` line per record and `json` one JSON object per line. Default: `text`. Webhook, interaction and bot tokens are redacted from the message and every field in both formats.
 
 ### `BIND_IP`
 
@@ -40,9 +44,9 @@ Disables HTTP/2 on outbound connections when `true`. It does not affect the inbo
 
 Overall deadline once scheduling begins, including FIFO and global waits, every outbound attempt, retry delays, and final Discord response streaming. It is not renewed per retry. Valid range: 1 through 86,400,000 milliseconds. Default: `60000`.
 
-Before Discord response headers arrive, an expired scheduler queue returns `408 Request Timeout`, while a Discord attempt that exceeds `REQUEST_TIMEOUT` returns `504 Gateway Timeout`. Both responses include `X-Nirn-Proxy-Error: true`. If a deadline expires after response headers were forwarded, Nirn aborts the response stream because its status can no longer be changed.
+Before Discord response headers arrive, an expired scheduler queue returns `408 Request Timeout`, while a Discord attempt that exceeds `REQUEST_TIMEOUT` returns `504 Gateway Timeout`. Both responses include `X-Sluice-Proxy-Error: true`. If a deadline expires after response headers were forwarded, Sluice aborts the response stream because its status can no longer be changed.
 
-When Discord has already supplied a cooldown that cannot leave a full `REQUEST_TIMEOUT` attempt before this deadline, Nirn returns the current Discord `429` or a cached `429` with `Retry-After` immediately instead of holding the connection until it times out.
+When Discord has already supplied a cooldown that cannot leave a full `REQUEST_TIMEOUT` attempt before this deadline, Sluice returns the current Discord `429` or a cached `429` with `Retry-After` immediately instead of holding the connection until it times out.
 
 ### `MAX_QUEUE_DEPTH`
 
@@ -54,13 +58,13 @@ A full queue fails fast with `503 Service Unavailable`.
 
 Process-wide maximum number of non-health requests admitted through the proxy handler, including requests received on the public and cluster-peer listeners. Queued requests, active upstream attempts, and streamed responses all occupy a slot. Valid range: 1 through 1,000,000. Default: `4096`.
 
-`/nirn/healthz` bypasses this limit so readiness remains observable during saturation. Excess requests fail immediately with `503 Service Unavailable`, `Retry-After: 1`, and `X-Nirn-Proxy-Error: true`.
+`/sluice/healthz`, and its nirn-proxy alias `/nirn/healthz`, bypass this limit so readiness remains observable during saturation. Excess requests fail immediately with `503 Service Unavailable`, `Retry-After: 1`, and `X-Sluice-Proxy-Error: true`.
 
 ### `MAX_RETRY_BODY_BYTES`
 
-Maximum request-body size Nirn captures while sending the first attempt when no replay function is available. Valid range: 0 through 1,073,741,824 bytes. Default: `26214400` (25 MiB). Captures larger than 1 MiB spill to the system temporary directory, which must be writable. Spill files are removed when retry handling finishes—immediately after response headers when no retry is needed.
+Maximum request-body size Sluice captures while sending the first attempt when no replay function is available. Valid range: 0 through 1,073,741,824 bytes. Default: `26214400` (25 MiB). Captures larger than 1 MiB spill to the system temporary directory, which must be writable. Spill files are removed when retry handling finishes—immediately after response headers when no retry is needed.
 
-Nirn retries a Discord 429 only if the body is replayable. Requests without bodies and requests that supply a replay function do not depend on this capture limit. If capture is incomplete or exceeds the limit, the original 429 is returned.
+Sluice retries a Discord 429 only if the body is replayable. Requests without bodies and requests that supply a replay function do not depend on this capture limit. If capture is incomplete or exceeds the limit, the original 429 is returned.
 
 ### `MAX_RETRY_CAPTURE_BYTES`
 
@@ -70,7 +74,7 @@ Process-wide capacity for request bodies currently being captured for possible r
 
 Maximum number of bearer-token client states retained at once, additionally bounded by `MAX_CLIENT_STATES`. Valid range: 1 through 1,000,000. Default: `1024`.
 
-When the limit is reached, Nirn can evict only the oldest state that has been untouched for more than 10 minutes, has no active request, and has no live global or route block. Otherwise a new bearer client receives `503 Service Unavailable`.
+When the limit is reached, Sluice can evict only the oldest state that has been untouched for more than 10 minutes, has no active request, and has no live global or route block. Otherwise a new bearer client receives `503 Service Unavailable`.
 
 ### `MAX_CLIENT_STATES`
 
@@ -78,15 +82,15 @@ Maximum combined number of bot and bearer credential states. Valid range: 1 thro
 
 ### `MAX_BUCKET_STATES`
 
-Process-wide capacity for learned rate-limit buckets and aliases. Valid range: 1 through 10,000,000. Default: `65536`. Capacity is reclaimed when idle state is swept; allocating a new optimistic bucket fails with 503 rather than growing memory without bound. If learning an alias would exceed the cap, Nirn retains that route's blocked optimistic bucket instead of discarding its rate state, but coordination with another route in the same Discord bucket remains degraded until capacity is available.
+Process-wide capacity for learned rate-limit buckets and aliases. Valid range: 1 through 10,000,000. Default: `65536`. Capacity is reclaimed when idle state is swept; allocating a new optimistic bucket fails with 503 rather than growing memory without bound. If learning an alias would exceed the cap, Sluice retains that route's blocked optimistic bucket instead of discarding its rate state, but coordination with another route in the same Discord bucket remains degraded until capacity is available.
 
 ## Global and invalid-request protection
 
-Discord's documented default global capacity is 50 requests per second for each authenticated bot and 50 requests per second per egress IP without authentication. Nirn applies the same pace conservatively to bearer credentials. Interaction endpoints bypass this global pacer. Per-route capacities are learned from Discord response headers and are never configured here.
+Discord's documented default global capacity is 50 requests per second for each authenticated bot and 50 requests per second per egress IP without authentication. Sluice applies the same pace conservatively to bearer credentials. Interaction endpoints bypass this global pacer. Per-route capacities are learned from Discord response headers and are never configured here.
 
 Discord can change limits, omit headers, and return inaccurate emoji-control quota headers, so zero 429s cannot be guaranteed; see the official [rate-limit documentation](https://docs.discord.com/developers/topics/rate-limits).
 
-In stand-alone mode, Nirn stops new upstream attempts after recording 9,500 invalid responses in a rolling 10-minute window, leaving headroom below Discord's documented 10,000-response Cloudflare threshold. Statuses 401, 403, and non-shared 429 count toward this process-wide egress budget; it resets continuously as old responses expire.
+In stand-alone mode, Sluice stops new upstream attempts after recording 9,500 invalid responses in a rolling 10-minute window, leaving headroom below Discord's documented 10,000-response Cloudflare threshold. Statuses 401, 403, and non-shared 429 count toward this process-wide egress budget; it resets continuously as old responses expire.
 
 In cluster mode, each node receives `max(1, floor(9500 / CLUSTER_MAX_NODES))` slots. With the default maximum of 32 nodes, that is 296 per node and at most 9,472 across the cluster. This static partition protects a shared-NAT budget only when every process using that egress is in this cluster, every node uses the same maximum, and the actual membership never exceeds it. A process restart resets that node's local rolling history, so deployment churn still consumes the shared headroom.
 
@@ -117,15 +121,19 @@ Set this to `true` only if credentials can become valid again without changing t
 
 ### `ENABLE_METRICS`
 
-Enables Prometheus metrics and serves them on `/metrics`. When `false`, Nirn disables that listener and skips the request histogram, active-request gauge, and cluster-routing observations. Error-level logs may still increment the process-local error counter. Default: `true`.
+Enables Prometheus metrics and serves them on `/metrics`. When `false`, Sluice disables that listener and skips the request histogram, active-request gauge, and cluster-routing observations. Error-level logs may still increment the process-local error counter. Default: `true`.
 
-`nirn_proxy_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its legacy `clientId` label is only `Bot`, `Bearer`, or `NoAuth`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
+`sluice_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its legacy `clientId` label is only `Bot`, `Bearer`, or `NoAuth`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
 
-`nirn_proxy_failures_total{reason}` counts bounded proxy failure reasons, including `queue_timeout`, `upstream_timeout`, `upstream_error`, `peer_error`, and `rate_limit_deadline`.
+`sluice_failures_total{reason}` counts bounded proxy failure reasons, including `queue_timeout`, `upstream_timeout`, `upstream_error`, `peer_error`, and `rate_limit_deadline`.
 
 ### `METRICS_PORT`
 
 Metrics HTTP port, from 1 through 65535. Default: `9000`.
+
+### `METRICS_NAMESPACE`
+
+Prefix of every Sluice metric. Default: `sluice`, which gives `sluice_requests`, `sluice_error` and so on. Set `nirn_proxy` to keep nirn-proxy's exact metric names, so existing dashboards and alerts keep working. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. Go runtime and process metrics (`go_*`, `process_*`) are never prefixed.
 
 ### `ENABLE_PPROF`
 
@@ -161,7 +169,7 @@ This value also statically partitions the invalid-request safety budget between 
 
 ### `CLUSTER_SECRET`
 
-Shared memberlist secret, required only when clustering is enabled. It must contain at least 32 characters. Nirn supplies SHA-256 of the secret as memberlist's 32-byte secret key. Use a randomly generated value and configure the same value on every node.
+Shared memberlist secret, required only when clustering is enabled. It must contain at least 32 characters. Sluice supplies SHA-256 of the secret as memberlist's 32-byte secret key. Use a randomly generated value and configure the same value on every node.
 
 ### `CLUSTER_CA_FILE`
 
@@ -169,11 +177,11 @@ PEM file containing the CA certificates trusted for peer mTLS. Required only whe
 
 ### `CLUSTER_CERT_FILE`
 
-PEM certificate chain presented for both the TLS server and client roles. Required only when clustering is enabled. Before joining, Nirn verifies the chain, validity period, both authentication usages, and a SAN for the memberlist-advertised IP address because peers connect to that address.
+PEM certificate chain presented for both the TLS server and client roles. Required only when clustering is enabled. Before joining, Sluice verifies the chain, validity period, both authentication usages, and a SAN for the memberlist-advertised IP address because peers connect to that address.
 
 ### `CLUSTER_KEY_FILE`
 
-PEM private key for `CLUSTER_CERT_FILE`. Required only when clustering is enabled. Restrict its filesystem permissions to the Nirn process.
+PEM private key for `CLUSTER_CERT_FILE`. Required only when clustering is enabled. Restrict its filesystem permissions to the Sluice process.
 
 Peer TLS requires TLS 1.3. Certificate verification cannot be disabled: servers require and validate client certificates, and clients validate peer server names against the configured CA.
 
@@ -199,14 +207,14 @@ Authenticated traffic is assigned by token affinity, while unauthenticated non-i
 
 Memberlist's advertised IP and `CLUSTER_PEER_PORT` must be directly reachable by every peer. NAT or peer-port translation is unsupported.
 
-The affinity and peer wire behavior changed from legacy releases. Upgrade every node as one coordinated deployment; mixed-version clusters are unsupported. Open `CLUSTER_PORT` (TCP and UDP) and `CLUSTER_PEER_PORT` (TCP) only between trusted nodes. `/nirn/global` was removed.
+Cluster affinity and the peer protocol differ from nirn-proxy's. Upgrade every node as one coordinated deployment; clusters that mix Sluice with nirn-proxy or with other Sluice versions are unsupported. Open `CLUSTER_PORT` (TCP and UDP) and `CLUSTER_PEER_PORT` (TCP) only between trusted nodes. nirn-proxy's `/nirn/global` endpoint no longer exists.
 
 ## Compatibility variables
 
 ### `BUFFER_SIZE`
 
-Ignored if present. Use `MAX_QUEUE_DEPTH`; the channel-buffer scheduler no longer exists.
+Ignored if present, with a warning at startup. Use `MAX_QUEUE_DEPTH`; the channel-buffer scheduler no longer exists.
 
 ### `DISABLE_GLOBAL_RATELIMIT_DETECTION`
 
-Ignored if present. Nirn no longer infers REST limits from `/gateway/bot`; it uses Discord's documented default plus `BOT_RATELIMIT_OVERRIDES`.
+Ignored if present, with a warning at startup. Sluice never infers REST limits from `/gateway/bot`; it uses Discord's documented default of 50 requests per second plus `BOT_RATELIMIT_OVERRIDES`.

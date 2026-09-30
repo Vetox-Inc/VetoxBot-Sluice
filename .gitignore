@@ -3,5 +3,5 @@
 *.log
 *.test
 .DS_Store
-/nirn-proxy
-/nirn-proxy.exe
+/sluice
+/sluice.exe

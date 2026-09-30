@@ -13,12 +13,88 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Melonly-Moderation/nirn-proxy/internal/proxy"
+	"github.com/Vetox-Inc/VetoxBot-Sluice/internal/proxy"
 )
+
+func TestConfigurationReferenceMatchesCodeAndDocs(t *testing.T) {
+	listed := map[string]bool{}
+	for _, group := range settingGroups {
+		for _, name := range group.names {
+			listed[name] = true
+		}
+	}
+	for _, setting := range obsoleteSettings {
+		listed[setting.name] = true
+	}
+
+	reference, err := os.ReadFile("CONFIG.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	documented := map[string]bool{}
+	for _, match := range regexp.MustCompile("(?m)^### `([A-Z0-9_]+)`$").FindAllStringSubmatch(string(reference), -1) {
+		documented[match[1]] = true
+	}
+	for name := range listed {
+		if !documented[name] {
+			t.Errorf("%s is listed in settingGroups but has no CONFIG.md section", name)
+		}
+	}
+	for name := range documented {
+		if !listed[name] {
+			t.Errorf("CONFIG.md documents %s, which settingGroups does not list", name)
+		}
+	}
+
+	read := map[string]bool{}
+	envRead := regexp.MustCompile(`(?:envString|envBool|envInt|envInt64|envDurationMilliseconds|os\.Getenv)\("([A-Z0-9_]+)"`)
+	for _, file := range []string{"config.go", "main.go"} {
+		source, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range envRead.FindAllStringSubmatch(string(source), -1) {
+			read[match[1]] = true
+		}
+	}
+	for name := range read {
+		if !listed[name] {
+			t.Errorf("%s is read but missing from settingGroups", name)
+		}
+	}
+	for _, group := range settingGroups {
+		for _, name := range group.names {
+			if !read[name] {
+				t.Errorf("%s is listed in settingGroups but never read", name)
+			}
+		}
+	}
+}
+
+func TestMetricsNamespaceIsValidated(t *testing.T) {
+	clearClusterEnvironment(t)
+	t.Setenv("METRICS_NAMESPACE", "")
+	config, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.metricsNamespace != proxy.DefaultMetricsNamespace {
+		t.Fatalf("default namespace = %q, want %q", config.metricsNamespace, proxy.DefaultMetricsNamespace)
+	}
+	t.Setenv("METRICS_NAMESPACE", "nirn_proxy")
+	if config, err = loadConfig(); err != nil || config.metricsNamespace != "nirn_proxy" {
+		t.Fatalf("namespace = %q, err = %v, want nirn_proxy", config.metricsNamespace, err)
+	}
+	t.Setenv("METRICS_NAMESPACE", "nirn-proxy")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "METRICS_NAMESPACE") {
+		t.Fatalf("invalid namespace error = %v, want METRICS_NAMESPACE error", err)
+	}
+}
 
 func TestStandaloneConfigNeedsNoClusterCredentials(t *testing.T) {
 	clearClusterEnvironment(t)
@@ -206,7 +282,7 @@ func writeClusterTestCertificate(t *testing.T) (string, string, string) {
 	}
 	caTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "Nirn test CA"},
+		Subject:               pkix.Name{CommonName: "Sluice test CA"},
 		NotBefore:             now.Add(-time.Minute),
 		NotAfter:              now.Add(time.Hour),
 		IsCA:                  true,
@@ -223,7 +299,7 @@ func writeClusterTestCertificate(t *testing.T) (string, string, string) {
 	}
 	leafTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "Nirn test peer"},
+		Subject:      pkix.Name{CommonName: "Sluice test peer"},
 		NotBefore:    now.Add(-time.Minute),
 		NotAfter:     now.Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

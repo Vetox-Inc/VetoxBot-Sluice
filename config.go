@@ -5,15 +5,37 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/Melonly-Moderation/nirn-proxy/internal/proxy"
+	"github.com/Vetox-Inc/VetoxBot-Sluice/internal/proxy"
 )
 
 const maxConfiguredTimeout = 24 * time.Hour
+
+var metricsNamespacePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// settingGroups lists every environment variable Sluice reads. It drives --help, and a
+// test keeps it, the variables read below, and CONFIG.md in agreement.
+var settingGroups = []struct {
+	title string
+	names []string
+}{
+	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2"}},
+	{"Scheduling and retries", []string{"QUEUE_TIMEOUT", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES", "MAX_BEARER_COUNT", "MAX_CLIENT_STATES", "MAX_BUCKET_STATES"}},
+	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK"}},
+	{"Observability", []string{"ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
+	{"Clustering", []string{"CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_MAX_NODES", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_MEMBERS", "CLUSTER_DNS", "NODE_NAME"}},
+}
+
+// obsoleteSettings are nirn-proxy variables that are accepted but no longer have an effect.
+var obsoleteSettings = []struct{ name, advice string }{
+	{"BUFFER_SIZE", "use MAX_QUEUE_DEPTH; the channel-buffer scheduler no longer exists"},
+	{"DISABLE_GLOBAL_RATELIMIT_DETECTION", "Sluice never guesses the global limit; set BOT_RATELIMIT_OVERRIDES for raised limits"},
+}
 
 type appConfig struct {
 	bindIP      string
@@ -21,8 +43,9 @@ type appConfig struct {
 	metricsPort int
 	pprofPort   int
 
-	enableMetrics bool
-	enablePprof   bool
+	enableMetrics    bool
+	enablePprof      bool
+	metricsNamespace string
 
 	clusterPort      int
 	clusterPeerPort  int
@@ -114,6 +137,10 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
+	metricsNamespace := envString("METRICS_NAMESPACE", proxy.DefaultMetricsNamespace)
+	if !metricsNamespacePattern.MatchString(metricsNamespace) {
+		return appConfig{}, fmt.Errorf("METRICS_NAMESPACE must match [a-zA-Z_][a-zA-Z0-9_]*")
+	}
 	clusterMembers := splitNonempty(os.Getenv("CLUSTER_MEMBERS"))
 	clusterDNS := strings.TrimSpace(os.Getenv("CLUSTER_DNS"))
 	clusterEnabled := len(clusterMembers) > 0 || clusterDNS != ""
@@ -144,6 +171,7 @@ func loadConfig() (appConfig, error) {
 		pprofPort:        pprofPort,
 		enableMetrics:    enableMetrics,
 		enablePprof:      enablePprof,
+		metricsNamespace: metricsNamespace,
 		clusterPort:      clusterPort,
 		clusterPeerPort:  clusterPeerPort,
 		clusterMaxNodes:  clusterMaxNodes,

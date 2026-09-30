@@ -70,17 +70,17 @@ type clusterEvents struct {
 }
 
 func (e clusterEvents) NotifyJoin(node *memberlist.Node) {
-	logger.WithField("node", node.Name).Info("Cluster node joined")
+	logger.Info("Cluster node joined", "node", node.Name)
 	go e.proxy.reindexMembers()
 }
 
 func (e clusterEvents) NotifyLeave(node *memberlist.Node) {
-	logger.WithField("node", node.Name).Info("Cluster node left")
+	logger.Info("Cluster node left", "node", node.Name)
 	go e.proxy.reindexMembers()
 }
 
 func (e clusterEvents) NotifyUpdate(node *memberlist.Node) {
-	logger.WithField("node", node.Name).Info("Cluster node updated")
+	logger.Info("Cluster node updated", "node", node.Name)
 	go e.proxy.reindexMembers()
 }
 
@@ -246,7 +246,7 @@ func (p *Proxy) reindexMembers() {
 	if len(members) > maxNodes {
 		p.clusterOverCapacity.Store(true)
 		p.routes.Store(nil)
-		logger.WithField("members", len(members)).WithField("maximum", maxNodes).Error("Cluster exceeds configured node capacity; refusing Discord traffic")
+		logger.Error("Cluster exceeds configured node capacity; refusing Discord traffic", "members", len(members), "maximum", maxNodes)
 		return
 	}
 	p.clusterOverCapacity.Store(false)
@@ -254,7 +254,7 @@ func (p *Proxy) reindexMembers() {
 		port := string(node.Meta)
 		parsedPort, err := strconv.Atoi(port)
 		if err != nil || parsedPort < 1 || parsedPort > 65535 {
-			logger.WithField("node", node.Name).Warn("Ignoring cluster node with invalid peer port metadata")
+			logger.Warn("Ignoring cluster node with invalid peer port metadata", "node", node.Name)
 			continue
 		}
 		table.members = append(table.members, newClusterMember(node.Name, net.JoinHostPort(node.Addr.String(), port)))

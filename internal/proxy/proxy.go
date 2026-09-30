@@ -18,6 +18,9 @@ import (
 const (
 	clientSweepInterval = 5 * time.Minute
 	maxPeerHops         = 1
+
+	hopHeader        = "X-Sluice-Hop"
+	proxyErrorHeader = "X-Sluice-Proxy-Error"
 )
 
 // Config controls request scheduling, resource bounds, transport, and metrics.
@@ -205,7 +208,7 @@ func New(config Config) (*Proxy, error) {
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch request.URL.Path {
-	case "/nirn/healthz":
+	case "/sluice/healthz", "/nirn/healthz":
 		select {
 		case <-p.ctx.Done():
 			writeUnavailable(writer, "proxy is shutting down")
@@ -229,7 +232,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	defer p.inFlight.release(1)
-	if strings.HasPrefix(request.URL.Path, "/nirn/") {
+	if strings.HasPrefix(request.URL.Path, "/sluice/") || strings.HasPrefix(request.URL.Path, "/nirn/") {
 		http.NotFound(writer, request)
 		return
 	}
@@ -267,8 +270,8 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	identity := identify(request.Header.Get("Authorization"))
 	interaction := isInteractionEndpoint(request.URL.Path)
 	routingHash := affinityHash(identity, bucketPath, interaction)
-	hop := forwardedHop(request.Header.Get("X-Nirn-Hop"))
-	request.Header.Del("X-Nirn-Hop")
+	hop := forwardedHop(request.Header.Get(hopHeader))
+	request.Header.Del(hopHeader)
 	if hop > 0 && p.config.EnableMetrics {
 		RequestsRoutedRecv.Inc()
 	}
@@ -342,7 +345,7 @@ func writeUnavailable(writer http.ResponseWriter, message string) {
 
 func writeProxyError(writer http.ResponseWriter, message string, status int) {
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	writer.Header().Set("X-Nirn-Proxy-Error", "true")
+	writer.Header().Set(proxyErrorHeader, "true")
 	writer.WriteHeader(status)
 	_, _ = writer.Write([]byte(message + "\n"))
 }

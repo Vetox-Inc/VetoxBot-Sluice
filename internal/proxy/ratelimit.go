@@ -282,7 +282,7 @@ func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath str
 			}
 		}
 		target := s.learnBucket(routeHash, info.bucket, majorKey, bucket)
-		logger.WithError(err).WithField("path", bucketPath).Warn("Ignoring invalid Discord rate-limit headers")
+		logger.Warn("Ignoring invalid Discord rate-limit headers", "error", err, "path", bucketPath)
 		return target
 	}
 

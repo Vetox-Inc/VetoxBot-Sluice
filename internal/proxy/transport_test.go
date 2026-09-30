@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,8 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 func TestBucketReleasesAfterUpstreamHeaders(t *testing.T) {
@@ -618,11 +617,8 @@ func TestRequestCompletionDoesNotDependOnDebugOutput(t *testing.T) {
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
-	testLogger := logrus.New()
-	testLogger.SetOutput(blockingLogWriter{release: release})
-	testLogger.SetLevel(logrus.DebugLevel)
 	previousLogger := logger
-	SetLogger(testLogger)
+	SetLogger(NewLogger(blockingLogWriter{release: release}, slog.LevelDebug, "text"))
 	t.Cleanup(func() { logger = previousLogger })
 
 	var calls atomic.Int64
@@ -660,10 +656,8 @@ func TestRequestCompletionDoesNotDependOnDebugOutput(t *testing.T) {
 func TestTimeoutResponseDoesNotDependOnLogOutput(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	testLogger := logrus.New()
-	testLogger.SetOutput(blockingLogWriter{release: release})
 	previousLogger := logger
-	SetLogger(testLogger)
+	SetLogger(NewLogger(blockingLogWriter{release: release}, slog.LevelInfo, "text"))
 	t.Cleanup(func() { logger = previousLogger })
 
 	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -684,8 +678,8 @@ func TestTimeoutResponseDoesNotDependOnLogOutput(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout response blocked on log output")
 	}
-	if response.Code != http.StatusGatewayTimeout || response.Header().Get("X-Nirn-Proxy-Error") != "true" {
-		t.Fatalf("status=%d proxy-error=%q, want 504/true", response.Code, response.Header().Get("X-Nirn-Proxy-Error"))
+	if response.Code != http.StatusGatewayTimeout || response.Header().Get(proxyErrorHeader) != "true" {
+		t.Fatalf("status=%d proxy-error=%q, want 504/true", response.Code, response.Header().Get(proxyErrorHeader))
 	}
 }
 

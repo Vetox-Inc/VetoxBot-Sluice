@@ -3,25 +3,28 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/Melonly-Moderation/nirn-proxy/internal/proxy"
+	"github.com/Vetox-Inc/VetoxBot-Sluice/internal/proxy"
 	"github.com/joho/godotenv"
-	"github.com/sirupsen/logrus"
 )
 
 const (
-	shutdownTimeout = 20 * time.Second
-	cleanupTimeout  = 5 * time.Second
+	shutdownTimeout    = 20 * time.Second
+	cleanupTimeout     = 5 * time.Second
+	configReferenceURL = "https://github.com/Vetox-Inc/VetoxBot-Sluice/blob/master/CONFIG.md"
 )
 
-var logger = logrus.New()
+var logger = proxy.NewLogger(os.Stderr, slog.LevelInfo, "text")
 
 type runningServer struct {
 	name     string
@@ -31,9 +34,30 @@ type runningServer struct {
 }
 
 func main() {
-	if err := run(); err != nil {
-		logger.WithError(err).Fatal("Proxy stopped")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.Usage = printUsage
+	flag.Parse()
+	if *showVersion {
+		fmt.Println("sluice", proxy.Version)
+		return
 	}
+	if err := run(); err != nil {
+		logger.Error("Proxy stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	output := flag.CommandLine.Output()
+	fmt.Fprintf(output, "Sluice %s, a Discord REST rate-limit proxy.\n\nUsage: sluice [--version]\n\n", proxy.Version)
+	fmt.Fprintln(output, "Configuration comes from environment variables and an optional .env file:")
+	for _, group := range settingGroups {
+		fmt.Fprintf(output, "\n  %s\n", group.title)
+		for _, name := range group.names {
+			fmt.Fprintf(output, "    %s\n", name)
+		}
+	}
+	fmt.Fprintf(output, "\nDefaults and details: %s\n", configReferenceURL)
 }
 
 func run() error {
@@ -47,12 +71,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	proxy.ConfigureMetrics(config.metricsNamespace)
+	warnObsoleteSettings()
 
 	serverProxy, err := proxy.New(config.proxy)
 	if err != nil {
 		return fmt.Errorf("configure proxy: %w", err)
 	}
-	proxy.SetLogger(logger)
 	var servers []runningServer
 	defer func() {
 		cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -142,12 +167,13 @@ func run() error {
 	for _, running := range servers[:last] {
 		start(running)
 	}
-	logger.WithFields(logrus.Fields{
-		"address":        publicAddress,
-		"disableHTTP2":   config.proxy.DisableHTTP2,
-		"queueTimeout":   config.proxy.QueueTimeout,
-		"requestTimeout": config.proxy.UpstreamTimeout,
-	}).Info("Proxy started")
+	logger.Info("Proxy started",
+		"version", proxy.Version,
+		"address", publicAddress,
+		"disableHTTP2", config.proxy.DisableHTTP2,
+		"queueTimeout", config.proxy.QueueTimeout.String(),
+		"requestTimeout", config.proxy.UpstreamTimeout.String(),
+	)
 
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
@@ -193,12 +219,40 @@ func newProxyServer(address string, handler http.Handler, requestLifetime time.D
 }
 
 func configureLogger() error {
-	level, err := logrus.ParseLevel(envString("LOG_LEVEL", "info"))
+	level, err := parseLogLevel(envString("LOG_LEVEL", "info"))
 	if err != nil {
-		return fmt.Errorf("parse LOG_LEVEL: %w", err)
+		return err
 	}
-	logger.SetLevel(level)
+	format := strings.ToLower(envString("LOG_FORMAT", "text"))
+	if format != "text" && format != "json" {
+		return fmt.Errorf("LOG_FORMAT must be text or json")
+	}
+	logger = proxy.NewLogger(os.Stderr, level, format)
+	proxy.SetLogger(logger)
 	return nil
+}
+
+// parseLogLevel accepts nirn-proxy's logrus level names; slog has no trace, fatal or panic.
+func parseLogLevel(value string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "trace", "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error", "fatal", "panic":
+		return slog.LevelError, nil
+	}
+	return 0, fmt.Errorf("LOG_LEVEL must be trace, debug, info, warn, error, fatal or panic")
+}
+
+func warnObsoleteSettings() {
+	for _, setting := range obsoleteSettings {
+		if os.Getenv(setting.name) != "" {
+			logger.Warn("Ignoring obsolete setting", "setting", setting.name, "advice", setting.advice)
+		}
+	}
 }
 
 func joinCluster(serverProxy *proxy.Proxy, config appConfig) error {

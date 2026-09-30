@@ -377,7 +377,7 @@ func (b *captureBody) captureLocked(data []byte) {
 		return
 	}
 	if b.file == nil {
-		file, err := os.CreateTemp("", "nirn-retry-*")
+		file, err := os.CreateTemp("", "sluice-retry-*")
 		if err != nil {
 			b.discardLocked()
 			return
@@ -652,7 +652,7 @@ func (p *Proxy) initReverseProxies() {
 			target, _ := proxyRequest.In.Context().Value(peerTargetContextKey).(peerTarget)
 			proxyRequest.SetURL(&url.URL{Scheme: "https", Host: target.address})
 			preserveForwardingHeaders(proxyRequest)
-			proxyRequest.Out.Header.Set("X-Nirn-Hop", strconv.Itoa(target.hop))
+			proxyRequest.Out.Header.Set(hopHeader, strconv.Itoa(target.hop))
 		},
 		Transport:  &timeoutTransport{base: clusterPeerRoundTripper{proxy: p}, timeout: p.config.QueueTimeout + p.config.UpstreamTimeout},
 		BufferPool: buffers,
@@ -680,6 +680,6 @@ func preserveForwardingHeaders(proxyRequest *httputil.ProxyRequest) {
 		}
 	}
 	if proxyRequest.In.Header.Get("User-Agent") == "" {
-		proxyRequest.Out.Header.Set("User-Agent", "DiscordBot (https://github.com/Melonly-Moderation/nirn-proxy, dev)")
+		proxyRequest.Out.Header.Set("User-Agent", userAgent())
 	}
 }

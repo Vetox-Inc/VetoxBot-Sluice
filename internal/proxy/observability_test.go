@@ -1,39 +1,93 @@
 package proxy
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func TestGlobalHookRedactsStructuredCredentialPaths(t *testing.T) {
-	for _, endpoint := range []string{"webhooks", "interactions"} {
-		t.Run(endpoint, func(t *testing.T) {
-			const secret = "short-secret"
-			path := "/api/v10/" + endpoint + "/123456789012345678/" + secret + "/callback"
-			entry := logrus.NewEntry(logrus.New())
-			entry.Message = "request failed: " + path
-			entry.Data = logrus.Fields{
-				"path":          path,
-				"route":         path,
-				logrus.ErrorKey: errors.New("upstream " + path),
-			}
-			if err := (&GlobalHook{}).Fire(entry); err != nil {
+// fakeBotToken has a bot token's shape without appearing as a literal secret scanners flag.
+var fakeBotToken = strings.Join([]string{"MTIzNDU2Nzg5MDEyMzQ1Njc4", "GAbCdE", strings.Repeat("x", 38)}, ".")
+
+func TestLoggerRedactsCredentialsEverywhere(t *testing.T) {
+	const pathSecret = "short-secret"
+	for _, format := range []string{"text", "json"} {
+		for _, endpoint := range []string{"webhooks", "interactions"} {
+			t.Run(format+"/"+endpoint, func(t *testing.T) {
+				path := "/api/v10/" + endpoint + "/123456789012345678/" + pathSecret + "/callback"
+				var output bytes.Buffer
+				testLogger := NewLogger(&output, slog.LevelDebug, format)
+				testLogger.With("route", path).WithGroup("request").Warn("request failed: "+path,
+					"path", path,
+					"error", errors.New("upstream "+path),
+					"authorization", "Bot "+fakeBotToken,
+					"detail", struct{ Token string }{fakeBotToken},
+				)
+				for _, secret := range []string{pathSecret, fakeBotToken} {
+					if strings.Contains(output.String(), secret) {
+						t.Fatalf("log output exposed %q:\n%s", secret, output.String())
+					}
+				}
+				if !strings.Contains(output.String(), ":token") {
+					t.Fatalf("log output lost the redaction marker:\n%s", output.String())
+				}
+			})
+		}
+	}
+}
+
+func TestErrorLogsIncrementErrorCounter(t *testing.T) {
+	before := testutil.ToFloat64(ErrorCounter)
+	testLogger := NewLogger(&bytes.Buffer{}, slog.LevelInfo, "text")
+	testLogger.Warn("not an error")
+	testLogger.Error("an error")
+	testLogger.With("component", "test").Error("another error")
+	if got := testutil.ToFloat64(ErrorCounter) - before; got != 2 {
+		t.Fatalf("error counter increased by %v, want 2", got)
+	}
+}
+
+func TestMetricsNamespaceNamesEveryMetric(t *testing.T) {
+	for namespace, want := range map[string][]string{
+		"nirn_proxy": {
+			"nirn_proxy_error", "nirn_proxy_failures_total", "nirn_proxy_open_connections", "nirn_proxy_requests",
+			"nirn_proxy_requests_routed_error", "nirn_proxy_requests_routed_received", "nirn_proxy_requests_routed_sent",
+		},
+		DefaultMetricsNamespace: {
+			"sluice_error", "sluice_failures_total", "sluice_open_connections", "sluice_requests",
+			"sluice_requests_routed_error", "sluice_requests_routed_received", "sluice_requests_routed_sent",
+		},
+	} {
+		t.Run(namespace, func(t *testing.T) {
+			set := newMetricSet(namespace)
+			set.errors.Inc()
+			set.failures.WithLabelValues("test").Inc()
+			set.requests.WithLabelValues("GET", "200 OK", "/gateway", "NoAuth").Observe(0.1)
+			set.openConnections.WithLabelValues("GET", "/gateway").Inc()
+			families, err := set.registry.Gather()
+			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(entry.Message, secret) {
-				t.Fatalf("message exposed credential: %q", entry.Message)
-			}
-			for field, value := range entry.Data {
-				if strings.Contains(fmt.Sprint(value), secret) {
-					t.Fatalf("field %q exposed credential: %v", field, value)
+			var got []string
+			for _, family := range families {
+				name := family.GetName()
+				if strings.HasPrefix(name, "go_") || strings.HasPrefix(name, "process_") {
+					continue
 				}
+				got = append(got, name)
+			}
+			sort.Strings(got)
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("metric names = %v, want %v", got, want)
 			}
 		})
 	}

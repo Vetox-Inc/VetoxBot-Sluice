@@ -1,4 +1,4 @@
-module github.com/Melonly-Moderation/nirn-proxy
+module github.com/Vetox-Inc/VetoxBot-Sluice
 
 go 1.26
 
@@ -6,7 +6,6 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/joho/godotenv v1.5.1
 	github.com/prometheus/client_golang v1.23.2
-	github.com/sirupsen/logrus v1.9.4
 )
 
 require (
@@ -21,6 +20,7 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.7 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
