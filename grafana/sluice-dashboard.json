@@ -78,14 +78,14 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum(increase(nirn_proxy_requests_count{status=\"429 Too Many Requests\",clientId=~\"$clientId\"}[1h]))",
+          "expr": "sum(increase(${namespace}_requests_count{status=\"429 Too Many Requests\",clientId=~\"$clientId\"}[1h]))",
           "interval": "",
           "legendFormat": "",
           "refId": "A"
         }
       ],
       "timeFrom": "1h",
-      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Nirn retries.",
+      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Sluice retries.",
       "title": "Non-shared Discord 429s (1h)",
       "type": "stat"
     },
@@ -142,7 +142,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum (rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
+          "expr": "sum (rate(${namespace}_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "",
           "refId": "A"
@@ -231,7 +231,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum(rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval])) by (clientId)",
+          "expr": "sum(rate(${namespace}_requests_count{clientId=~\"$clientId\"}[$__rate_interval])) by (clientId)",
           "interval": "",
           "legendFormat": "{{clientId}}",
           "refId": "A"
@@ -242,7 +242,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum(rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[1m]))",
+          "expr": "sum(rate(${namespace}_requests_count{clientId=~\"$clientId\"}[1m]))",
           "hide": false,
           "interval": "",
           "legendFormat": "Total",
@@ -332,13 +332,13 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum by(method, status, route) (rate(nirn_proxy_requests_count{status=\"429 Too Many Requests\",clientId=~\"$clientId\"}[$__rate_interval]))",
+          "expr": "sum by(method, status, route) (rate(${namespace}_requests_count{status=\"429 Too Many Requests\",clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{method}} {{route}} ({{status}})",
           "refId": "A"
         }
       ],
-      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Nirn retries.",
+      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Sluice retries.",
       "title": "Non-shared Discord 429s",
       "type": "timeseries"
     },
@@ -423,7 +423,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum by(method, status, route) (rate(nirn_proxy_requests_count{status=~\"5.. .*\",clientId=~\"$clientId\"}[$__rate_interval]))",
+          "expr": "sum by(method, status, route) (rate(${namespace}_requests_count{status=~\"5.. .*\",clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{method}} {{route}} ({{status}})",
           "refId": "A"
@@ -513,7 +513,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum by (status) (rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
+          "expr": "sum by (status) (rate(${namespace}_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{status}}",
           "refId": "A"
@@ -602,7 +602,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum by (route) (rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
+          "expr": "sum by (route) (rate(${namespace}_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{route}}",
           "refId": "A"
@@ -691,7 +691,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "histogram_quantile(0.9, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.9, sum(rate(${namespace}_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
           "interval": "",
           "legendFormat": "90th",
           "refId": "A"
@@ -702,7 +702,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "histogram_quantile(0.95, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(${namespace}_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
           "hide": false,
           "interval": "",
           "legendFormat": "95th",
@@ -714,7 +714,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "histogram_quantile(0.99, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(${namespace}_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
           "hide": false,
           "interval": "",
           "legendFormat": "99th",
@@ -805,7 +805,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "histogram_quantile(0.90, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le, method, route))",
+          "expr": "histogram_quantile(0.90, sum(rate(${namespace}_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le, method, route))",
           "instant": false,
           "interval": "1m",
           "intervalFactor": 1,
@@ -896,7 +896,7 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "histogram_quantile(0.99, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le, method, route))",
+          "expr": "histogram_quantile(0.99, sum(rate(${namespace}_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le, method, route))",
           "interval": "",
           "legendFormat": "{{method}} {{route}}",
           "refId": "A"
@@ -984,13 +984,13 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum(nirn_proxy_open_connections)",
+          "expr": "sum(${namespace}_open_connections)",
           "interval": "",
           "legendFormat": "Connections Open",
           "refId": "A"
         }
       ],
-      "description": "HTTP requests currently executing in Nirn after admission; this is not a count of TCP sockets.",
+      "description": "HTTP requests currently executing in Sluice after admission; this is not a count of TCP sockets.",
       "title": "Active proxy requests",
       "type": "timeseries"
     }
@@ -1023,6 +1023,34 @@
       {
         "current": {
           "selected": true,
+          "text": "sluice",
+          "value": "sluice"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Metric prefix",
+        "multi": false,
+        "name": "namespace",
+        "options": [
+          {
+            "selected": true,
+            "text": "sluice",
+            "value": "sluice"
+          },
+          {
+            "selected": false,
+            "text": "nirn_proxy",
+            "value": "nirn_proxy"
+          }
+        ],
+        "query": "sluice,nirn_proxy",
+        "queryValue": "",
+        "skipUrlSync": false,
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": true,
           "text": [
             "All"
           ],
@@ -1034,15 +1062,15 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(nirn_proxy_requests_count, clientId)",
+        "definition": "label_values(${namespace}_requests_count, clientId)",
         "hide": 0,
         "includeAll": true,
-        "label": "Authentication class",
+        "label": "Client",
         "multi": true,
         "name": "clientId",
         "options": [],
         "query": {
-          "query": "label_values(nirn_proxy_requests_count, clientId)",
+          "query": "label_values(${namespace}_requests_count, clientId)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,
@@ -1059,8 +1087,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Nirn Proxy",
-  "uid": "LFGoppS7k",
+  "title": "Sluice",
+  "uid": "sluice",
   "version": 27,
   "weekStart": ""
 }

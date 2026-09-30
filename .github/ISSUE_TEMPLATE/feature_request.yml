@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest a change to Sluice
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: How Sluice could solve it, and any alternatives you considered.

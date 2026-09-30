@@ -62,7 +62,7 @@ A full queue fails fast with `503 Service Unavailable`.
 
 Process-wide maximum number of non-health requests admitted through the proxy handler, including requests received on the public and cluster-peer listeners. Queued requests, active upstream attempts, and streamed responses all occupy a slot. Valid range: 1 through 1,000,000. Default: `4096`.
 
-`/sluice/healthz`, and its nirn-proxy alias `/nirn/healthz`, bypass this limit so readiness remains observable during saturation. Excess requests fail immediately with `503 Service Unavailable`, `Retry-After: 1`, and `X-Sluice-Proxy-Error: true`.
+The health endpoints (`/sluice/healthz`, its nirn-proxy alias `/nirn/healthz`, and `/sluice/health/upstream`) bypass this limit so they remain observable during saturation. Excess requests fail immediately with `503 Service Unavailable`, `Retry-After: 1`, and `X-Sluice-Proxy-Error: true`.
 
 ### `MAX_RETRY_BODY_BYTES`
 

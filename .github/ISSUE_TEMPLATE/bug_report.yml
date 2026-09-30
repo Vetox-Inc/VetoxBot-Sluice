@@ -1,0 +1,25 @@
+name: Bug report
+description: Sluice does not behave as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what Sluice did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Requests, configuration and logs. Remove tokens and webhook URLs first.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `sluice --version`, or the image tag.
+    validations:
+      required: true

@@ -1,7 +1,8 @@
 # @vetox-bot/sluice
 
 [Sluice](https://github.com/Vetox-Inc/VetoxBot-Sluice) is a Discord REST rate-limit proxy, the maintained successor
-to nirn-proxy. This package installs its prebuilt binary for your platform; no Go toolchain and no install script are
+to [nirn-proxy](https://github.com/germanoeich/nirn-proxy) by Germano Eichenberg, built on Melonly-Moderation's rewrite
+of its engine. This package installs its prebuilt binary for your platform; no Go toolchain and no install script are
 needed.
 
 ```sh

@@ -23,7 +23,7 @@ archives:
     format_overrides:
       - { goos: windows, formats: [zip] }
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
-    files: [LICENSE, README.md, CONFIG.md]
+    files: [LICENSE, README.md, CONFIG.md, MIGRATING.md, CHANGELOG.md]
 
 checksum:
   name_template: checksums.txt

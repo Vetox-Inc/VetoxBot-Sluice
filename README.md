@@ -1,123 +1,228 @@
-# Nirn Proxy Reborn
+# Sluice
 
-Nirn Proxy is a transparent HTTP reverse proxy for Discord's REST API. It coordinates per-route and global rate limits, preserves FIFO dispatch within a bucket, retries safe 429 responses, and exports Prometheus metrics.
+[![CI](https://github.com/Vetox-Inc/VetoxBot-Sluice/actions/workflows/ci.yml/badge.svg)](https://github.com/Vetox-Inc/VetoxBot-Sluice/actions/workflows/ci.yml)
 
-Clients send the same method, path, query, application headers, and body they would send to `discord.com`, but use the proxy address instead. As with any reverse proxy, Nirn rewrites `Host`, removes hop-by-hop and internal `X-Nirn-Hop` headers, and supplies a fallback `User-Agent` when one is absent.
+Sluice is a transparent HTTP reverse proxy for Discord's REST API. It paces every bot's requests against Discord's
+per-route and global rate limits, keeps each bucket's requests in order, retries the 429s it can safely replay,
+protects your IP from Cloudflare bans, and exports Prometheus metrics. Any number of bots and processes can share one
+Sluice, or one cluster of them.
+
+Sluice continues [nirn-proxy](https://github.com/germanoeich/nirn-proxy), which its author has archived. It reads the
+same settings and serves the same ports, so a single nirn-proxy node can be swapped for Sluice directly;
+[MIGRATING.md](MIGRATING.md) lists what changes. [Lineage and credits](#lineage-and-credits) names everyone whose work
+it builds on.
+
+## Quick start
+
+Run the container image, publishing the proxy port on loopback only:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/vetox-inc/sluice:1
+```
+
+Or run the prebuilt binary from npm, which needs no Go toolchain:
+
+```sh
+npx @vetox-bot/sluice
+```
+
+Every [release](https://github.com/Vetox-Inc/VetoxBot-Sluice/releases) also has binaries for Linux, macOS and Windows.
+To build from source, clone the repository and run `go build -o sluice .` with Go 1.26 or later.
+
+Then send your REST traffic to Sluice instead of Discord:
 
 ```text
 https://discord.com/api/v10/gateway
         becomes
-http://nirn-proxy:8080/api/v10/gateway
+http://127.0.0.1:8080/api/v10/gateway
 ```
 
-The public proxy, metrics, and pprof listeners have no built-in application authentication, and `BIND_IP` defaults to `0.0.0.0`. Restrict them with a firewall or network policy. Discord credentials cross the client-to-proxy hop, so terminate TLS and authenticate callers before that hop leaves a trusted private network. Only the separate cluster-peer listener has built-in mutual TLS.
+In discord.js, that is `new Client({ intents, rest: { api: 'http://127.0.0.1:8080/api' } })`. Most libraries have a
+similar base-URL option; otherwise, remap the host.
 
-## Rate-limit model
+Sluice forwards the method, path, query, headers and body as sent. Like any reverse proxy, it rewrites `Host`, drops
+hop-by-hop, `Forwarded` and `X-Forwarded-*` headers, and supplies a `User-Agent` when the client sends none. A path
+without the `/api` prefix is forwarded under it.
 
-Discord currently documents these HTTP API limits:
+## Security
 
-- Authenticated bots: 50 requests per second globally by default. Nirn conservatively applies the same pacing to bearer credentials.
-- Unauthenticated requests: 50 requests per second per egress IP.
-- Interaction endpoints: exempt from the global limit.
-- Invalid requests: 10,000 responses with status 401, 403, or 429 per 10 minutes per egress IP; shared-scope 429s do not count.
+The proxy, metrics and pprof listeners have no authentication, and `BIND_IP` defaults to `0.0.0.0`. Anyone who can
+reach the proxy port can send requests to Discord from your IP, and your clients' tokens cross that hop in plain HTTP.
+Keep the listeners on loopback or a private network, or restrict them with a firewall or network policy. Only the
+cluster-peer listener has built-in mutual TLS.
 
-See Discord's official [HTTP rate-limit documentation](https://docs.discord.com/developers/topics/rate-limits). Gateway session-start limits are a separate system and are not used to infer REST capacity; see the [Gateway documentation](https://docs.discord.com/developers/events/gateway).
+Sluice redacts tokens from every log field, including webhook and interaction tokens in paths. Report vulnerabilities
+privately, as [SECURITY.md](SECURITY.md) describes.
 
-Per-route limits are never hardcoded. Nirn begins with a conservative route grouping, then learns Discord's bucket identity and state from `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset-After`, using `Retry-After` for 429 responses when available. Buckets remain distinct across Discord's major parameters such as channel, guild, and webhook identity.
+## How Sluice schedules requests
 
-Each bucket has a bounded, cancellation-safe FIFO queue. `MAX_QUEUE_DEPTH` bounds waiting requests per gate, while `MAX_IN_FLIGHT_REQUESTS` bounds all admitted non-health requests across the process. `QUEUE_TIMEOUT` is the overall scheduling deadline, including waits, attempts, retries, and the final Discord response stream. The bucket is released after Discord's response headers are processed, so a slow downstream reader cannot block later requests in the same bucket. Shared-bucket FIFO coordination begins after Discord's first response reveals the bucket identity; before then Nirn uses its conservative route grouping.
+Discord documents these REST [rate limits](https://docs.discord.com/developers/topics/rate-limits):
 
-The proxy also reserves a process-local safety budget for invalid responses. Responses with status 401, 403, or non-shared 429 consume it; Nirn stops its own new upstream attempts at 9,500 retained events per rolling 10 minutes. Cluster nodes statically divide those slots by `CLUSTER_MAX_NODES` to retain shared-NAT headroom. Restarts and traffic outside Nirn are not represented in this history.
+- **Global:** 50 requests per second per bot unless Discord has raised it, and 50 per second per IP without
+  authentication. Sluice paces bearer tokens the same way. Interaction endpoints are exempt.
+- **Per route:** limits Discord reports in each response, grouped into buckets.
+- **Invalid requests:** 10,000 responses with status 401, 403 or 429 per 10 minutes per IP, not counting shared-scope
+  429s. Past that, Cloudflare blocks the IP.
 
-## Affinity and clustering
+Per-route limits are never hardcoded, so new Discord endpoints need no update. Sluice starts from a conservative route
+grouping and learns each bucket from `X-RateLimit-Bucket`, `X-RateLimit-Remaining` and `X-RateLimit-Reset-After`, and
+from `Retry-After` on 429s. Buckets stay separate per channel, guild and webhook. Each bucket sends one request at a
+time, first in first out, and moves on as soon as Discord's response headers arrive, so a slow client never holds up
+the queue. The global limit is taken when a request is sent, never while it waits.
 
-All requests using the same bot or bearer credential are assigned to the same node with rendezvous hashing. That node owns the credential's per-route buckets and global pacer, eliminating the old internal global-limit RPC. Unauthenticated non-interaction traffic is assigned by shared egress affinity so its IP-scoped global limit is coordinated. Interaction traffic bypasses the global pacer but still observes per-route limits.
+Waits are bounded. `MAX_QUEUE_DEPTH` caps the requests waiting on one bucket, and `MAX_IN_FLIGHT_REQUESTS` caps
+everything admitted. `QUEUE_TIMEOUT` is each request's whole deadline, covering waiting, attempts, retries and the
+response stream, and a request whose client disconnects leaves its queue at once.
 
-Clustering uses HashiCorp memberlist/SWIM and is intentionally AP. Gossip requires a shared secret and peer proxying uses a dedicated TLS 1.3 listener with certificate verification in both directions. The peer client transport is direct: it is separate from Discord's transport and never honors `HTTP_PROXY`.
+### 429 retries
 
-Rate-limit coordination is therefore practical protection, not a mathematical guarantee:
+When Discord answers 429, Sluice retries the request itself if it can replay the body: when there is none, or when it
+captured the whole body while sending it, up to `MAX_RETRY_BODY_BYTES`. Retries go back through the scheduler and must
+finish within `QUEUE_TIMEOUT`. If the known cooldown leaves no time for a full `REQUEST_TIMEOUT` attempt, Sluice
+returns the 429 straight away, with `Retry-After`. A body it cannot replay gets Discord's original 429, never a partial
+or altered retry. No other status is retried.
 
-- During a network partition, each side can temporarily process the same credential with independent state.
-- Membership changes can move an identity while requests are still in flight.
-- Requests made with the same Discord identity outside this cluster are invisible to Nirn.
-- Multiple credentials that Discord accounts to one user, or unauthenticated traffic sharing the same external egress IP, can exceed limits that one Nirn state cannot observe.
-- Discord may omit rate-limit headers, and it specifically warns that emoji-control quota headers can be inaccurate.
-- A previously unseen shared bucket cannot be coordinated until Discord identifies it in a response.
-- A non-replayable request body or an exhausted retry deadline exposes Discord's original 429 or a proxy timeout.
+Sluice prevents avoidable requests and absorbs the 429s it can, but it cannot promise zero. Discord can change limits
+and omit headers, and requests made outside Sluice with the same token are invisible to it. Clients should still
+handle 429s.
 
-Nirn prevents avoidable dispatches and absorbs replay-safe 429s; it cannot guarantee zero 429s. Configure clients and infrastructure to tolerate them.
+### Protecting your IP
 
-> **Upgrade note:** token affinity, rendezvous routing, and the peer-hop wire behavior changed. Upgrade the whole cluster as one coordinated deployment; do not run legacy and new nodes together.
+- **Invalid-request budget.** Sluice counts 401, 403 and non-shared 429 responses over a rolling 10 minutes and stops
+  sending new requests at 9,500, answering `503` until old responses age out. In a cluster, each node gets an equal
+  share: 9,500 divided by `CLUSTER_MAX_NODES`.
+- **Invalid tokens.** After a 401 on a route the token authenticates, later requests with that token get a 401 from
+  Sluice without reaching Discord. Webhook-token and interaction routes never mark a token invalid.
+  `DISABLE_401_LOCK=true` turns this off.
+- **Deleted webhooks.** Once Discord reports a webhook as unknown (code 10015) or its token as invalid (code 50027),
+  Sluice answers further calls to that webhook itself for an hour. Other 404s pass through.
+- **Cloudflare blocks.** Discord's own responses carry `Via: 1.1 google`, so a 429 or 403 without it came from
+  Cloudflare. Sluice then pauses all outbound traffic for the response's `Retry-After` and answers `429` meanwhile. Set
+  `CLOUDFLARE_BAN_DETECTION=false` if something between Sluice and Discord strips `Via`.
 
-Set `CLUSTER_MEMBERS` or `CLUSTER_DNS` to enable clustering. Cluster mode also requires `CLUSTER_SECRET`, `CLUSTER_CA_FILE`, `CLUSTER_CERT_FILE`, and `CLUSTER_KEY_FILE`. Startup verifies the certificate chain, lifetime, client/server usages, and a SAN for the memberlist-advertised IP. Expose the gossip port (TCP and UDP) and peer HTTPS port only between cluster nodes. The advertised IP and peer port must be directly reachable; NAT or peer-port translation is unsupported.
+## Clustering
 
-If every configured seed join fails, startup fails rather than silently creating an isolated singleton. Ensure a cold-start discovery set includes the node itself or another reachable seed.
+Set `CLUSTER_MEMBERS` or `CLUSTER_DNS` to run several nodes as one proxy. Each bot or bearer token is assigned to one
+node by rendezvous hashing, and that node owns its buckets and global pacer. Unauthenticated traffic is assigned by
+egress affinity, so its per-IP limit is coordinated too. Nodes gossip over HashiCorp memberlist with a shared
+`CLUSTER_SECRET`, and forward requests to each other over a dedicated TLS 1.3 listener that verifies certificates in
+both directions.
 
-`CLUSTER_MAX_NODES` defaults to 32. Joining a larger cluster fails startup; exceeding the cap after startup makes health checks and Discord requests fail with 503. This cap also partitions the shared invalid-request budget, so every node must use the same value. Traffic outside the cluster that shares the egress IP remains invisible to Nirn.
+The cluster favours availability, so its coordination is protection, not a guarantee:
 
-The only reserved `/nirn/` endpoint on the proxy and peer listeners is `/nirn/healthz`; `/nirn/global` no longer exists. Metrics and pprof use separate listeners.
+- During a network partition, both sides can serve the same token with separate state.
+- Membership changes can move a token while its requests are in flight.
+- Several tokens that Discord counts as one user, or unauthenticated traffic sharing an egress IP, can exceed limits
+  no single node sees.
+- A shared bucket cannot be coordinated until Discord names it in a response.
 
-## 429 retries
+Startup fails if no seed can be joined, rather than starting an isolated node. `CLUSTER_MAX_NODES` (default 32) caps
+the cluster size. Open the gossip port (TCP and UDP) and the peer port only between nodes, and set
+`CLUSTER_ADVERTISE_ADDR` when nodes reach each other through Docker or NAT. [CONFIG.md](CONFIG.md#clustering) has the
+details.
 
-Nirn transparently retries a Discord 429 only when the request body can be replayed safely:
+## Responses
 
-- Requests without a body are replayable.
-- Bodies with a replay function are replayable.
-- Other bodies are captured while first sent, up to `MAX_RETRY_BODY_BYTES`, and are replayable only if capture completes without exceeding that limit.
+Discord's response passes through unchanged, after any retry. Responses Sluice generates itself carry
+`generated-by-proxy: true` and `Via: 1.1 sluice`. The exception is the Cloudflare-pause 429, which omits `Via` so
+clients treat it like the block it reports. Sluice's own errors (`400`, `408`, `502`, `503`, and `404` on a reserved
+path) also carry `X-Sluice-Proxy-Error: true`.
 
-Retries re-enter the same bounded scheduler and must complete within `QUEUE_TIMEOUT`. If the known cooldown cannot leave a full `REQUEST_TIMEOUT` attempt, Nirn immediately returns Discord's current 429 or a cached 429 with `Retry-After`. If the body cannot be replayed, Nirn returns Discord's original 429 instead of risking a partial or changed request. Other Discord statuses are not retried.
+| Status | When |
+| --- | --- |
+| `429` | A known cooldown outlasts the request's deadline, or a Cloudflare block has paused traffic. Carries `Retry-After`. |
+| `401` | Discord already rejected the token (see `DISABLE_401_LOCK`), or a webhook's token is known to be invalid. |
+| `404` | The webhook is known to be deleted, or the path is under the reserved `/sluice/` or `/nirn/` prefix. |
+| `408` | A Discord attempt exceeded `REQUEST_TIMEOUT`, or the request's `QUEUE_TIMEOUT` expired. |
+| `502` | Discord could not be reached or returned an unusable response. |
+| `503` | Sluice could not safely take the request: a full queue, exhausted capacity or invalid-request budget, an unavailable peer, or shutdown. Carries `Retry-After: 1`. |
+| `400` | `CONNECT`, protocol upgrades, and paths containing dot segments or encoded separators. |
 
-## Proxy responses
-
-| Status | Meaning |
-|---|---|
-| Discord status | Discord's response after any safe 429 retry is passed through. |
-| `429 Too Many Requests` | Discord's current response, or a cached Discord cooldown that cannot fit before the scheduler deadline. |
-| `408 Request Timeout` | Nirn's scheduler queue/retry deadline expired. |
-| `504 Gateway Timeout` | An outbound Discord attempt exceeded `REQUEST_TIMEOUT`. |
-| `502 Bad Gateway` | Discord could not be reached or returned an unusable transport response. |
-| `503 Service Unavailable` | Nirn could not safely process the request, such as a full queue, unavailable peer, client-capacity exhaustion, or shutdown. |
-| `400 Bad Request` | `CONNECT` and protocol upgrades are unsupported. |
-
-Proxy-generated 408, 502, 503, and 504 responses include `X-Nirn-Proxy-Error: true`.
-If a deadline expires after Discord response headers were forwarded, Nirn aborts the response stream because its status can no longer be changed.
-
-Nirn does not disguise an internal failure as a Discord 429.
-
-Nirn caches an invalid credential after its first ordinary 401. Idle state is eventually reclaimed. Set `DISABLE_401_LOCK=true` only when credential caching is undesirable.
+If a deadline expires after Discord's response headers were forwarded, Sluice aborts the stream, because the status
+can no longer change.
 
 ## Configuration
 
-All settings are optional in stand-alone mode, and a local `.env` file is loaded when present. Malformed or unreadable `.env` files fail startup; cluster mode requires its secret and TLS files. See [CONFIG.md](CONFIG.md) for the complete environment-variable reference, defaults, validation ranges, and override syntax.
+Sluice reads environment variables, and a `.env` file in the working directory when present. Every setting is optional
+for a single node, and `sluice --help` lists them all. The ones most deployments set:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BIND_IP` | `0.0.0.0` | Address every listener binds to |
+| `PORT` | `8080` | Proxy port |
+| `METRICS_PORT` | `9000` | Prometheus `/metrics` port |
+| `BOT_RATELIMIT_OVERRIDES` | empty | Raised global limits, as `bot_id:requests_per_second` |
+| `REQUEST_TIMEOUT` | `5000` | Milliseconds allowed for each Discord attempt |
+| `QUEUE_TIMEOUT` | `60000` | Milliseconds allowed for a request in total |
+| `LOG_LEVEL`, `LOG_FORMAT` | `info`, `text` | Log verbosity; `json` for structured logs |
+
+[CONFIG.md](CONFIG.md) documents every setting with its range and default.
 
 ## Metrics and health
 
-With metrics enabled, unauthenticated `/metrics` is served on `BIND_IP:METRICS_PORT`. `nirn_proxy_requests` observes Discord responses—one for each outbound attempt that returns response headers—so a transparent retry adds another observation. It excludes transport failures before headers and is not a count of logical inbound requests. `nirn_proxy_failures_total{reason}` separates scheduler, upstream, peer, and known-rate-limit deadline failures. The legacy `clientId` label contains only `Bot`, `Bearer`, or `NoAuth`, never an ID or token. Unknown methods become `OTHER`, numeric route components are normalized, and excessive or oversized route labels collapse to `/unknown`.
+Metrics are served without authentication at `/metrics` on `METRICS_PORT` while `ENABLE_METRICS` is on, as it is by
+default. Their names start with `sluice_`; set `METRICS_NAMESPACE=nirn_proxy` to keep nirn-proxy's names, dashboards
+and alerts.
 
-The legacy `nirn_proxy_open_connections` name is retained for dashboard compatibility, but the gauge counts active handler requests rather than TCP sockets.
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `sluice_requests` | `method`, `status`, `route`, `clientId` | Histogram of Discord responses, one per attempt |
+| `sluice_queue_wait_seconds` | `method`, `route` | Wait for the bucket and global limit before the first attempt |
+| `sluice_open_connections` | `method`, `route` | Requests being handled now, not TCP sockets |
+| `sluice_failures_total` | `reason` | Requests Sluice failed itself |
+| `sluice_error` | none | Errors logged |
+| `sluice_invalid_requests` | none | Invalid responses in the rolling 10 minutes |
+| `sluice_cloudflare_blocked` | none | 1 while a Cloudflare block pauses traffic |
+| `sluice_cloudflare_blocks_total` | none | Cloudflare blocks detected |
+| `sluice_webhook_short_circuits_total` | none | Calls to deleted webhooks answered by Sluice |
+| `sluice_requests_routed_sent`, `_received`, `_error` | none | Requests forwarded between cluster nodes |
 
-An importable dashboard is included at [grafana/nirn-proxy-dashboard.json](grafana/nirn-proxy-dashboard.json).
+`clientId` is a bot's user ID once Discord has accepted its token, and `Unverified` before that. Bearer and
+unauthenticated traffic show as `Bearer` and `NoAuth`, and bots past the first 1,024 share `Other`. Route labels are
+normalised and capped, so cardinality stays bounded. [grafana/sluice-dashboard.json](grafana/sluice-dashboard.json) is
+an importable Grafana dashboard for either metric prefix.
 
-| Metric | Labels |
-|---|---|
-| `nirn_proxy_error` | none |
-| `nirn_proxy_failures_total` | `reason` |
-| `nirn_proxy_requests` | `method`, `status`, `route`, `clientId` |
-| `nirn_proxy_open_connections` | `method`, `route` |
-| `nirn_proxy_requests_routed_sent` | none |
-| `nirn_proxy_requests_routed_received` | none |
-| `nirn_proxy_requests_routed_error` | none |
+The proxy port also serves two health endpoints:
 
-`GET /nirn/healthz` returns 200 while the proxy is available and 503 during shutdown or cluster over-capacity. When pprof is enabled, its endpoints are available under `http://BIND_IP:PPROF_PORT/debug/pprof/`; do not expose them publicly. Enabled listeners are bound before startup completes, so a port conflict fails startup.
+- `/sluice/healthz`, or nirn-proxy's `/nirn/healthz`, is liveness: `200`, or `503` while shutting down or when the
+  cluster exceeds `CLUSTER_MAX_NODES`.
+- `/sluice/health/upstream` answers `503` while a Cloudflare block is active or at least 80% of the invalid-request
+  budget is used. Alert on it; do not restart on it.
 
-## Running
+With `ENABLE_PPROF=true`, profiles are served at `/debug/pprof/` on `PPROF_PORT`. Never expose that port publicly.
 
-Build and run locally with a supported Go toolchain:
+## Migrating
 
-```sh
-go run .
-```
+Coming from nirn-proxy or from Melonly-Moderation's fork? [MIGRATING.md](MIGRATING.md) lists every difference.
 
-Release binaries and container images are available from the repository's [releases](https://github.com/Melonly-Moderation/nirn-proxy/releases) and [packages](https://github.com/Melonly-Moderation/nirn-proxy/pkgs/container/nirn-proxy).
+## Contributing
 
-Nirn Proxy is licensed under the terms in [LICENSE](LICENSE).
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Lineage and credits
+
+Sluice exists because of other people's work, and their commits remain in this repository's history.
+
+- **[nirn-proxy](https://github.com/germanoeich/nirn-proxy)** by [Germano Eichenberg](https://github.com/germanoeich).
+  It was born out of a need within [Dyno](https://dyno.gg), proved useful to many other bot developers, and is now
+  archived by its author. Sluice carries it on.
+- **[Melonly-Moderation's rewrite](https://github.com/Melonly-Moderation/nirn-proxy)** of nirn-proxy's engine: learned
+  buckets, the cancellation-safe scheduler, bounded state and authenticated clustering. Sluice's engine is that
+  rewrite.
+- **Community forks** of nirn-proxy by bsian03, PluralKit, DraftBot, TicketsBot, LorittaBot, WelcomerTeam and davfsa,
+  whose ideas Sluice uses.
+- **[weir](https://github.com/Xavinlol/weir)** by Xavin, whose Cloudflare-block detection, `Via` marking and upstream
+  health check inspired Sluice's own.
+
+nirn-proxy's acknowledgements, as its author wrote them:
+
+- [Eris](https://github.com/abalabahaha/eris) - used as reference throughout this project
+- [Twilight](https://github.com/twilight-rs) - used as inspiration and reference
+- [@bsian](https://github.com/bsian03) & [@bean](https://github.com/beanjo55) - for listening to my rants and providing assistance
+
+## License
+
+Sluice is free software under the [GNU General Public License v3.0](LICENSE), the license of nirn-proxy. It is a
+modified version of nirn-proxy: Vetox has changed it since 2026-09-30, and the commit history records every change.
+Copyright in nirn-proxy and in Melonly-Moderation's work stays with their authors.
