@@ -100,6 +100,18 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	if !ok {
 		return nil, fmt.Errorf("missing request scheduler metadata")
 	}
+	queuedAt := time.Now()
+	if metadata.webhookKey != "" {
+		if failure, blocked := t.proxy.webhooks.lookup(metadata.webhookKey, queuedAt); blocked {
+			if t.proxy.config.EnableMetrics {
+				WebhookShortCircuits.Inc()
+			}
+			return failure.response(request), nil
+		}
+	}
+	if pause := t.proxy.cloudflare.retryAfter(queuedAt); pause > 0 {
+		return cloudflarePauseResponse(request, pause), nil
+	}
 	// Check before joining any rate-limit queue; reserve again immediately before
 	// the outbound attempt to close races with concurrent invalid responses.
 	if !t.proxy.invalidRequests.available(time.Now()) {
@@ -194,6 +206,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 		}
 
+		if pause := t.proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
+			return cloudflarePauseResponse(request, pause), nil
+		}
 		body, err := replay.body(attempt)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errRetryPreparation, err)
@@ -211,6 +226,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		var started time.Time
 		if t.proxy.config.EnableMetrics {
 			started = time.Now()
+			if attempt == 0 {
+				QueueWaitHistogram.WithLabelValues(metadata.metricsMethod, metadata.metricsPath).Observe(started.Sub(queuedAt).Seconds())
+			}
 		}
 		response, err := t.base.RoundTrip(outbound)
 		if err != nil {
@@ -231,21 +249,36 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			response.Body = http.NoBody
 		}
 		t.proxy.invalidRequests.complete(time.Now(), invalidDiscordResponse(response))
+		if t.proxy.config.CloudflareBanDetection && isCloudflareBlock(response) {
+			pause := cloudflarePause(response.Header)
+			if t.proxy.cloudflare.block(time.Now(), pause) {
+				logger.Warn("Discord's edge blocked this IP; pausing outbound requests", "status", response.StatusCode, "pause", pause.String())
+				if t.proxy.config.EnableMetrics {
+					CloudflareBlocks.Inc()
+				}
+			}
+		}
+		if metadata.webhookKey != "" {
+			t.proxy.webhooks.observe(metadata.webhookKey, response, time.Now())
+		}
 
 		observedBucket := metadata.state.observeResponse(
 			metadata.routeHash,
 			metadata.majorKey,
 			metadata.bucketPath,
 			metadata.interaction,
+			metadata.credentialScoped,
 			bucket,
 			response,
 			t.proxy.config.Disable401Lock,
 		)
 		if validationHeld {
-			if response.StatusCode == http.StatusUnauthorized && !t.proxy.config.Disable401Lock {
-				metadata.state.validity.Store(clientInvalid)
-			} else {
+			// A 401 on a webhook-token route judges that token, not the credential being validated.
+			switch {
+			case response.StatusCode != http.StatusUnauthorized || metadata.credentialScoped && t.proxy.config.Disable401Lock:
 				metadata.state.validity.Store(clientValid)
+			case metadata.credentialScoped:
+				metadata.state.validity.Store(clientInvalid)
 			}
 			metadata.state.validation.release()
 			validationHeld = false
@@ -256,7 +289,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			if response.StatusCode == http.StatusTooManyRequests && response.Header.Get("X-RateLimit-Scope") == "shared" {
 				status = "429 Shared"
 			}
-			RequestHistogram.WithLabelValues(metadata.metricsMethod, status, metadata.metricsPath, metadata.state.identity.label).Observe(time.Since(started).Seconds())
+			RequestHistogram.WithLabelValues(metadata.metricsMethod, status, metadata.metricsPath, metadata.state.metricsLabel()).Observe(time.Since(started).Seconds())
 		}
 		if response.StatusCode != http.StatusTooManyRequests {
 			releaseBucket()
@@ -536,7 +569,7 @@ func syntheticResponse(request *http.Request, status int, body string) *http.Res
 	return &http.Response{
 		Status:        strconv.Itoa(status) + " " + http.StatusText(status),
 		StatusCode:    status,
-		Header:        http.Header{"Content-Type": {"application/json"}},
+		Header:        http.Header{"Content-Type": {"application/json"}, "Generated-By-Proxy": {"true"}, "Via": {sluiceVia}},
 		Body:          io.NopCloser(bytes.NewBufferString(body)),
 		ContentLength: int64(len(body)),
 		Request:       request,
@@ -615,8 +648,9 @@ func (p *Proxy) initReverseProxies() {
 	errorLog := log.New(io.Discard, "", 0)
 	p.discordProxy = &httputil.ReverseProxy{
 		Rewrite: func(proxyRequest *httputil.ProxyRequest) {
+			// Rewrite drops Forwarded and X-Forwarded-* by default, so client addresses never reach Discord.
 			proxyRequest.SetURL(p.discordURL)
-			preserveForwardingHeaders(proxyRequest)
+			setDefaultUserAgent(proxyRequest)
 		},
 		Transport:  &scheduledTransport{base: p.transport, proxy: p},
 		BufferPool: buffers,
@@ -635,7 +669,7 @@ func (p *Proxy) initReverseProxies() {
 				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
 			case errors.Is(err, errUpstreamDeadline):
 				ProxyFailures.WithLabelValues("upstream_timeout").Inc()
-				writeProxyError(writer, err.Error(), http.StatusGatewayTimeout)
+				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
 			case errors.Is(err, context.DeadlineExceeded):
 				ProxyFailures.WithLabelValues("deadline").Inc()
 				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
@@ -679,6 +713,10 @@ func preserveForwardingHeaders(proxyRequest *httputil.ProxyRequest) {
 			proxyRequest.Out.Header[name] = append([]string(nil), values...)
 		}
 	}
+	setDefaultUserAgent(proxyRequest)
+}
+
+func setDefaultUserAgent(proxyRequest *httputil.ProxyRequest) {
 	if proxyRequest.In.Header.Get("User-Agent") == "" {
 		proxyRequest.Out.Header.Set("User-Agent", userAgent())
 	}

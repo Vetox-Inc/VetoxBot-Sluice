@@ -57,22 +57,23 @@ func TestErrorLogsIncrementErrorCounter(t *testing.T) {
 }
 
 func TestMetricsNamespaceNamesEveryMetric(t *testing.T) {
-	for namespace, want := range map[string][]string{
-		"nirn_proxy": {
-			"nirn_proxy_error", "nirn_proxy_failures_total", "nirn_proxy_open_connections", "nirn_proxy_requests",
-			"nirn_proxy_requests_routed_error", "nirn_proxy_requests_routed_received", "nirn_proxy_requests_routed_sent",
-		},
-		DefaultMetricsNamespace: {
-			"sluice_error", "sluice_failures_total", "sluice_open_connections", "sluice_requests",
-			"sluice_requests_routed_error", "sluice_requests_routed_received", "sluice_requests_routed_sent",
-		},
-	} {
+	suffixes := []string{
+		"cloudflare_blocked", "cloudflare_blocks_total", "error", "failures_total", "invalid_requests", "open_connections",
+		"queue_wait_seconds", "requests", "requests_routed_error", "requests_routed_received", "requests_routed_sent",
+		"webhook_short_circuits_total",
+	}
+	for _, namespace := range []string{"nirn_proxy", DefaultMetricsNamespace} {
 		t.Run(namespace, func(t *testing.T) {
+			var want []string
+			for _, suffix := range suffixes {
+				want = append(want, namespace+"_"+suffix)
+			}
 			set := newMetricSet(namespace)
 			set.errors.Inc()
 			set.failures.WithLabelValues("test").Inc()
 			set.requests.WithLabelValues("GET", "200 OK", "/gateway", "NoAuth").Observe(0.1)
 			set.openConnections.WithLabelValues("GET", "/gateway").Inc()
+			set.queueWait.WithLabelValues("GET", "/gateway").Observe(0.1)
 			families, err := set.registry.Gather()
 			if err != nil {
 				t.Fatal(err)

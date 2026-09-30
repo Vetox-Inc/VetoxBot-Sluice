@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -24,11 +25,11 @@ var settingGroups = []struct {
 	title string
 	names []string
 }{
-	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2"}},
+	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2", "DISCORD_API_URL"}},
 	{"Scheduling and retries", []string{"QUEUE_TIMEOUT", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES", "MAX_BEARER_COUNT", "MAX_CLIENT_STATES", "MAX_BUCKET_STATES"}},
-	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK"}},
+	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION"}},
 	{"Observability", []string{"ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
-	{"Clustering", []string{"CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_MAX_NODES", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_MEMBERS", "CLUSTER_DNS", "NODE_NAME"}},
+	{"Clustering", []string{"CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_ADVERTISE_ADDR", "CLUSTER_MAX_NODES", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_MEMBERS", "CLUSTER_DNS", "NODE_NAME"}},
 }
 
 // obsoleteSettings are nirn-proxy variables that are accepted but no longer have an effect.
@@ -47,15 +48,16 @@ type appConfig struct {
 	enablePprof      bool
 	metricsNamespace string
 
-	clusterPort      int
-	clusterPeerPort  int
-	clusterMaxNodes  int
-	clusterMembers   []string
-	clusterDNS       string
-	nodeName         string
-	clusterSecret    string
-	clusterServerTLS *tls.Config
-	clusterClientTLS *tls.Config
+	clusterPort          int
+	clusterPeerPort      int
+	clusterMaxNodes      int
+	clusterMembers       []string
+	clusterDNS           string
+	clusterAdvertiseAddr string
+	nodeName             string
+	clusterSecret        string
+	clusterServerTLS     *tls.Config
+	clusterClientTLS     *tls.Config
 
 	proxy proxy.Config
 }
@@ -137,6 +139,18 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
+	cloudflareBanDetection, err := envBool("CLOUDFLARE_BAN_DETECTION", true)
+	if err != nil {
+		return appConfig{}, err
+	}
+	discordURL := envString("DISCORD_API_URL", proxy.DefaultDiscordURL)
+	if _, err := proxy.ParseDiscordURL(discordURL); err != nil {
+		return appConfig{}, fmt.Errorf("DISCORD_API_URL: %w", err)
+	}
+	clusterAdvertiseAddr := strings.TrimSpace(os.Getenv("CLUSTER_ADVERTISE_ADDR"))
+	if clusterAdvertiseAddr != "" && net.ParseIP(clusterAdvertiseAddr) == nil {
+		return appConfig{}, fmt.Errorf("CLUSTER_ADVERTISE_ADDR must be an IP address")
+	}
 	metricsNamespace := envString("METRICS_NAMESPACE", proxy.DefaultMetricsNamespace)
 	if !metricsNamespacePattern.MatchString(metricsNamespace) {
 		return appConfig{}, fmt.Errorf("METRICS_NAMESPACE must match [a-zA-Z_][a-zA-Z0-9_]*")
@@ -165,38 +179,41 @@ func loadConfig() (appConfig, error) {
 	}
 
 	return appConfig{
-		bindIP:           envString("BIND_IP", "0.0.0.0"),
-		port:             port,
-		metricsPort:      metricsPort,
-		pprofPort:        pprofPort,
-		enableMetrics:    enableMetrics,
-		enablePprof:      enablePprof,
-		metricsNamespace: metricsNamespace,
-		clusterPort:      clusterPort,
-		clusterPeerPort:  clusterPeerPort,
-		clusterMaxNodes:  clusterMaxNodes,
-		clusterMembers:   clusterMembers,
-		clusterDNS:       clusterDNS,
-		nodeName:         strings.TrimSpace(os.Getenv("NODE_NAME")),
-		clusterSecret:    clusterSecret,
-		clusterServerTLS: clusterServerTLS,
-		clusterClientTLS: clusterClientTLS,
+		bindIP:               envString("BIND_IP", "0.0.0.0"),
+		port:                 port,
+		metricsPort:          metricsPort,
+		pprofPort:            pprofPort,
+		enableMetrics:        enableMetrics,
+		enablePprof:          enablePprof,
+		metricsNamespace:     metricsNamespace,
+		clusterPort:          clusterPort,
+		clusterPeerPort:      clusterPeerPort,
+		clusterMaxNodes:      clusterMaxNodes,
+		clusterMembers:       clusterMembers,
+		clusterDNS:           clusterDNS,
+		clusterAdvertiseAddr: clusterAdvertiseAddr,
+		nodeName:             strings.TrimSpace(os.Getenv("NODE_NAME")),
+		clusterSecret:        clusterSecret,
+		clusterServerTLS:     clusterServerTLS,
+		clusterClientTLS:     clusterClientTLS,
 		proxy: proxy.Config{
-			OutboundIP:           strings.TrimSpace(os.Getenv("OUTBOUND_IP")),
-			UpstreamTimeout:      requestTimeout,
-			QueueTimeout:         queueTimeout,
-			DisableHTTP2:         disableHTTP2,
-			Disable401Lock:       disable401Lock,
-			EnableMetrics:        enableMetrics,
-			GlobalOverrides:      strings.TrimSpace(os.Getenv("BOT_RATELIMIT_OVERRIDES")),
-			MaxBearerClients:     maxBearerClients,
-			MaxClientStates:      maxClientStates,
-			MaxInFlightRequests:  maxInFlightRequests,
-			MaxBucketStates:      maxBucketStates,
-			MaxQueueDepth:        maxQueueDepth,
-			MaxRetryBodyBytes:    maxRetryBodyBytes,
-			MaxRetryCaptureBytes: maxRetryCaptureBytes,
-			InvalidRequestLimit:  invalidRequestLimit,
+			OutboundIP:             strings.TrimSpace(os.Getenv("OUTBOUND_IP")),
+			UpstreamTimeout:        requestTimeout,
+			QueueTimeout:           queueTimeout,
+			DisableHTTP2:           disableHTTP2,
+			Disable401Lock:         disable401Lock,
+			EnableMetrics:          enableMetrics,
+			GlobalOverrides:        strings.TrimSpace(os.Getenv("BOT_RATELIMIT_OVERRIDES")),
+			MaxBearerClients:       maxBearerClients,
+			MaxClientStates:        maxClientStates,
+			MaxInFlightRequests:    maxInFlightRequests,
+			MaxBucketStates:        maxBucketStates,
+			MaxQueueDepth:          maxQueueDepth,
+			MaxRetryBodyBytes:      maxRetryBodyBytes,
+			MaxRetryCaptureBytes:   maxRetryCaptureBytes,
+			InvalidRequestLimit:    invalidRequestLimit,
+			DiscordURL:             discordURL,
+			CloudflareBanDetection: cloudflareBanDetection,
 		},
 	}, nil
 }

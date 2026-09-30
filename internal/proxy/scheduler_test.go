@@ -588,7 +588,7 @@ func TestLearnedAliasIsBlockedBeforePublication(t *testing.T) {
 	}), nil)
 	done := make(chan *bucketState, 1)
 	go func() {
-		done <- state.observeResponse(route, major, "/channels/:channel_id/messages", false, current, response, false)
+		done <- state.observeResponse(route, major, "/channels/:channel_id/messages", false, true, current, response, false)
 	}()
 
 	deadline := time.Now().Add(time.Second)

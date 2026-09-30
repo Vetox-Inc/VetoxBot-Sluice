@@ -46,6 +46,13 @@ func (g *invalidRequestGuard) available(now time.Time) bool {
 	return len(g.timestamps)-g.head+g.reserved < g.limit
 }
 
+func (g *invalidRequestGuard) count(now time.Time) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.prune(now)
+	return len(g.timestamps) - g.head
+}
+
 func (g *invalidRequestGuard) reserve(now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -264,8 +271,8 @@ func parseRateLimitHeaders(header http.Header, statusCode int, now time.Time) (r
 	return info, nil
 }
 
-func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath string, interaction bool, bucket *bucketState, response *http.Response, disable401Lock bool) *bucketState {
-	if response.StatusCode == http.StatusUnauthorized && !interaction && s.identity.kind != authNone && !disable401Lock {
+func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath string, interaction, credentialScoped bool, bucket *bucketState, response *http.Response, disable401Lock bool) *bucketState {
+	if response.StatusCode == http.StatusUnauthorized && credentialScoped && s.identity.kind != authNone && !disable401Lock {
 		s.validity.Store(clientInvalid)
 	}
 

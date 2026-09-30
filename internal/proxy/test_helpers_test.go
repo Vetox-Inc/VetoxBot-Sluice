@@ -93,13 +93,15 @@ func scheduledRequest(t *testing.T, ctx context.Context, state *clientState, met
 	bucketPath := GetOptimisticBucketPath(path, method)
 	majorKey := majorParameter(path)
 	metadata := &requestMetadata{
-		state:         state,
-		routeHash:     routeHash(method, bucketPath, majorKey),
-		bucketPath:    bucketPath,
-		metricsMethod: metricsMethodLabel(method),
-		metricsPath:   bucketPath,
-		majorKey:      majorKey,
-		interaction:   interaction,
+		state:            state,
+		routeHash:        routeHash(method, bucketPath, majorKey),
+		bucketPath:       bucketPath,
+		metricsMethod:    metricsMethodLabel(method),
+		metricsPath:      bucketPath,
+		majorKey:         majorKey,
+		interaction:      interaction,
+		credentialScoped: !interaction && webhookCredentialKey(path, interaction) == "",
+		webhookKey:       webhookCredentialKey(path, interaction),
 	}
 	return request.WithContext(context.WithValue(request.Context(), requestMetadataContextKey, metadata))
 }

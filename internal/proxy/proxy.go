@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -21,26 +22,32 @@ const (
 
 	hopHeader        = "X-Sluice-Hop"
 	proxyErrorHeader = "X-Sluice-Proxy-Error"
+	sluiceVia        = "1.1 sluice"
+
+	// DefaultDiscordURL is where requests go unless Config.DiscordURL points elsewhere.
+	DefaultDiscordURL = "https://discord.com"
 )
 
 // Config controls request scheduling, resource bounds, transport, and metrics.
 type Config struct {
-	OutboundIP           string
-	UpstreamTimeout      time.Duration
-	QueueTimeout         time.Duration
-	DisableHTTP2         bool
-	Disable401Lock       bool
-	EnableMetrics        bool
-	GlobalOverrides      string
-	MaxBearerClients     int
-	MaxBucketStates      int
-	MaxClientStates      int
-	MaxInFlightRequests  int
-	MaxQueueDepth        int
-	MaxRetryBodyBytes    int64
-	MaxRetryCaptureBytes int64
-	InvalidRequestLimit  int
-	Transport            http.RoundTripper
+	OutboundIP             string
+	UpstreamTimeout        time.Duration
+	QueueTimeout           time.Duration
+	DisableHTTP2           bool
+	Disable401Lock         bool
+	EnableMetrics          bool
+	GlobalOverrides        string
+	MaxBearerClients       int
+	MaxBucketStates        int
+	MaxClientStates        int
+	MaxInFlightRequests    int
+	MaxQueueDepth          int
+	MaxRetryBodyBytes      int64
+	MaxRetryCaptureBytes   int64
+	InvalidRequestLimit    int
+	DiscordURL             string
+	CloudflareBanDetection bool
+	Transport              http.RoundTripper
 }
 
 type requestContextKey uint8
@@ -58,6 +65,10 @@ type requestMetadata struct {
 	metricsPath   string
 	majorKey      string
 	interaction   bool
+	// credentialScoped marks routes authenticated by the Authorization credential rather than
+	// by a webhook or interaction token in the path.
+	credentialScoped bool
+	webhookKey       string
 }
 
 type peerTarget struct {
@@ -79,6 +90,8 @@ type Proxy struct {
 
 	globalOverrides map[string]uint
 	invalidRequests *invalidRequestGuard
+	webhooks        *webhookGuard
+	cloudflare      *cloudflareGuard
 	bucketSlots     *resourceBudget
 	inFlight        *resourceBudget
 	retryCapture    *resourceBudget
@@ -182,8 +195,11 @@ func New(config Config) (*Proxy, error) {
 		}
 	}
 
+	discordURL, err := ParseDiscordURL(config.DiscordURL)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	discordURL, _ := url.Parse("https://discord.com")
 	p := &Proxy{
 		config:          config,
 		ctx:             ctx,
@@ -192,6 +208,8 @@ func New(config Config) (*Proxy, error) {
 		bearers:         make(map[[sha256.Size]byte]*clientState),
 		globalOverrides: overrides,
 		invalidRequests: newInvalidRequestGuard(invalidLimit, invalidRequestWindow),
+		webhooks:        newWebhookGuard(),
+		cloudflare:      &cloudflareGuard{},
 		bucketSlots:     newResourceBudget(int64(config.MaxBucketStates)),
 		inFlight:        newResourceBudget(int64(config.MaxInFlightRequests)),
 		retryCapture:    newResourceBudget(config.MaxRetryCaptureBytes),
@@ -203,7 +221,41 @@ func New(config Config) (*Proxy, error) {
 	p.initReverseProxies()
 	p.wg.Add(1)
 	go p.sweepLoop()
+	activeProxy.Store(p)
 	return p, nil
+}
+
+// ParseDiscordURL validates a Discord API base URL. An empty value means DefaultDiscordURL.
+func ParseDiscordURL(value string) (*url.URL, error) {
+	if value == "" {
+		value = DefaultDiscordURL
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return nil, fmt.Errorf("Discord API URL must be an absolute URL without a path, such as %s", DefaultDiscordURL)
+	}
+	switch parsed.Scheme {
+	case "https":
+	case "http":
+		if host := parsed.Hostname(); host != "localhost" && !net.ParseIP(host).IsLoopback() {
+			return nil, fmt.Errorf("Discord API URL must use https unless it points at a loopback address")
+		}
+	default:
+		return nil, fmt.Errorf("Discord API URL must use https")
+	}
+	parsed.Path = ""
+	return parsed, nil
+}
+
+// upstreamProblem explains why Discord is unreachable from this node, or returns "".
+func (p *Proxy) upstreamProblem(now time.Time) string {
+	if p.cloudflare.retryAfter(now) > 0 {
+		return "Discord's edge is blocking this IP"
+	}
+	if p.invalidRequests.count(now)*5 >= p.invalidRequests.limit*4 {
+		return "invalid-request budget is at least 80% used"
+	}
+	return ""
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -218,6 +270,13 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			} else {
 				writer.WriteHeader(http.StatusOK)
 			}
+		}
+		return
+	case "/sluice/health/upstream":
+		if problem := p.upstreamProblem(time.Now()); problem != "" {
+			writeUnavailable(writer, problem)
+		} else {
+			writer.WriteHeader(http.StatusOK)
 		}
 		return
 	}
@@ -240,6 +299,11 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "protocol upgrades are not supported", http.StatusBadRequest)
 		return
 	}
+	if !isCleanDiscordPath(request.URL) {
+		writeProxyError(writer, "path contains dot segments or encoded separators", http.StatusBadRequest)
+		return
+	}
+	ensureAPIPrefix(request.URL)
 	if p.clusterOverCapacity.Load() {
 		writeUnavailable(writer, "cluster exceeds CLUSTER_MAX_NODES")
 		return
@@ -293,14 +357,17 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	defer state.end()
 
 	majorKey := majorParameter(request.URL.Path)
+	webhookKey := webhookCredentialKey(request.URL.Path, interaction)
 	metadata := &requestMetadata{
-		state:         state,
-		routeHash:     routeHash(request.Method, bucketPath, majorKey),
-		bucketPath:    bucketPath,
-		metricsMethod: metricsMethod,
-		metricsPath:   metricsPath,
-		majorKey:      majorKey,
-		interaction:   interaction,
+		state:            state,
+		routeHash:        routeHash(request.Method, bucketPath, majorKey),
+		bucketPath:       bucketPath,
+		metricsMethod:    metricsMethod,
+		metricsPath:      metricsPath,
+		majorKey:         majorKey,
+		interaction:      interaction,
+		credentialScoped: !interaction && webhookKey == "",
+		webhookKey:       webhookKey,
 	}
 	ctx := context.WithValue(request.Context(), requestMetadataContextKey, metadata)
 	p.discordProxy.ServeHTTP(writer, request.WithContext(ctx))
@@ -346,6 +413,8 @@ func writeUnavailable(writer http.ResponseWriter, message string) {
 func writeProxyError(writer http.ResponseWriter, message string, status int) {
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.Header().Set(proxyErrorHeader, "true")
+	writer.Header().Set("Generated-By-Proxy", "true")
+	writer.Header().Set("Via", sluiceVia)
 	writer.WriteHeader(status)
 	_, _ = writer.Write([]byte(message + "\n"))
 }
@@ -379,6 +448,7 @@ func (p *Proxy) Close(ctx context.Context) error {
 }
 
 func (p *Proxy) finishClose() {
+	activeProxy.CompareAndSwap(p, nil)
 	p.closeErr = p.closeCluster(context.Background())
 	p.clientsMu.Lock()
 	p.bots = nil

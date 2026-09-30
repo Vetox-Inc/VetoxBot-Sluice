@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,25 +23,34 @@ import (
 const DefaultMetricsNamespace = "sluice"
 
 const (
-	maxMetricsRouteLabels     = 1024
-	maxMetricsRouteLabelBytes = 512
-	overflowMetricsRouteLabel = "/unknown"
-	auxiliaryReadTimeout      = 15 * time.Second
-	auxiliaryWriteTimeout     = 2 * time.Minute
-	auxiliaryIdleTimeout      = 30 * time.Second
+	maxMetricsRouteLabels      = 1024
+	maxMetricsRouteLabelBytes  = 512
+	overflowMetricsRouteLabel  = "/unknown"
+	maxMetricsClientLabels     = 1024
+	overflowMetricsClientLabel = "Other"
+	auxiliaryReadTimeout       = 15 * time.Second
+	auxiliaryWriteTimeout      = 2 * time.Minute
+	auxiliaryIdleTimeout       = 30 * time.Second
 )
 
 var (
-	ErrorCounter        prometheus.Counter
-	ProxyFailures       *prometheus.CounterVec
-	RequestHistogram    *prometheus.HistogramVec
-	ConnectionsOpen     *prometheus.GaugeVec
-	RequestsRoutedSent  prometheus.Counter
-	RequestsRoutedRecv  prometheus.Counter
-	RequestsRoutedError prometheus.Counter
+	ErrorCounter         prometheus.Counter
+	ProxyFailures        *prometheus.CounterVec
+	RequestHistogram     *prometheus.HistogramVec
+	QueueWaitHistogram   *prometheus.HistogramVec
+	ConnectionsOpen      *prometheus.GaugeVec
+	RequestsRoutedSent   prometheus.Counter
+	RequestsRoutedRecv   prometheus.Counter
+	RequestsRoutedError  prometheus.Counter
+	WebhookShortCircuits prometheus.Counter
+	CloudflareBlocks     prometheus.Counter
 
 	metricsRegistry *prometheus.Registry
 	metricsRoutes   = newRouteLabelLimiter(maxMetricsRouteLabels)
+	clientLabels    = newLabelLimiter(maxMetricsClientLabels, overflowMetricsClientLabel)
+
+	// activeProxy feeds the gauges that read live proxy state.
+	activeProxy atomic.Pointer[Proxy]
 
 	logger = NewLogger(os.Stderr, slog.LevelInfo, "text")
 
@@ -59,14 +69,17 @@ func init() {
 }
 
 type metricSet struct {
-	registry        *prometheus.Registry
-	errors          prometheus.Counter
-	failures        *prometheus.CounterVec
-	requests        *prometheus.HistogramVec
-	openConnections *prometheus.GaugeVec
-	routedSent      prometheus.Counter
-	routedReceived  prometheus.Counter
-	routedError     prometheus.Counter
+	registry             *prometheus.Registry
+	errors               prometheus.Counter
+	failures             *prometheus.CounterVec
+	requests             *prometheus.HistogramVec
+	queueWait            *prometheus.HistogramVec
+	openConnections      *prometheus.GaugeVec
+	routedSent           prometheus.Counter
+	routedReceived       prometheus.Counter
+	routedError          prometheus.Counter
+	webhookShortCircuits prometheus.Counter
+	cloudflareBlocks     prometheus.Counter
 }
 
 func newMetricSet(namespace string) metricSet {
@@ -85,6 +98,11 @@ func newMetricSet(namespace string) metricSet {
 			Help:    "Request histogram",
 			Buckets: []float64{.1, .25, 1, 2.5, 5, 20},
 		}, []string{"method", "status", "route", "clientId"}),
+		queueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Name: "queue_wait_seconds",
+			Help:    "Time a request waited for its rate-limit bucket and the global limit before its first Discord attempt",
+			Buckets: []float64{.005, .025, .1, .25, 1, 2.5, 5, 10, 30, 60},
+		}, []string{"method", "route"}),
 		openConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "open_connections",
 			Help: "Gauge for requests currently active in the proxy handler",
@@ -101,12 +119,38 @@ func newMetricSet(namespace string) metricSet {
 			Namespace: namespace, Name: "requests_routed_error",
 			Help: "Counter for failed requests routed from this node",
 		}),
+		webhookShortCircuits: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "webhook_short_circuits_total",
+			Help: "Requests to deleted or invalid webhooks answered without contacting Discord",
+		}),
+		cloudflareBlocks: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "cloudflare_blocks_total",
+			Help: "Times Discord's edge blocked this IP and outbound traffic was paused",
+		}),
 	}
 	set.registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		set.errors, set.failures, set.requests, set.openConnections,
-		set.routedSent, set.routedReceived, set.routedError,
+		set.errors, set.failures, set.requests, set.queueWait, set.openConnections,
+		set.routedSent, set.routedReceived, set.routedError, set.webhookShortCircuits, set.cloudflareBlocks,
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "invalid_requests",
+			Help: "Invalid Discord responses (401, 403, non-shared 429) in the rolling 10-minute window",
+		}, func() float64 {
+			if p := activeProxy.Load(); p != nil {
+				return float64(p.invalidRequests.count(time.Now()))
+			}
+			return 0
+		}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "cloudflare_blocked",
+			Help: "1 while outbound traffic is paused because Discord's edge blocked this IP",
+		}, func() float64 {
+			if p := activeProxy.Load(); p != nil && p.cloudflare.retryAfter(time.Now()) > 0 {
+				return 1
+			}
+			return 0
+		}),
 	)
 	return set
 }
@@ -119,39 +163,48 @@ func ConfigureMetrics(namespace string) {
 	ErrorCounter = set.errors
 	ProxyFailures = set.failures
 	RequestHistogram = set.requests
+	QueueWaitHistogram = set.queueWait
 	ConnectionsOpen = set.openConnections
 	RequestsRoutedSent = set.routedSent
 	RequestsRoutedRecv = set.routedReceived
 	RequestsRoutedError = set.routedError
+	WebhookShortCircuits = set.webhookShortCircuits
+	CloudflareBlocks = set.cloudflareBlocks
 }
 
 type routeLabelLimiter struct {
-	mu    sync.Mutex
-	limit int
-	seen  map[string]struct{}
+	mu       sync.Mutex
+	limit    int
+	overflow string
+	seen     map[string]struct{}
 }
 
 func newRouteLabelLimiter(limit int) *routeLabelLimiter {
+	return newLabelLimiter(limit, overflowMetricsRouteLabel)
+}
+
+func newLabelLimiter(limit int, overflow string) *routeLabelLimiter {
 	return &routeLabelLimiter{
-		limit: limit,
-		seen:  map[string]struct{}{overflowMetricsRouteLabel: {}},
+		limit:    limit,
+		overflow: overflow,
+		seen:     map[string]struct{}{overflow: {}},
 	}
 }
 
-func (l *routeLabelLimiter) label(route string) string {
-	if len(route) > maxMetricsRouteLabelBytes {
-		return overflowMetricsRouteLabel
+func (l *routeLabelLimiter) label(value string) string {
+	if len(value) > maxMetricsRouteLabelBytes {
+		return l.overflow
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, ok := l.seen[route]; ok {
-		return route
+	if _, ok := l.seen[value]; ok {
+		return value
 	}
 	if len(l.seen) >= l.limit {
-		return overflowMetricsRouteLabel
+		return l.overflow
 	}
-	l.seen[route] = struct{}{}
-	return route
+	l.seen[value] = struct{}{}
+	return value
 }
 
 // metricsRouteLabel bounds the number of request-derived Prometheus route labels.

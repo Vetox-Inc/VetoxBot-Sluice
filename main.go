@@ -270,14 +270,15 @@ func joinCluster(serverProxy *proxy.Proxy, config appConfig) error {
 		}
 	}
 	if err := serverProxy.JoinCluster(proxy.ClusterConfig{
-		KnownMembers: knownMembers,
-		BindAddress:  config.bindIP,
-		Port:         config.clusterPort,
-		PeerPort:     config.clusterPeerPort,
-		MaxNodes:     config.clusterMaxNodes,
-		NodeName:     config.nodeName,
-		Secret:       config.clusterSecret,
-		PeerTLS:      config.clusterClientTLS,
+		KnownMembers:     knownMembers,
+		BindAddress:      config.bindIP,
+		AdvertiseAddress: config.clusterAdvertiseAddr,
+		Port:             config.clusterPort,
+		PeerPort:         config.clusterPeerPort,
+		MaxNodes:         config.clusterMaxNodes,
+		NodeName:         config.nodeName,
+		Secret:           config.clusterSecret,
+		PeerTLS:          config.clusterClientTLS,
 	}); err != nil {
 		return fmt.Errorf("initialize cluster: %w", err)
 	}

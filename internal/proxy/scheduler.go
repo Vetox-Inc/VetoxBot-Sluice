@@ -320,6 +320,18 @@ func (s *clientState) touch() {
 	s.lastUsed.Store(time.Now().UnixNano())
 }
 
+// metricsLabel names a credential in metrics: a bot by its user ID once Discord has accepted
+// its token, so forged tokens cannot mint label values.
+func (s *clientState) metricsLabel() string {
+	if s.identity.kind != authBot {
+		return s.identity.label
+	}
+	if s.validity.Load() != clientValid || s.identity.botID == "" {
+		return "Unverified"
+	}
+	return clientLabels.label(s.identity.botID)
+}
+
 func (s *clientState) begin() {
 	s.active.Add(1)
 	s.touch()

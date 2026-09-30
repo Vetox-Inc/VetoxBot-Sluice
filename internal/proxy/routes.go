@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"hash/crc64"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +24,10 @@ const (
 )
 
 var crc64Table = crc64.MakeTable(crc64.ISO)
+
+// identifierFollows names literal segments followed by a non-numeric identifier, so neither
+// buckets nor metric labels multiply per activity instance, provider identity or template code.
+var identifierFollows = map[string]bool{"activity-instances": true, "identities": true, "templates": true}
 
 // HashCRC64 returns the stable hash used for bucket and cluster affinity.
 func HashCRC64(data string) uint64 {
@@ -141,7 +148,13 @@ func GetOptimisticBucketPath(path, method string) string {
 	}
 
 	remainingParts := parts[2:]
+	collapseRest := false
 	for index, part := range remainingParts {
+		if identifierFollows[parts[index+1]] || collapseRest && part != "delete" {
+			bucket.WriteString("/!")
+			continue
+		}
+		collapseRest = collapseRest || part == "application-identities"
 		if isSnowflake(part) {
 			if currentMajor == majorChannels && parts[index+1] == "messages" && method == "DELETE" && index == len(remainingParts)-1 {
 				createdAt, _ := snowflakeCreatedAt(part)
@@ -233,4 +246,38 @@ func isInteractionEndpoint(path string) bool {
 		return true
 	}
 	return len(parts) >= 3 && parts[0] == majorWebhooks && strings.HasPrefix(parts[2], interactionTokenPrefix)
+}
+
+// isCleanDiscordPath rejects dot segments and encoded separators, which could make Discord
+// resolve a different route from the one this proxy rate-limited.
+func isCleanDiscordPath(u *url.URL) bool {
+	for _, segment := range strings.Split(u.EscapedPath(), "/") {
+		decoded, err := url.PathUnescape(segment)
+		if err != nil || decoded == "." || decoded == ".." || strings.ContainsAny(decoded, "/\\") {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureAPIPrefix lets clients whose base URL omits /api work unchanged.
+func ensureAPIPrefix(u *url.URL) {
+	if u.Path == "/api" || strings.HasPrefix(u.Path, "/api/") {
+		return
+	}
+	u.Path = "/api" + u.Path
+	if u.RawPath != "" {
+		u.RawPath = "/api" + u.RawPath
+	}
+}
+
+// webhookCredentialKey identifies a webhook authenticated by the token in its path, or ""
+// for every other route. Interaction follow-ups are excluded: their tokens expire on their own.
+func webhookCredentialKey(path string, interaction bool) string {
+	parts := cleanAPIPath(path)
+	if interaction || len(parts) < 3 || parts[0] != majorWebhooks {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(parts[1] + "/" + parts[2]))
+	return hex.EncodeToString(digest[:16])
 }

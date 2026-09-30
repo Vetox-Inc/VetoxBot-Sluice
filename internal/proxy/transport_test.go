@@ -678,8 +678,8 @@ func TestTimeoutResponseDoesNotDependOnLogOutput(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout response blocked on log output")
 	}
-	if response.Code != http.StatusGatewayTimeout || response.Header().Get(proxyErrorHeader) != "true" {
-		t.Fatalf("status=%d proxy-error=%q, want 504/true", response.Code, response.Header().Get(proxyErrorHeader))
+	if response.Code != http.StatusRequestTimeout || response.Header().Get(proxyErrorHeader) != "true" {
+		t.Fatalf("status=%d proxy-error=%q, want 408/true", response.Code, response.Header().Get(proxyErrorHeader))
 	}
 }
 

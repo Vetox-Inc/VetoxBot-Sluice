@@ -38,13 +38,17 @@ Per-attempt deadline for sending the Discord request body through consuming its 
 
 Disables HTTP/2 on outbound connections when `true`. It does not affect the inbound server. Default: `true` because a stalled multiplexed connection can delay unrelated Discord requests.
 
+### `DISCORD_API_URL`
+
+Base URL requests are forwarded to. Default: `https://discord.com`. Point it at a mock or staging server for testing. It must use `https` unless the host is loopback, and must not include a path. Never use `discordapp.com`, which rejects API v10.
+
 ## Scheduling and retries
 
 ### `QUEUE_TIMEOUT`
 
 Overall deadline once scheduling begins, including FIFO and global waits, every outbound attempt, retry delays, and final Discord response streaming. It is not renewed per retry. Valid range: 1 through 86,400,000 milliseconds. Default: `60000`.
 
-Before Discord response headers arrive, an expired scheduler queue returns `408 Request Timeout`, while a Discord attempt that exceeds `REQUEST_TIMEOUT` returns `504 Gateway Timeout`. Both responses include `X-Sluice-Proxy-Error: true`. If a deadline expires after response headers were forwarded, Sluice aborts the response stream because its status can no longer be changed.
+Before Discord response headers arrive, an expired scheduler queue and a Discord attempt that exceeds `REQUEST_TIMEOUT` both return `408 Request Timeout`, as nirn-proxy did; the message says which deadline expired. Both responses include `X-Sluice-Proxy-Error: true`. If a deadline expires after response headers were forwarded, Sluice aborts the response stream because its status can no longer be changed.
 
 When Discord has already supplied a cooldown that cannot leave a full `REQUEST_TIMEOUT` attempt before this deadline, Sluice returns the current Discord `429` or a cached `429` with `Retry-After` immediately instead of holding the connection until it times out.
 
@@ -94,6 +98,8 @@ In stand-alone mode, Sluice stops new upstream attempts after recording 9,500 in
 
 In cluster mode, each node receives `max(1, floor(9500 / CLUSTER_MAX_NODES))` slots. With the default maximum of 32 nodes, that is 296 per node and at most 9,472 across the cluster. This static partition protects a shared-NAT budget only when every process using that egress is in this cluster, every node uses the same maximum, and the actual membership never exceeds it. A process restart resets that node's local rolling history, so deployment churn still consumes the shared headroom.
 
+Sluice answers requests to a webhook that Discord reported as deleted (code 10015), or whose token it rejected (code 50027), itself for an hour, because Discord restricts IPs that keep calling such webhooks. Other 404s, such as a missing message, are never cached.
+
 ### `BOT_RATELIMIT_OVERRIDES`
 
 Comma-separated explicit global capacities for credentials with Discord-approved elevated limits. Default: empty.
@@ -113,9 +119,13 @@ Limits must be positive integers. A bot-ID override takes precedence over a fing
 
 ### `DISABLE_401_LOCK`
 
-When `false`, the first ordinary authenticated 401 marks that credential invalid and later requests fail locally with Discord-shaped 401 responses. Interaction endpoints are excluded. Default: `false`.
+When `false`, the first ordinary authenticated 401 marks that credential invalid and later requests fail locally with Discord-shaped 401 responses. Interaction endpoints and webhook-token routes are excluded, because their 401s judge the token in the path rather than the credential. Default: `false`.
 
 Set this to `true` only if credentials can become valid again without changing their token. Cached validity is reclaimed after the credential has been inactive and unblocked for more than 10 minutes.
+
+### `CLOUDFLARE_BAN_DETECTION`
+
+When `true`, a 429 or 403 without Discord's `Via` header, meaning Cloudflare answered rather than Discord, pauses every outbound request from this node for the response's `Retry-After`: 60 seconds when it is absent, and at most an hour. Requests during the pause get a synthetic 429 without `Via`, so clients back off as they would for the real block, and `/sluice/health/upstream` reports 503. Set `false` if an egress proxy between Sluice and Discord strips `Via`. Default: `true`.
 
 ## Observability
 
@@ -123,9 +133,15 @@ Set this to `true` only if credentials can become valid again without changing t
 
 Enables Prometheus metrics and serves them on `/metrics`. When `false`, Sluice disables that listener and skips the request histogram, active-request gauge, and cluster-routing observations. Error-level logs may still increment the process-local error counter. Default: `true`.
 
-`sluice_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its legacy `clientId` label is only `Bot`, `Bearer`, or `NoAuth`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
+`sluice_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its `clientId` label is the bot's user ID once Discord has accepted that token, `Unverified` until then, and `Bearer` or `NoAuth` for other traffic; after 1,024 distinct bots, further ones share `Other`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
 
 `sluice_failures_total{reason}` counts bounded proxy failure reasons, including `queue_timeout`, `upstream_timeout`, `upstream_error`, `peer_error`, and `rate_limit_deadline`.
+
+`sluice_queue_wait_seconds{method,route}` measures how long requests waited for their bucket and the global limit before their first Discord attempt. `sluice_invalid_requests` is the current rolling 10-minute invalid-response count, `sluice_webhook_short_circuits_total` counts requests answered from the webhook fail-fast cache, and `sluice_cloudflare_blocked` and `sluice_cloudflare_blocks_total` track Cloudflare blocks.
+
+### Health endpoints
+
+`/sluice/healthz` (alias `/nirn/healthz`) is liveness: 200 unless the proxy is shutting down or the cluster exceeds `CLUSTER_MAX_NODES`. `/sluice/health/upstream` answers 503 while a Cloudflare block is active or at least 80% of the invalid-request budget is used; use it for alerting, not for restarts.
 
 ### `METRICS_PORT`
 
@@ -160,6 +176,10 @@ Memberlist uses this port for both TCP and UDP. Gossip is encrypted and authenti
 ### `CLUSTER_PEER_PORT`
 
 Dedicated HTTPS port for proxy traffic between members, from 1 through 65535. Default: `8443`. It binds to `BIND_IP`, requires a valid client certificate, and is advertised through memberlist metadata. Peer traffic uses a direct transport and never honors `HTTP_PROXY`.
+
+### `CLUSTER_ADVERTISE_ADDR`
+
+IP address other members use to reach this node, for Docker or NAT where the bind address is not reachable. Default: empty, which advertises the address memberlist detects. The peer certificate needs a SAN for the advertised address, and `CLUSTER_PORT` and `CLUSTER_PEER_PORT` must keep the same numbers across the translation.
 
 ### `CLUSTER_MAX_NODES`
 
@@ -205,7 +225,7 @@ Optional unique memberlist node name. Default: memberlist's generated host-based
 
 Authenticated traffic is assigned by token affinity, while unauthenticated non-interaction traffic is assigned by shared egress affinity. The cluster is AP: partitions and membership changes can temporarily duplicate rate-limit state, and traffic using the same Discord identity outside the cluster is not visible.
 
-Memberlist's advertised IP and `CLUSTER_PEER_PORT` must be directly reachable by every peer. NAT or peer-port translation is unsupported.
+Memberlist's advertised IP (see `CLUSTER_ADVERTISE_ADDR`) and `CLUSTER_PEER_PORT` must be reachable by every peer. Port translation is unsupported.
 
 Cluster affinity and the peer protocol differ from nirn-proxy's. Upgrade every node as one coordinated deployment; clusters that mix Sluice with nirn-proxy or with other Sluice versions are unsupported. Open `CLUSTER_PORT` (TCP and UDP) and `CLUSTER_PEER_PORT` (TCP) only between trusted nodes. nirn-proxy's `/nirn/global` endpoint no longer exists.
 

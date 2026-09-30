@@ -22,14 +22,15 @@ const maxClusterLeaveTime = 5 * time.Second
 
 // ClusterConfig enables authenticated gossip and mutually authenticated peer routing.
 type ClusterConfig struct {
-	KnownMembers []string
-	BindAddress  string
-	Port         int
-	PeerPort     int
-	MaxNodes     int
-	NodeName     string
-	Secret       string
-	PeerTLS      *tls.Config
+	KnownMembers     []string
+	BindAddress      string
+	AdvertiseAddress string
+	Port             int
+	PeerPort         int
+	MaxNodes         int
+	NodeName         string
+	Secret           string
+	PeerTLS          *tls.Config
 }
 
 type clusterHandle interface {
@@ -91,6 +92,9 @@ func (p *Proxy) JoinCluster(config ClusterConfig) error {
 	if config.BindAddress != "" && net.ParseIP(config.BindAddress) == nil {
 		return fmt.Errorf("cluster BIND_IP must be an IP address")
 	}
+	if config.AdvertiseAddress != "" && net.ParseIP(config.AdvertiseAddress) == nil {
+		return fmt.Errorf("CLUSTER_ADVERTISE_ADDR must be an IP address")
+	}
 	if config.MaxNodes < 1 || config.MaxNodes > InvalidRequestSafetyLimit {
 		return fmt.Errorf("cluster max nodes must be between 1 and %d", InvalidRequestSafetyLimit)
 	}
@@ -142,6 +146,9 @@ func (p *Proxy) JoinCluster(config ClusterConfig) error {
 	memberConfig := memberlist.DefaultLANConfig()
 	if config.BindAddress != "" {
 		memberConfig.BindAddr = config.BindAddress
+	}
+	if config.AdvertiseAddress != "" {
+		memberConfig.AdvertiseAddr = config.AdvertiseAddress
 	}
 	memberConfig.BindPort = config.Port
 	memberConfig.AdvertisePort = config.Port
