@@ -2,141 +2,230 @@ package main
 
 import (
 	"context"
-	"github.com/germanoeich/nirn-proxy/lib"
-	"github.com/hashicorp/memberlist"
-	_ "github.com/joho/godotenv/autoload"
-	"github.com/sirupsen/logrus"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Melonly-Moderation/nirn-proxy/internal/proxy"
+	"github.com/joho/godotenv"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	shutdownTimeout = 20 * time.Second
+	cleanupTimeout  = 5 * time.Second
 )
 
 var logger = logrus.New()
 
-// token : queue map
-var bufferSize = 50
-
-func setupLogger() {
-	logLevel := lib.EnvGet("LOG_LEVEL", "info")
-	lvl, err := logrus.ParseLevel(logLevel)
-
-	if err != nil {
-		panic("Failed to parse log level")
-	}
-
-	logger.SetLevel(lvl)
-	lib.SetLogger(logger)
-}
-
-func initCluster(proxyPort string, manager *lib.QueueManager) *memberlist.Memberlist {
-	port := lib.EnvGetInt("CLUSTER_PORT", 7946)
-
-	memberEnv := os.Getenv("CLUSTER_MEMBERS")
-	dns := os.Getenv("CLUSTER_DNS")
-
-	if memberEnv == "" && dns == "" {
-		logger.Info("Running in stand-alone mode")
-		return nil
-	}
-
-	logger.Info("Attempting to create/join cluster")
-	var members []string
-	if memberEnv != "" {
-		members = strings.Split(memberEnv, ",")
-	} else {
-		ips, err := net.LookupIP(dns)
-		if err != nil {
-			logger.Panic(err)
-		}
-
-		if len(ips) == 0 {
-			logger.Panic("no ips returned by dns")
-		}
-
-		for _, ip := range ips {
-			members = append(members, ip.String())
-		}
-	}
-
-	return lib.InitMemberList(members, port, proxyPort, manager)
+type runningServer struct {
+	name     string
+	server   *http.Server
+	listener net.Listener
+	tls      bool
 }
 
 func main() {
-	outboundIp := os.Getenv("OUTBOUND_IP")
+	if err := run(); err != nil {
+		logger.WithError(err).Fatal("Proxy stopped")
+	}
+}
 
-	timeout := lib.EnvGetInt("REQUEST_TIMEOUT", 5000)
-
-	disableHttp2 := lib.EnvGetBool("DISABLE_HTTP_2", true)
-
-	globalOverrides := lib.EnvGet("BOT_RATELIMIT_OVERRIDES", "")
-
-	disableGlobalRatelimitDetection := lib.EnvGetBool("DISABLE_GLOBAL_RATELIMIT_DETECTION", false)
-
-	lib.ConfigureDiscordHTTPClient(outboundIp, time.Duration(timeout)*time.Millisecond, disableHttp2, globalOverrides, disableGlobalRatelimitDetection)
-
-	port := lib.EnvGet("PORT", "8080")
-	bindIp := lib.EnvGet("BIND_IP", "0.0.0.0")
-
-	setupLogger()
-
-	bufferSize = lib.EnvGetInt("BUFFER_SIZE", 50)
-	maxBearerLruSize := lib.EnvGetInt("MAX_BEARER_COUNT", 1024)
-
-	manager := lib.NewQueueManager(bufferSize, maxBearerLruSize)
-
-	mux := manager.CreateMux()
-
-	s := &http.Server{
-		Addr:              bindIp + ":" + port,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       10 * time.Second,
-		WriteTimeout:      1 * time.Hour,
-		MaxHeaderBytes:    1 << 20,
+func run() error {
+	if err := loadDotEnv(); err != nil {
+		return err
+	}
+	if err := configureLogger(); err != nil {
+		return err
+	}
+	config, err := loadConfig()
+	if err != nil {
+		return err
 	}
 
-	if os.Getenv("ENABLE_PPROF") == "true" {
-		go lib.StartProfileServer()
+	serverProxy, err := proxy.New(config.proxy)
+	if err != nil {
+		return fmt.Errorf("configure proxy: %w", err)
 	}
-
-	if os.Getenv("ENABLE_METRICS") != "false" {
-		port := lib.EnvGet("METRICS_PORT", "9000")
-		go lib.StartMetrics(bindIp + ":" + port)
-	}
-
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.WithFields(logrus.Fields{"function": "http.ListenAndServe"}).Panic(err)
+	proxy.SetLogger(logger)
+	var servers []runningServer
+	defer func() {
+		cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancelCleanup()
+		_ = serverProxy.Close(cleanupContext)
+		for _, running := range servers {
+			_ = running.server.Shutdown(cleanupContext)
+			_ = running.listener.Close()
 		}
 	}()
+	requestLifetime := config.proxy.QueueTimeout + config.proxy.UpstreamTimeout + 5*time.Second
+	publicAddress := net.JoinHostPort(config.bindIP, fmt.Sprint(config.port))
+	publicServer := newProxyServer(publicAddress, serverProxy, requestLifetime)
+	publicListener, err := net.Listen("tcp", publicAddress)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", publicAddress, err)
+	}
+	servers = append(servers, runningServer{name: "proxy", server: publicServer, listener: publicListener})
 
-	logger.Info("Started proxy on " + bindIp + ":" + port)
-
-	// Wait for the http server to ready before joining the cluster
-	<-time.After(1 * time.Second)
-	initCluster(port, manager)
-
-	<-done
-	logger.Info("Server received shutdown signal")
-
-	logger.Info("Broadcasting leave message to cluster, if in cluster mode")
-	manager.Shutdown()
-
-	logger.Info("Gracefully shutting down HTTP server")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	if err := s.Shutdown(ctx); err != nil {
-		logger.WithFields(logrus.Fields{"function": "http.Shutdown"}).Error(err)
+	if config.enableMetrics {
+		address := net.JoinHostPort(config.bindIP, fmt.Sprint(config.metricsPort))
+		server := proxy.NewMetricsServer(address)
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return fmt.Errorf("listen for metrics on %s: %w", address, err)
+		}
+		servers = append(servers, runningServer{name: "metrics", server: server, listener: listener})
+	}
+	if config.enablePprof {
+		address := net.JoinHostPort(config.bindIP, fmt.Sprint(config.pprofPort))
+		server := proxy.NewProfileServer(address)
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return fmt.Errorf("listen for pprof on %s: %w", address, err)
+		}
+		servers = append(servers, runningServer{name: "pprof", server: server, listener: listener})
 	}
 
-	logger.Info("Bye bye")
+	clustered := config.clusteringEnabled()
+	if clustered {
+		address := net.JoinHostPort(config.bindIP, fmt.Sprint(config.clusterPeerPort))
+		server := newProxyServer(address, serverProxy, requestLifetime)
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return fmt.Errorf("listen for cluster peers on %s: %w", address, err)
+		}
+		server.TLSConfig = config.clusterServerTLS.Clone()
+		servers = append(servers, runningServer{name: "cluster peer", server: server, listener: listener, tls: true})
+	}
+
+	serveErrors := make(chan error, len(servers))
+	start := func(running runningServer) {
+		go func() {
+			var err error
+			if running.tls {
+				err = running.server.ServeTLS(running.listener, "", "")
+			} else {
+				err = running.server.Serve(running.listener)
+			}
+			if err == nil {
+				err = fmt.Errorf("server stopped unexpectedly")
+			}
+			if !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				serveErrors <- fmt.Errorf("%s server: %w", running.name, err)
+			}
+		}()
+	}
+	if clustered {
+		// The final entry is the mTLS listener. Make it reachable before gossip
+		// advertises this node's peer port.
+		start(servers[len(servers)-1])
+		if err := joinCluster(serverProxy, config); err != nil {
+			return err
+		}
+		select {
+		case err := <-serveErrors:
+			return err
+		default:
+		}
+	} else {
+		logger.Info("Running in stand-alone mode")
+	}
+	last := len(servers)
+	if clustered {
+		last--
+	}
+	for _, running := range servers[:last] {
+		start(running)
+	}
+	logger.WithFields(logrus.Fields{
+		"address":        publicAddress,
+		"disableHTTP2":   config.proxy.DisableHTTP2,
+		"queueTimeout":   config.proxy.QueueTimeout,
+		"requestTimeout": config.proxy.UpstreamTimeout,
+	}).Info("Proxy started")
+
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	select {
+	case <-signalContext.Done():
+		logger.Info("Shutdown signal received")
+	case err := <-serveErrors:
+		return err
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelShutdown()
+	var shutdownErrors []error
+	if err := serverProxy.Close(shutdownContext); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("close proxy: %w", err))
+	}
+	for _, running := range servers {
+		if err := running.server.Shutdown(shutdownContext); err != nil {
+			shutdownErrors = append(shutdownErrors, fmt.Errorf("shutdown %s server: %w", running.name, err))
+		}
+	}
+	logger.Info("Proxy stopped")
+	return errors.Join(shutdownErrors...)
+}
+
+func loadDotEnv() error {
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load .env: %w", err)
+	}
+	return nil
+}
+
+func newProxyServer(address string, handler http.Handler, requestLifetime time.Duration) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       requestLifetime,
+		WriteTimeout:      requestLifetime,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
+func configureLogger() error {
+	level, err := logrus.ParseLevel(envString("LOG_LEVEL", "info"))
+	if err != nil {
+		return fmt.Errorf("parse LOG_LEVEL: %w", err)
+	}
+	logger.SetLevel(level)
+	return nil
+}
+
+func joinCluster(serverProxy *proxy.Proxy, config appConfig) error {
+	knownMembers := config.clusterMembers
+	if len(knownMembers) == 0 {
+		addresses, err := net.LookupIP(config.clusterDNS)
+		if err != nil {
+			return fmt.Errorf("resolve CLUSTER_DNS: %w", err)
+		}
+		if len(addresses) == 0 {
+			return fmt.Errorf("CLUSTER_DNS returned no addresses")
+		}
+		for _, address := range addresses {
+			knownMembers = append(knownMembers, net.JoinHostPort(address.String(), fmt.Sprint(config.clusterPort)))
+		}
+	}
+	if err := serverProxy.JoinCluster(proxy.ClusterConfig{
+		KnownMembers: knownMembers,
+		BindAddress:  config.bindIP,
+		Port:         config.clusterPort,
+		PeerPort:     config.clusterPeerPort,
+		MaxNodes:     config.clusterMaxNodes,
+		NodeName:     config.nodeName,
+		Secret:       config.clusterSecret,
+		PeerTLS:      config.clusterClientTLS,
+	}); err != nil {
+		return fmt.Errorf("initialize cluster: %w", err)
+	}
+	return nil
 }

@@ -21,8 +21,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 16,
-  "iteration": 1642101763496,
+  "id": null,
   "links": [],
   "liveNow": false,
   "panels": [
@@ -82,12 +81,12 @@
           "expr": "sum(increase(nirn_proxy_requests_count{status=\"429 Too Many Requests\",clientId=~\"$clientId\"}[1h]))",
           "interval": "",
           "legendFormat": "",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
       "timeFrom": "1h",
-      "title": "429s (1h)",
+      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Nirn retries.",
+      "title": "Non-shared Discord 429s (1h)",
       "type": "stat"
     },
     {
@@ -149,7 +148,7 @@
           "refId": "A"
         }
       ],
-      "title": "Reqs /s (curr)",
+      "title": "Discord responses/s (current)",
       "type": "stat"
     },
     {
@@ -235,7 +234,6 @@
           "expr": "sum(rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval])) by (clientId)",
           "interval": "",
           "legendFormat": "{{clientId}}",
-          "queryType": "randomWalk",
           "refId": "A"
         },
         {
@@ -251,7 +249,7 @@
           "refId": "B"
         }
       ],
-      "title": "Reqs/s",
+      "title": "Discord responses/s",
       "type": "timeseries"
     },
     {
@@ -337,11 +335,11 @@
           "expr": "sum by(method, status, route) (rate(nirn_proxy_requests_count{status=\"429 Too Many Requests\",clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{method}} {{route}} ({{status}})",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
-      "title": "429",
+      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Nirn retries.",
+      "title": "Non-shared Discord 429s",
       "type": "timeseries"
     },
     {
@@ -425,14 +423,14 @@
             "uid": "${datasource}"
           },
           "exemplar": true,
-          "expr": "sum by(method, status, route) (rate(nirn_proxy_requests_count{status=~\"500 Internal Server Error|501 Not Implemented|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|505 HTTP Version Not Supported|506 Variant Also Negotiates|507 Insufficient Storage|508 Loop Detected|510 Not Extended|511 Network Authentication Required\", clientId=~\"$clientId\"}[$__rate_interval]))",
+          "expr": "sum by(method, status, route) (rate(nirn_proxy_requests_count{status=~\"5.. .*\",clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{method}} {{route}} ({{status}})",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
-      "title": "5XX",
+      "description": "Discord upstream 5xx attempts only; proxy-generated local failures are not part of the request histogram.",
+      "title": "Discord 5xx",
       "type": "timeseries"
     },
     {
@@ -518,11 +516,10 @@
           "expr": "sum by (status) (rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{status}}",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
-      "title": "Status codes",
+      "title": "Discord response statuses",
       "type": "timeseries"
     },
     {
@@ -608,11 +605,10 @@
           "expr": "sum by (route) (rate(nirn_proxy_requests_count{clientId=~\"$clientId\"}[$__rate_interval]))",
           "interval": "",
           "legendFormat": "{{route}}",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
-      "title": "Reqs by path",
+      "title": "Discord responses by route",
       "type": "timeseries"
     },
     {
@@ -698,7 +694,6 @@
           "expr": "histogram_quantile(0.9, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le))",
           "interval": "",
           "legendFormat": "90th",
-          "queryType": "randomWalk",
           "refId": "A"
         },
         {
@@ -726,7 +721,7 @@
           "refId": "C"
         }
       ],
-      "title": "Latency",
+      "title": "Discord response-header latency",
       "type": "timeseries"
     },
     {
@@ -815,11 +810,10 @@
           "interval": "1m",
           "intervalFactor": 1,
           "legendFormat": "{{method}} {{route}}",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
-      "title": "Latency 90th",
+      "title": "Discord response-header latency p90",
       "type": "timeseries"
     },
     {
@@ -905,11 +899,10 @@
           "expr": "histogram_quantile(0.99, sum(rate(nirn_proxy_requests_bucket{clientId=~\"$clientId\"}[5m])) by (le, method, route))",
           "interval": "",
           "legendFormat": "{{method}} {{route}}",
-          "queryType": "randomWalk",
           "refId": "A"
         }
       ],
-      "title": "Latency 99th",
+      "title": "Discord response-header latency p99",
       "type": "timeseries"
     },
     {
@@ -997,7 +990,8 @@
           "refId": "A"
         }
       ],
-      "title": "Open connections",
+      "description": "HTTP requests currently executing in Nirn after admission; this is not a count of TCP sockets.",
+      "title": "Active proxy requests",
       "type": "timeseries"
     }
   ],
@@ -1043,6 +1037,7 @@
         "definition": "label_values(nirn_proxy_requests_count, clientId)",
         "hide": 0,
         "includeAll": true,
+        "label": "Authentication class",
         "multi": true,
         "name": "clientId",
         "options": [],
@@ -1066,6 +1061,6 @@
   "timezone": "",
   "title": "Nirn Proxy",
   "uid": "LFGoppS7k",
-  "version": 26,
+  "version": 27,
   "weekStart": ""
 }

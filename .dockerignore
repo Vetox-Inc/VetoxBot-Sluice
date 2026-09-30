@@ -1,0 +1,9 @@
+.git
+.env*
+.idea
+*.log
+*.crt
+*.key
+*.pem
+*.test
+nirn-proxy

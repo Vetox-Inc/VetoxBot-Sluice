@@ -1,0 +1,38 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows]
+        goarch: [386, amd64, arm64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          name="nirn-proxy-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = windows ]; then name="${name}.exe"; fi
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$name" .
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          name="nirn-proxy-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = windows ]; then name="${name}.exe"; fi
+          gh release upload "${{ github.event.release.tag_name }}" "$name" --clobber

@@ -1,7 +1,7 @@
 .idea/
-nirn-proxy.*
-nirn-proxy
-.env
-*.txt
+.env*
 *.log
-k6_tests/node_modules
+*.test
+.DS_Store
+/nirn-proxy
+/nirn-proxy.exe

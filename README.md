@@ -1,133 +1,123 @@
-# Archival notice
-Thanks for all the support. This project was born out of a need within Dyno, and I'm glad it ended up being useful to many other bot creators as well.
+# Nirn Proxy Reborn
 
-Unfortunately, I no longer have the time or capacity to maintain it. I’ve since stepped away from Discord bot development and I’m no longer active enough in the ecosystem to keep up with ongoing changes. Because of that, I’ve decided to archive this project.
+Nirn Proxy is a transparent HTTP reverse proxy for Discord's REST API. It coordinates per-route and global rate limits, preserves FIFO dispatch within a bucket, retries safe 429 responses, and exports Prometheus metrics.
 
-# Nirn-proxy
-Nirn-proxy is a highly available, transparent & dynamic HTTP proxy that 
-handles Discord ratelimits for you and exports meaningful prometheus metrics.
-This project is at the heart of [Dyno](https://dyno.gg), handling several hundreds of requests per sec across hundreds of bots all while keeping 429s at ~100 per hour.
+Clients send the same method, path, query, application headers, and body they would send to `discord.com`, but use the proxy address instead. As with any reverse proxy, Nirn rewrites `Host`, removes hop-by-hop and internal `X-Nirn-Hop` headers, and supplies a fallback `User-Agent` when one is absent.
 
-It is designed to be minimally invasive and exploits common library patterns to make the adoption as simple as a URL change.
+```text
+https://discord.com/api/v10/gateway
+        becomes
+http://nirn-proxy:8080/api/v10/gateway
+```
 
-#### Features
+The public proxy, metrics, and pprof listeners have no built-in application authentication, and `BIND_IP` defaults to `0.0.0.0`. Restrict them with a firewall or network policy. Discord credentials cross the client-to-proxy hop, so terminate TLS and authenticate callers before that hop leaves a trusted private network. Only the separate cluster-peer listener has built-in mutual TLS.
 
-- Highly available, horizontally scalable
-- Transparent ratelimit handling, per-route and global
-- Works with any API version (Also supports using two or more versions for the same bot)
-- Small resource footprint
-- Works with webhooks
-- Works with Bearer tokens
-- Supports an unlimited number of clients (Bots and Bearer)
-- Prometheus metrics exported out of the box
-- No hardcoded routes, therefore no need of updates for new routes introduced by Discord
+## Rate-limit model
 
-### Usage
-Binaries can be found [here](https://github.com/germanoeich/nirn-proxy/releases). Docker images can be found [here](https://github.com/germanoeich/nirn-proxy/pkgs/container/nirn-proxy)
+Discord currently documents these HTTP API limits:
 
-The proxy sits between the client and discord. Instead of pointing to discord.com, you point to whatever IP and port the proxy is running on, so discord.com/api/v9/gateway becomes 10.0.0.1:8080/api/v9/gateway. This can be achieved in many ways, some suggestions are host remapping on the OS level, DNS overrides or changes to the library code. Please note that the proxy currently does not support SSL.
+- Authenticated bots: 50 requests per second globally by default. Nirn conservatively applies the same pacing to bearer credentials.
+- Unauthenticated requests: 50 requests per second per egress IP.
+- Interaction endpoints: exempt from the global limit.
+- Invalid requests: 10,000 responses with status 401, 403, or 429 per 10 minutes per egress IP; shared-scope 429s do not count.
 
-Configuration options are
+See Discord's official [HTTP rate-limit documentation](https://docs.discord.com/developers/topics/rate-limits). Gateway session-start limits are a separate system and are not used to infer REST capacity; see the [Gateway documentation](https://docs.discord.com/developers/events/gateway).
 
-| Variable        | Value                                       | Default |
-|-----------------|---------------------------------------------|---------|
-| LOG_LEVEL       | panic, fatal, error, warn, info, debug, trace | info    |
-| PORT            | number                                      | 8080    |
-| METRICS_PORT    | number                                      | 9000    |
-| ENABLE_METRICS  | boolean                                     | true    |
-| ENABLE_PPROF    | boolean                                     | false   |
-| BUFFER_SIZE     | number                                      | 50      |
-| OUTBOUND_IP     | string                                      | ""      |
-| BIND_IP         | string                                      | 0.0.0.0 |
-| REQUEST_TIMEOUT | number (milliseconds)                       | 5000    |
-| CLUSTER_PORT    | number                                      | 7946    |
-| CLUSTER_MEMBERS | string list (comma separated)               | ""      |
-| CLUSTER_DNS     | string                                      | ""      |
-| MAX_BEARER_COUNT| number                                      | 1024    |
-| DISABLE_HTTP_2  | bool                                        | true    |
-| BOT_RATELIMIT_OVERRIDES | string list (comma separated)       | ""      |
-| DISABLE_GLOBAL_RATELIMIT_DETECTION | boolean                  | false   |
+Per-route limits are never hardcoded. Nirn begins with a conservative route grouping, then learns Discord's bucket identity and state from `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset-After`, using `Retry-After` for 429 responses when available. Buckets remain distinct across Discord's major parameters such as channel, guild, and webhook identity.
 
-Information on each config var can be found [here](https://github.com/germanoeich/nirn-proxy/blob/main/CONFIG.md)
+Each bucket has a bounded, cancellation-safe FIFO queue. `MAX_QUEUE_DEPTH` bounds waiting requests per gate, while `MAX_IN_FLIGHT_REQUESTS` bounds all admitted non-health requests across the process. `QUEUE_TIMEOUT` is the overall scheduling deadline, including waits, attempts, retries, and the final Discord response stream. The bucket is released after Discord's response headers are processed, so a slow downstream reader cannot block later requests in the same bucket. Shared-bucket FIFO coordination begins after Discord's first response reveals the bucket identity; before then Nirn uses its conservative route grouping.
 
-.env files are loaded if present
+The proxy also reserves a process-local safety budget for invalid responses. Responses with status 401, 403, or non-shared 429 consume it; Nirn stops its own new upstream attempts at 9,500 retained events per rolling 10 minutes. Cluster nodes statically divide those slots by `CLUSTER_MAX_NODES` to retain shared-NAT headroom. Restarts and traffic outside Nirn are not represented in this history.
 
-### Behaviour
+## Affinity and clustering
 
-The proxy listens on all routes and relays them to Discord, while keeping track of ratelimit buckets and making requests wait if there are no tokens to spare. The proxy fires requests sequentially for each bucket and ordering is preserved. The proxy does not modify the requests in any way so any library compatible with Discords API can be pointed at the proxy and it will not break the library, even with the libraries own ratelimiting intact.
+All requests using the same bot or bearer credential are assigned to the same node with rendezvous hashing. That node owns the credential's per-route buckets and global pacer, eliminating the old internal global-limit RPC. Unauthenticated non-interaction traffic is assigned by shared egress affinity so its IP-scoped global limit is coordinated. Interaction traffic bypasses the global pacer but still observes per-route limits.
 
-When using the proxy, it is safe to remove the ratelimiting logic from clients and fire requests instantly, however, the proxy does not handle retries. If for some reason (i.e shared ratelimits, internal discord ratelimits, etc) the proxy encounters a 429, it will return that to the client. It is safe to immediately retry requests that return 429 or even setup retry logic elsewhere (like in a load balancer or service mesh).
+Clustering uses HashiCorp memberlist/SWIM and is intentionally AP. Gossip requires a shared secret and peer proxying uses a dedicated TLS 1.3 listener with certificate verification in both directions. The peer client transport is direct: it is separate from Discord's transport and never honors `HTTP_PROXY`.
 
-The proxy also guards against known scenarios that might cause a cloudflare ban, like too many webhook 404s or too many 401s.
+Rate-limit coordination is therefore practical protection, not a mathematical guarantee:
 
-### Proxy specific responses
+- During a network partition, each side can temporarily process the same credential with independent state.
+- Membership changes can move an identity while requests are still in flight.
+- Requests made with the same Discord identity outside this cluster are invisible to Nirn.
+- Multiple credentials that Discord accounts to one user, or unauthenticated traffic sharing the same external egress IP, can exceed limits that one Nirn state cannot observe.
+- Discord may omit rate-limit headers, and it specifically warns that emoji-control quota headers can be inaccurate.
+- A previously unseen shared bucket cannot be coordinated until Discord identifies it in a response.
+- A non-replayable request body or an exhausted retry deadline exposes Discord's original 429 or a proxy timeout.
 
-The proxy may return a 408 Request Timeout if Discord takes more than $REQUEST_TIMEOUT milliseconds to respond. This allows you to identify and react to routes that have issues.
+Nirn prevents avoidable dispatches and absorbs replay-safe 429s; it cannot guarantee zero 429s. Configure clients and infrastructure to tolerate them.
 
-Requests may also return a 408 status code in the event that they were aborted because of ratelimits, as documented above.
+> **Upgrade note:** token affinity, rendezvous routing, and the peer-hop wire behavior changed. Upgrade the whole cluster as one coordinated deployment; do not run legacy and new nodes together.
 
-### Limitations
+Set `CLUSTER_MEMBERS` or `CLUSTER_DNS` to enable clustering. Cluster mode also requires `CLUSTER_SECRET`, `CLUSTER_CA_FILE`, `CLUSTER_CERT_FILE`, and `CLUSTER_KEY_FILE`. Startup verifies the certificate chain, lifetime, client/server usages, and a SAN for the memberlist-advertised IP. Expose the gossip port (TCP and UDP) and peer HTTPS port only between cluster nodes. The advertised IP and peer port must be directly reachable; NAT or peer-port translation is unsupported.
 
-The ratelimiting only works with `X-RateLimit-Precision` set to `seconds`. If you are using Discord API v8+, that is the only possible behaviour. For users on v6 or v7, please refer to your library docs for information on which precision it uses and how to change it to seconds.
+If every configured seed join fails, startup fails rather than silently creating an isolated singleton. Ensure a cold-start discovery set includes the node itself or another reachable seed.
 
-The proxy tries its best to detect your REST global limits, but Discord does not expose this information. Be sure to set `BOT_RATELIMIT_OVERRIDES` for any clients with elevated limits.
+`CLUSTER_MAX_NODES` defaults to 32. Joining a larger cluster fails startup; exceeding the cap after startup makes health checks and Discord requests fail with 503. This cap also partitions the shared invalid-request budget, so every node must use the same value. Traffic outside the cluster that shares the egress IP remains invisible to Nirn.
 
-### High availability
+The only reserved `/nirn/` endpoint on the proxy and peer listeners is `/nirn/healthz`; `/nirn/global` no longer exists. Metrics and pprof use separate listeners.
 
-The proxy can be run in a cluster by setting either `CLUSTER_MEMBERS` or `CLUSTER_DNS` env vars. When in cluster mode, all nodes are a suitable gateway for all requests and the proxy will route requests consistently using the bucket hash.
+## 429 retries
 
-It's recommended that all nodes are reachable through LAN. Please reach out if a WAN cluster is desired for your use case.
+Nirn transparently retries a Discord 429 only when the request body can be replayed safely:
 
-If a node fails, there is a brief period where it will be unhealthy but requests will still be routed to it. When these requests fail, the proxy will mock a 429 to send back to the user. The 429 will signal the client to wait 1s and will have a custom header `generated-by-proxy`. This is done in order to allow seamless retries when a member fails. If you want to backoff, use the custom header to override your lib retry logic.
+- Requests without a body are replayable.
+- Bodies with a replay function are replayable.
+- Other bodies are captured while first sent, up to `MAX_RETRY_BODY_BYTES`, and are replayable only if capture completes without exceeding that limit.
 
-The cluster uses [SWIM](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf), which is an [AP protocol](https://en.wikipedia.org/wiki/CAP_theorem) and is powered by hashicorps excellent [memberlist](https://github.com/hashicorp/memberlist) implementation.
+Retries re-enter the same bounded scheduler and must complete within `QUEUE_TIMEOUT`. If the known cooldown cannot leave a full `REQUEST_TIMEOUT` attempt, Nirn immediately returns Discord's current 429 or a cached 429 with `Retry-After`. If the body cannot be replayed, Nirn returns Discord's original 429 instead of risking a partial or changed request. Other Discord statuses are not retried.
 
-Being an AP system means that the cluster will tolerate a network partition and needs no quorum to function. In case a network partition occurs, you'll have two clusters running independently, which may or may not be desirable. Configure your network accordingly.
+## Proxy responses
 
-In case you want to specifically target a node (i.e, for troubleshooting), set the `nirn-routed-to` header on the request. The value doesn't matter. This will prevent the node from routing the request to another node.
+| Status | Meaning |
+|---|---|
+| Discord status | Discord's response after any safe 429 retry is passed through. |
+| `429 Too Many Requests` | Discord's current response, or a cached Discord cooldown that cannot fit before the scheduler deadline. |
+| `408 Request Timeout` | Nirn's scheduler queue/retry deadline expired. |
+| `504 Gateway Timeout` | An outbound Discord attempt exceeded `REQUEST_TIMEOUT`. |
+| `502 Bad Gateway` | Discord could not be reached or returned an unusable transport response. |
+| `503 Service Unavailable` | Nirn could not safely process the request, such as a full queue, unavailable peer, client-capacity exhaustion, or shutdown. |
+| `400 Bad Request` | `CONNECT` and protocol upgrades are unsupported. |
 
-During recovery periods or when nodes join/leave the cluster, you might notice increased 429s. This is expected since the hashing table is changing as members change. Once the cluster settles into a stable state, it'll go back to normal.
+Proxy-generated 408, 502, 503, and 504 responses include `X-Nirn-Proxy-Error: true`.
+If a deadline expires after Discord response headers were forwarded, Nirn aborts the response stream because its status can no longer be changed.
 
-Global ratelimits are handled by a single node on the cluster, however this affinity is soft. There is no concept of leader or elections and if this node leaves, the cluster will simply pick a new one. This is a bottleneck and might increase tail latency, but the other options were either too complex, required an external storage, or would require quorum for the proxy to function. Webhooks and other requests with no token bypass this mechanism completely.
+Nirn does not disguise an internal failure as a Discord 429.
 
-The best deployment strategy for the cluster is to kill nodes one at a time, preferably with the replacement node already up.
+Nirn caches an invalid credential after its first ordinary 401. Idle state is eventually reclaimed. Set `DISABLE_401_LOCK=true` only when credential caching is undesirable.
 
-### Bearer Tokens
+## Configuration
 
-Bearer tokens are first class citizens. They are treated differently than bot tokens, while bot queues are long lived and never get evicted, Bearer queues are put into an LRU and are spread out by their token hash instead of by the path hash. This provides a more even spread of bearer queues across nodes in the cluster. In addition, Bearer globals are always handled locally. You can control how many bearer queues to keep at any time with the MAX_BEARER_COUNT env var.
+All settings are optional in stand-alone mode, and a local `.env` file is loaded when present. Malformed or unreadable `.env` files fail startup; cluster mode requires its secret and TLS files. See [CONFIG.md](CONFIG.md) for the complete environment-variable reference, defaults, validation ranges, and override syntax.
 
-### Why?
+## Metrics and health
 
-As projects grow, it's desirable to break them into multiple pieces, each responsible for its own domain. Discord provides gateway sharding on their end but REST can get tricky once you start moving logic out of the shards themselves and lose the guild affinity that shards inherently have, thus a centralized place for handling ratelimits is a must to prevent cloudflare bans and prevent avoidable 429s. At the time this project was created, there was no alternative that fully satisfied our requirements like multi-bot support. We are also early adopters of Discord features, so we need a proxy that supports new routes without us having to manually update it. Thus, this project was born.
+With metrics enabled, unauthenticated `/metrics` is served on `BIND_IP:METRICS_PORT`. `nirn_proxy_requests` observes Discord responses—one for each outbound attempt that returns response headers—so a transparent retry adds another observation. It excludes transport failures before headers and is not a count of logical inbound requests. `nirn_proxy_failures_total{reason}` separates scheduler, upstream, peer, and known-rate-limit deadline failures. The legacy `clientId` label contains only `Bot`, `Bearer`, or `NoAuth`, never an ID or token. Unknown methods become `OTHER`, numeric route components are normalized, and excessive or oversized route labels collapse to `/unknown`.
 
-### Resource usage
+The legacy `nirn_proxy_open_connections` name is retained for dashboard compatibility, but the gauge counts active handler requests rather than TCP sockets.
 
-This will vary depending on your usage, how many unique routes you see, etc. For reference, for Dynos use case, doing 150req/s, the usage is ~0.3 CPU and ~550MB of RAM. The proxy can comfortably run on a cheap VPS or an ARM based system.
+An importable dashboard is included at [grafana/nirn-proxy-dashboard.json](grafana/nirn-proxy-dashboard.json).
 
-### Metrics / Health
+| Metric | Labels |
+|---|---|
+| `nirn_proxy_error` | none |
+| `nirn_proxy_failures_total` | `reason` |
+| `nirn_proxy_requests` | `method`, `status`, `route`, `clientId` |
+| `nirn_proxy_open_connections` | `method`, `route` |
+| `nirn_proxy_requests_routed_sent` | none |
+| `nirn_proxy_requests_routed_received` | none |
+| `nirn_proxy_requests_routed_error` | none |
 
-| Key                                | Labels                                 | Description                                                |
-|------------------------------------|----------------------------------------|------------------------------------------------------------|
-|nirn_proxy_error                    | none                                   | Counter for errors                                         |
-|nirn_proxy_requests                 | method, status, route, clientId        | Histogram that keeps track of all request metrics          |
-|nirn_proxy_open_connections         | route, method                          | Gauge for open client connections with the proxy           |
-|nirn_proxy_requests_routed_sent     | none                                   | Counter for requests routed to other nodes                 |
-|nirn_proxy_requests_routed_received | none                                   | Counter for requests received from other nodes             |
-|nirn_proxy_requests_routed_error    | none                                   | Counter for requests routed that failed                    |
+`GET /nirn/healthz` returns 200 while the proxy is available and 503 during shutdown or cluster over-capacity. When pprof is enabled, its endpoints are available under `http://BIND_IP:PPROF_PORT/debug/pprof/`; do not expose them publicly. Enabled listeners are bound before startup completes, so a port conflict fails startup.
 
-Note: 429s can produce two status: 429 Too Many Requests or 429 Shared. The latter is only produced for requests that return with the x-ratelimit-scope header set to "shared", which means they don't count towards the cloudflare firewall limit and thus should not be used for alerts, etc.
+## Running
 
-The proxy has an internal endpoint located at `/nirn/healthz` for liveliness and readiness probes.
+Build and run locally with a supported Go toolchain:
 
-### Profiling
+```sh
+go run .
+```
 
-The proxy can be profiled at runtime by enabling the ENABLE_PPROF flag and browsing to `http://ip:7654/debug/pprof/`
+Release binaries and container images are available from the repository's [releases](https://github.com/Melonly-Moderation/nirn-proxy/releases) and [packages](https://github.com/Melonly-Moderation/nirn-proxy/pkgs/container/nirn-proxy).
 
-### Related projects
-
-[nirn-probe](https://github.com/germanoeich/nirn-probe) - Checks and alerts if a server is cloudflare banned
-
-##### Acknowledgements
-- [Eris](https://github.com/abalabahaha/eris) - used as reference throughout this project
-- [Twilight](https://github.com/twilight-rs) - used as inspiration and reference
-- [@bsian](https://github.com/bsian03) & [@bean](https://github.com/beanjo55) - for listening to my rants and providing assistance
+Nirn Proxy is licensed under the terms in [LICENSE](LICENSE).
