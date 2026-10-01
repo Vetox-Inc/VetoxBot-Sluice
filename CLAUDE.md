@@ -20,10 +20,16 @@ it; so can anyone else. It is a standalone service with no Kafka, Redis, MongoDB
   `TestConfigurationReferenceMatchesCodeAndDocs` enforces it.
 - npm: a launcher plus one exactly pinned optional dependency per platform, built from GoReleaser's `dist/` by
   `scripts/npm-packages.mjs`, with no postinstall script.
+- `STATE_FILE` defaults to a file in the user cache directory, so anything that runs the binary for a test or a tool
+  sets `STATE_FILE=` (empty) to keep it from writing there.
+- Responses Sluice generates keep Discord's shapes: JSON errors, and 429s with `X-RateLimit-*` headers. discord.js reads
+  both, and a request that may have reached Discord never gets a retryable 429.
 
 ## Verification
 
-`gofmt -l .` prints nothing; `go vet ./...`, `go test -race ./...` and `golangci-lint run` pass. Packaging changes
-also pass `goreleaser release --snapshot --clean` and `node scripts/pack-test.mjs`. Without a local Go toolchain, run
+`gofmt -l .` prints nothing; `go vet ./...`, `go test -race ./...` and `golangci-lint run` pass. Path-handling changes
+also get the fuzz targets in `internal/proxy/routes_fuzz_test.go`, which CI runs for 30 s each; keep a failing input the
+fuzzer writes to `testdata/fuzz/` as a regression seed. Packaging changes also pass
+`goreleaser release --snapshot --clean` and `node scripts/pack-test.mjs`. Without a local Go toolchain, run
 them in `golang:1.27` (not `-alpine`, which cannot run `-race`) and `golangci/golangci-lint:v2.14.0`, with
 `MSYS_NO_PATHCONV=1` under Git Bash.

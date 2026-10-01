@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +35,8 @@ type invalidRequestGuard struct {
 	timestamps []time.Time
 	head       int
 	reserved   int
+	// revision changes with every recorded invalid response, telling the state file to save.
+	revision atomic.Uint64
 }
 
 func newInvalidRequestGuard(limit int, window time.Duration) *invalidRequestGuard {
@@ -70,8 +74,45 @@ func (g *invalidRequestGuard) complete(now time.Time, invalid bool) {
 	g.reserved--
 	if invalid {
 		g.timestamps = append(g.timestamps, now)
+		g.revision.Add(1)
 	}
 	g.prune(now)
+}
+
+// snapshot counts the invalid responses still in the window per unix second.
+func (g *invalidRequestGuard) snapshot(now time.Time) [][2]int64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.prune(now)
+	var seconds [][2]int64
+	for _, at := range g.timestamps[g.head:] {
+		if last := len(seconds) - 1; last >= 0 && seconds[last][0] == at.Unix() {
+			seconds[last][1]++
+		} else {
+			seconds = append(seconds, [2]int64{at.Unix(), 1})
+		}
+	}
+	return seconds
+}
+
+// restore records saved invalid responses that are still inside the window, and returns how
+// many it recorded.
+func (g *invalidRequestGuard) restore(seconds [][2]int64, now time.Time) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	oldest := now.Add(-g.window)
+	restored := 0
+	for _, entry := range seconds {
+		at := time.Unix(entry[0], 0)
+		if !at.After(oldest) || at.After(now) {
+			continue
+		}
+		for count := entry[1]; count > 0 && restored < g.limit; count-- {
+			g.timestamps = append(g.timestamps, at)
+			restored++
+		}
+	}
+	return restored
 }
 
 func (g *invalidRequestGuard) prune(now time.Time) {
@@ -118,7 +159,7 @@ func newPacer(limit uint, maxWaiters int) *pacer {
 }
 
 func (p *pacer) wait(ctx context.Context) error {
-	delay, err := p.waitFor(ctx, 0)
+	delay, err := p.waitFor(ctx)
 	if err != nil || delay == 0 {
 		return err
 	}
@@ -126,7 +167,9 @@ func (p *pacer) wait(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (p *pacer) waitFor(ctx context.Context, reserve time.Duration) (time.Duration, error) {
+// waitFor takes the next send slot, or returns a global block's delay at once when it would
+// outlast ctx.
+func (p *pacer) waitFor(ctx context.Context) (time.Duration, error) {
 	if err := p.gate.acquire(ctx); err != nil {
 		return 0, err
 	}
@@ -151,7 +194,7 @@ func (p *pacer) waitFor(ctx context.Context, reserve time.Duration) (time.Durati
 		wake := p.wake
 		p.mu.Unlock()
 		if blockedDelay > 0 {
-			if deadline, ok := ctx.Deadline(); ok && blockedDelay+reserve >= time.Until(deadline) {
+			if deadline, ok := ctx.Deadline(); ok && blockedDelay >= time.Until(deadline) {
 				return blockedDelay, nil
 			}
 		}
@@ -206,20 +249,27 @@ func (p *pacer) retryAfter(now time.Time) time.Duration {
 }
 
 type rateLimitInfo struct {
-	bucket     string
-	scope      string
-	remaining  int64
+	bucket    string
+	scope     string
+	remaining int64
+	// resetAfter is when the bucket reopens; retryAfter is a 429's own cooldown. They differ
+	// for a shared-scope 429, which limits one resource while its bucket keeps capacity.
 	resetAfter time.Duration
+	retryAfter time.Duration
 	global     bool
 }
 
-func parseRateLimitHeaders(header http.Header, statusCode int, now time.Time) (rateLimitInfo, error) {
+func (i rateLimitInfo) shared() bool { return i.scope == "shared" }
+
+// parseRateLimitHeaders reads Discord's rate-limit headers. retryAfter is the 429's cooldown
+// from discordRetryAfter, or "" for any other response.
+func parseRateLimitHeaders(header http.Header, statusCode int, retryAfter string, now time.Time) (rateLimitInfo, error) {
 	info := rateLimitInfo{remaining: -1}
 	if header == nil {
 		return info, fmt.Errorf("missing rate-limit headers")
 	}
 	if header.Get("X-RateLimit-Bucket") == "" && header.Get("X-RateLimit-Remaining") == "" &&
-		header.Get("X-RateLimit-Reset-After") == "" && header.Get("Retry-After") == "" &&
+		header.Get("X-RateLimit-Reset-After") == "" && retryAfter == "" &&
 		header.Get("X-RateLimit-Global") == "" && header.Get("X-RateLimit-Scope") == "" {
 		return info, nil
 	}
@@ -236,20 +286,22 @@ func parseRateLimitHeaders(header http.Header, statusCode int, now time.Time) (r
 		info.remaining = remaining
 	}
 
-	resetValue := header.Get("X-RateLimit-Reset-After")
-	if statusCode == http.StatusTooManyRequests && header.Get("Retry-After") != "" {
-		resetValue = header.Get("Retry-After")
+	if statusCode == http.StatusTooManyRequests && retryAfter != "" {
+		delay, err := parseRateLimitSeconds(retryAfter)
+		if err != nil {
+			return info, err
+		}
+		info.retryAfter = delay
 	}
-	if resetValue != "" {
-		seconds, err := strconv.ParseFloat(resetValue, 64)
-		if err != nil || seconds < 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
-			return info, fmt.Errorf("invalid rate-limit reset %q", resetValue)
+	resetValue := header.Get("X-RateLimit-Reset-After")
+	if statusCode == http.StatusTooManyRequests && retryAfter != "" && !info.shared() {
+		info.resetAfter = info.retryAfter
+	} else if resetValue != "" {
+		delay, err := parseRateLimitSeconds(resetValue)
+		if err != nil {
+			return info, err
 		}
-		if seconds >= maximumRateLimitDelay.Seconds() {
-			info.resetAfter = maximumRateLimitDelay
-		} else {
-			info.resetAfter = time.Duration(seconds * float64(time.Second))
-		}
+		info.resetAfter = delay
 	} else if resetAt := header.Get("X-RateLimit-Reset"); resetAt != "" {
 		seconds, err := strconv.ParseFloat(resetAt, 64)
 		if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
@@ -268,15 +320,47 @@ func parseRateLimitHeaders(header http.Header, statusCode int, now time.Time) (r
 	if (info.remaining == 0 || statusCode == http.StatusTooManyRequests) && info.resetAfter > 0 {
 		info.resetAfter += rateLimitHeaderSlack
 	}
+	if info.retryAfter > 0 {
+		info.retryAfter += rateLimitHeaderSlack
+	}
 	return info, nil
 }
 
-func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath string, interaction, credentialScoped bool, bucket *bucketState, response *http.Response, disable401Lock bool) *bucketState {
+func parseRateLimitSeconds(value string) (time.Duration, error) {
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || seconds < 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, fmt.Errorf("invalid rate-limit reset %q", value)
+	}
+	if seconds >= maximumRateLimitDelay.Seconds() {
+		return maximumRateLimitDelay, nil
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
+// discordRetryAfter returns a 429's cooldown in seconds: the retry_after of Discord's body when
+// it refines the whole-second Retry-After header, else the header. The body alone is not trusted
+// because API v6 and v7 report it in milliseconds.
+func discordRetryAfter(header http.Header, body []byte) string {
+	value := header.Get("Retry-After")
+	whole, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return value
+	}
+	var payload struct {
+		RetryAfter float64 `json:"retry_after"`
+	}
+	if json.Unmarshal(body, &payload) == nil && payload.RetryAfter > whole-1 && payload.RetryAfter <= whole {
+		return strconv.FormatFloat(payload.RetryAfter, 'f', -1, 64)
+	}
+	return value
+}
+
+func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath string, interaction, credentialScoped bool, bucket *bucketState, response *http.Response, retryAfter string, disable401Lock bool) (*bucketState, rateLimitInfo) {
 	if response.StatusCode == http.StatusUnauthorized && credentialScoped && s.identity.kind != authNone && !disable401Lock {
 		s.validity.Store(clientInvalid)
 	}
 
-	info, err := parseRateLimitHeaders(response.Header, response.StatusCode, time.Now())
+	info, err := parseRateLimitHeaders(response.Header, response.StatusCode, retryAfter, time.Now())
 	if err != nil {
 		if response.StatusCode == http.StatusTooManyRequests {
 			if info.global {
@@ -284,13 +368,13 @@ func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath str
 				if interaction {
 					bucket.blockUntil(time.Now().Add(minimumRetryDelay))
 				}
-			} else {
+			} else if !info.shared() {
 				bucket.blockUntil(time.Now().Add(minimumRetryDelay))
 			}
 		}
 		target := s.learnBucket(routeHash, info.bucket, majorKey, bucket)
 		logger.Warn("Ignoring invalid Discord rate-limit headers", "error", err, "path", bucketPath)
-		return target
+		return target, info
 	}
 
 	if info.global {
@@ -304,13 +388,32 @@ func (s *clientState) observeResponse(routeHash uint64, majorKey, bucketPath str
 				bucket.blockUntil(time.Now().Add(delay))
 			}
 		}
-	} else if info.remaining == 0 || response.StatusCode == http.StatusTooManyRequests {
+	} else if info.remaining == 0 || response.StatusCode == http.StatusTooManyRequests && !info.shared() {
 		if info.resetAfter < minimumRetryDelay && response.StatusCode == http.StatusTooManyRequests {
 			info.resetAfter = minimumRetryDelay
 		}
 		bucket.blockUntil(time.Now().Add(info.resetAfter))
 	}
-	return s.learnBucket(routeHash, info.bucket, majorKey, bucket)
+	return s.learnBucket(routeHash, info.bucket, majorKey, bucket), info
+}
+
+// parseBotWideRoutes reads comma-separated "METHOD /route" entries, with identifiers written as
+// "!" the way the route label of sluice_requests shows them.
+func parseBotWideRoutes(value string) (map[string]bool, error) {
+	routes := make(map[string]bool)
+	for raw := range strings.SplitSeq(value, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		method, route, found := strings.Cut(entry, " ")
+		route = strings.TrimSpace(route)
+		if !found || metricsMethodLabel(method) == "OTHER" || !strings.HasPrefix(route, "/") {
+			return nil, fmt.Errorf("invalid BOT_WIDE_ROUTES entry %q; use a method and a route, such as GET /guilds/!/vanity-url", entry)
+		}
+		routes[method+" "+MetricsPathFromBucket(route)] = true
+	}
+	return routes, nil
 }
 
 func parseGlobalOverrides(value string) (map[string]uint, error) {

@@ -52,7 +52,7 @@ func TestConfigurationReferenceMatchesCodeAndDocs(t *testing.T) {
 	}
 
 	read := map[string]bool{}
-	envRead := regexp.MustCompile(`(?:envString|envBool|envInt|envInt64|envDurationMilliseconds|os\.Getenv)\("([A-Z0-9_]+)"`)
+	envRead := regexp.MustCompile(`(?:envString|envBool|envInt|envInt64|envDurationMilliseconds|os\.Getenv|os\.LookupEnv)\("([A-Z0-9_]+)"`)
 	for _, file := range []string{"config.go", "main.go"} {
 		source, err := os.ReadFile(file)
 		if err != nil {
@@ -160,6 +160,56 @@ func TestHTTP2IsDisabledByDefaultButCanBeEnabled(t *testing.T) {
 	}
 	if config.proxy.DisableHTTP2 {
 		t.Fatal("DISABLE_HTTP_2=false did not enable outbound HTTP/2")
+	}
+}
+
+func TestDefaultTimeoutsFitDiscordJSRequestTimeout(t *testing.T) {
+	clearClusterEnvironment(t)
+	t.Setenv("QUEUE_TIMEOUT", "")
+	t.Setenv("REQUEST_TIMEOUT", "")
+	config, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// discord.js aborts a request after 15 seconds by default; Sluice must answer before then.
+	if total := config.proxy.QueueTimeout + config.proxy.UpstreamTimeout; total > 15*time.Second {
+		t.Fatalf("default queue and request timeouts total %v, beyond discord.js's 15s", total)
+	}
+}
+
+func TestClientAuthSecretMustBeLong(t *testing.T) {
+	clearClusterEnvironment(t)
+	t.Setenv("CLIENT_AUTH_SECRET", "short")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("a short CLIENT_AUTH_SECRET was accepted")
+	}
+	secret := strings.Repeat("s", 32)
+	t.Setenv("CLIENT_AUTH_SECRET", secret)
+	config, err := loadConfig()
+	if err != nil || config.proxy.ClientAuthSecret != secret {
+		t.Fatalf("CLIENT_AUTH_SECRET = %q, %v", config.proxy.ClientAuthSecret, err)
+	}
+}
+
+func TestStateFileDefaultsToTheCacheDirectory(t *testing.T) {
+	clearClusterEnvironment(t)
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("PORT", "8123")
+	t.Setenv("STATE_FILE", "")
+	if config, err := loadConfig(); err != nil || config.proxy.StateFile != "" {
+		t.Fatalf("an empty STATE_FILE gave %q, %v; want it off", config.proxy.StateFile, err)
+	}
+	t.Setenv("STATE_FILE", "/var/lib/sluice/state.json")
+	if config, err := loadConfig(); err != nil || config.proxy.StateFile != "/var/lib/sluice/state.json" {
+		t.Fatalf("STATE_FILE gave %q, %v", config.proxy.StateFile, err)
+	}
+	if err := os.Unsetenv("STATE_FILE"); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(cache, "sluice", "state-8123.json")
+	if config, err := loadConfig(); err != nil || config.proxy.StateFile != want {
+		t.Fatalf("default STATE_FILE = %q, %v; want %q", config.proxy.StateFile, err, want)
 	}
 }
 

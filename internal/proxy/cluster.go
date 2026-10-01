@@ -317,12 +317,35 @@ func (p *Proxy) closeCluster(ctx context.Context) error {
 		cluster = p.cluster
 		peerTransport = p.peerTransport
 		p.cluster = nil
-		p.peerTransport = nil
 		p.maxClusterNodes = 0
 		p.localAddr = ""
 		p.clusterMu.Unlock()
 		break
 	}
+
+	// Forwarding to peers continues while this node leaves, so each token keeps one owner
+	// until the others know it is gone.
+	var leaveErr error
+	if cluster != nil {
+		leaveTime := maxClusterLeaveTime
+		if ctx.Err() != nil {
+			leaveTime = 0
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining < leaveTime {
+				leaveTime = remaining
+			}
+		}
+		if leaveTime > 0 {
+			leaveErr = cluster.Leave(leaveTime)
+		}
+	}
+
+	p.clusterMu.Lock()
+	if p.peerTransport == peerTransport {
+		p.peerTransport = nil
+	}
+	p.clusterMu.Unlock()
 	p.routes.Store(nil)
 	p.clusterOverCapacity.Store(false)
 	if peerTransport != nil {
@@ -330,20 +353,6 @@ func (p *Proxy) closeCluster(ctx context.Context) error {
 	}
 	if cluster == nil {
 		return nil
-	}
-
-	leaveTime := maxClusterLeaveTime
-	if ctx.Err() != nil {
-		leaveTime = 0
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < leaveTime {
-			leaveTime = remaining
-		}
-	}
-	var leaveErr error
-	if leaveTime > 0 {
-		leaveErr = cluster.Leave(leaveTime)
 	}
 	return errors.Join(leaveErr, cluster.Shutdown())
 }

@@ -24,8 +24,15 @@ go test -race ./...  # Discord is faked in-process: no network or token needed
 golangci-lint run    # v2
 ```
 
-All four must pass. Without a local Go toolchain, run them in the official image. Use `golang`, not an `-alpine` tag,
-because `-race` needs cgo:
+All four must pass, and `go test` also runs every fuzz seed. A change to path handling should also get some fuzzing,
+which CI runs for 30 seconds a target:
+
+```sh
+go test -run '^$' -fuzz '^FuzzPathClassificationIsStable$' -fuzztime 30s ./internal/proxy
+```
+
+Without a local Go toolchain, run them in the official image. Use `golang`, not an `-alpine` tag, because `-race`
+needs cgo:
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src golang:1.27 go test -race ./...
@@ -51,14 +58,17 @@ A change must not break these. If one has to bend, say so in the pull request.
 - **The global limit is taken when a request is sent**, at Discord's documented rate or `BOT_RATELIMIT_OVERRIDES`,
   never inferred. Interaction callbacks and follow-ups are exempt, as Discord documents.
 - **Every wait ends.** A request leaves its queue when its client disconnects, its deadline passes or the proxy shuts
-  down.
-- **All state is bounded.** Clients, buckets, queues, retained bodies, fail-fast entries and metric labels each have a
-  cap.
-- **The invalid-request budget is never spent carelessly.** Sluice stops at 9,500 invalid responses per 10 minutes and
-  pauses entirely during a Cloudflare block.
+  down, and an attempt ends once it goes `REQUEST_TIMEOUT` without progress, or after 10 minutes.
+- **All state is bounded.** Clients, buckets, queues, retained bodies, fail-fast entries, known applications and metric
+  labels each have a cap.
+- **The invalid-request budget is never spent carelessly.** Sluice stops at 9,500 invalid responses per 10 minutes,
+  pauses entirely while Discord's edge blocks its IP, and remembers both across restarts.
 - **Requests reach Discord as sent:** path encoding, query, headers and body, apart from the documented rewrites.
 - **Responses Sluice generates are marked** with `generated-by-proxy: true` and `Via: 1.1 sluice`. The one exception is
   the Cloudflare-pause 429, which omits `Via` on purpose.
+- **Responses Sluice generates use Discord's shapes:** errors as `{"message", "code"}` JSON, and 429s with Discord's
+  `X-RateLimit-*` headers, so Discord libraries handle them unchanged. A request that never reached Discord gets a 429,
+  which clients retry safely; one that may have reached it never does.
 - **Credentials never reach logs or metric labels.** Every log goes through the redacting logger, and `clientId` holds
   only validated bot user IDs.
 - **nirn-proxy's settings keep their meaning**, so existing deployments keep working.

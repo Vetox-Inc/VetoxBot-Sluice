@@ -213,8 +213,11 @@ func TestIdentifyCanonicalizesAuthorization(t *testing.T) {
 	if basic, none := identify("Basic credentials"), identify("   "); basic.kind != authNone || basic != none {
 		t.Fatalf("Basic identity = %#v, want no-auth identity %#v", basic, none)
 	}
-	if unknown, none := identify("Digest credentials"), identify(""); unknown.kind != authNone || unknown != none {
-		t.Fatalf("unknown authorization identity = %#v, want no-auth identity %#v", unknown, none)
+	if unknown := identify("Digest credentials"); unknown.kind != authNone || unknown.label != "NoAuth" || !unknown.unsupported {
+		t.Fatalf("unknown authorization identity = %#v, want an unsupported no-auth identity", unknown)
+	}
+	if basic := identify("Basic credentials"); basic.unsupported {
+		t.Fatal("Basic, which Discord's OAuth2 token endpoints accept, was marked unsupported")
 	}
 }
 
@@ -588,7 +591,8 @@ func TestLearnedAliasIsBlockedBeforePublication(t *testing.T) {
 	}), nil)
 	done := make(chan *bucketState, 1)
 	go func() {
-		done <- state.observeResponse(route, major, "/channels/:channel_id/messages", false, true, current, response, false)
+		learned, _ := state.observeResponse(route, major, "/channels/:channel_id/messages", false, true, current, response, "", false)
+		done <- learned
 	}()
 
 	deadline := time.Now().Add(time.Second)

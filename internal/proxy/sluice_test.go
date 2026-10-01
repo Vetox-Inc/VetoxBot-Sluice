@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -120,6 +121,7 @@ func TestCloudflareBlockPausesOutboundTraffic(t *testing.T) {
 	}
 	blocked.Store(true)
 	serve(proxy, http.MethodGet, "/api/v10/channels/2/messages", "", nil)
+	waitForEdgeProbe(t, proxy)
 	before := calls.Load()
 	paused := serve(proxy, http.MethodGet, "/api/v10/channels/3/messages", "", nil)
 	if calls.Load() != before || paused.Code != http.StatusTooManyRequests || paused.Header().Get("Via") != "" ||
@@ -131,6 +133,97 @@ func TestCloudflareBlockPausesOutboundTraffic(t *testing.T) {
 	}
 	if live := serve(proxy, http.MethodGet, "/sluice/healthz", "", nil); live.Code != http.StatusOK {
 		t.Fatalf("liveness during a block = %d, want 200", live.Code)
+	}
+}
+
+func TestEdgeRefusalOfOneClientDoesNotPauseTheIP(t *testing.T) {
+	var calls atomic.Int64
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		switch {
+		case strings.Contains(request.Header.Get("User-Agent"), "refused-client"):
+			return testResponse(request, http.StatusForbidden, nil, nil), nil
+		case request.URL.Path == "/api/v10/gateway":
+			time.Sleep(200 * time.Millisecond)
+		}
+		return jsonResponse(request, http.StatusOK, `{}`), nil
+	})
+	config := testConfig(transport)
+	config.CloudflareBanDetection = true
+	proxy := newTestProxy(t, config)
+	refusedClient := func(path string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("User-Agent", "refused-client/1.0")
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, request)
+		return response
+	}
+
+	if refused := refusedClient("/api/v10/channels/1/messages"); refused.Code != http.StatusForbidden {
+		t.Fatalf("edge refusal reached the client as %d, want 403", refused.Code)
+	}
+	if during := serve(proxy, http.MethodGet, "/api/v10/channels/3/messages", "", nil); during.Code != http.StatusOK {
+		t.Fatalf("another client got %d while the probe ran; traffic must keep flowing", during.Code)
+	}
+	waitForEdgeProbe(t, proxy)
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
+		t.Fatalf("one client's refusal paused every request for %v", pause)
+	}
+	if other := serve(proxy, http.MethodGet, "/api/v10/channels/2/messages", "", nil); other.Code != http.StatusOK {
+		t.Fatalf("another route answered %d while only one client was refused", other.Code)
+	}
+	before := calls.Load()
+	if again := refusedClient("/api/v10/channels/1/messages"); again.Code != http.StatusTooManyRequests || calls.Load() != before {
+		t.Fatalf("the refused route answered %d after %d more calls, want a local 429", again.Code, calls.Load()-before)
+	}
+}
+
+func TestFailedEdgeProbeProvesNothing(t *testing.T) {
+	var probes atomic.Int64
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/api/v10/gateway" {
+			probes.Add(1)
+			return nil, errors.New("dial tcp: lookup discord.com: no such host")
+		}
+		return testResponse(request, http.StatusForbidden, nil, nil), nil
+	})
+	config := testConfig(transport)
+	config.CloudflareBanDetection = true
+	config.StateFile = filepath.Join(t.TempDir(), "state.json")
+	proxy := newTestProxy(t, config)
+
+	for index, path := range []string{"/api/v10/channels/1/messages", "/api/v10/channels/2/messages"} {
+		serve(proxy, http.MethodGet, path, "", nil)
+		waitForEdgeProbe(t, proxy)
+		if pause := proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
+			t.Fatalf("a probe that failed paused every request for %v", pause)
+		}
+		if got := probes.Load(); got != int64(index+1) {
+			t.Fatalf("after refusal %d, %d probes ran; a failed probe must let the next refusal probe again", index+1, got)
+		}
+	}
+	if err := proxy.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := os.ReadFile(config.StateFile); err != nil || strings.Contains(string(saved), "edgeBlockedUntil") {
+		t.Fatalf("state file after failed probes = %s (%v), want no Cloudflare block", saved, err)
+	}
+}
+
+func waitForEdgeProbe(t *testing.T, proxy *Proxy) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		proxy.cloudflare.mu.Lock()
+		probing := proxy.cloudflare.probing
+		proxy.cloudflare.mu.Unlock()
+		if !probing {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("edge probe never settled")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

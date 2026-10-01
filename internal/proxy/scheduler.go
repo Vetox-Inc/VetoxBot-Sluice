@@ -35,6 +35,9 @@ type identity struct {
 	key   [sha256.Size]byte
 	botID string
 	label string
+	// unsupported marks an Authorization scheme other than Bot, Bearer and Basic, which Discord
+	// always rejects.
+	unsupported bool
 }
 
 func identify(authorization string) identity {
@@ -59,7 +62,7 @@ func identify(authorization string) identity {
 	case strings.EqualFold(scheme, "Bearer"):
 		kind = authBearer
 	case !strings.EqualFold(scheme, "Bot"):
-		return identity{kind: authNone, label: "NoAuth"}
+		return identity{kind: authNone, label: "NoAuth", unsupported: true}
 	}
 
 	key := sha256.Sum256([]byte(credential))
@@ -202,7 +205,8 @@ func (b *bucketState) release() {
 	b.gate.release()
 }
 
-func (b *bucketState) wait(ctx context.Context, reserve time.Duration) (time.Duration, error) {
+// wait sleeps until the bucket reopens, or returns the delay at once when it would outlast ctx.
+func (b *bucketState) wait(ctx context.Context) (time.Duration, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, err
@@ -215,7 +219,7 @@ func (b *bucketState) wait(ctx context.Context, reserve time.Duration) (time.Dur
 		if delay <= 0 {
 			return 0, nil
 		}
-		if deadline, ok := ctx.Deadline(); ok && delay+reserve >= time.Until(deadline) {
+		if deadline, ok := ctx.Deadline(); ok && delay >= time.Until(deadline) {
 			return delay, nil
 		}
 		timer := time.NewTimer(delay)
@@ -292,11 +296,13 @@ type clientState struct {
 	global     *pacer
 	validation fifoGate
 	validity   atomic.Int32
-	active     atomic.Int64
-	lastUsed   atomic.Int64
-	aliasLimit atomic.Bool
-	maxWaiters int
-	slots      *resourceBudget
+	// applicationRecorded is set once the bot's ID has gone into Proxy.applications.
+	applicationRecorded atomic.Bool
+	active              atomic.Int64
+	lastUsed            atomic.Int64
+	aliasLimit          atomic.Bool
+	maxWaiters          int
+	slots               *resourceBudget
 }
 
 func newClientState(identity identity, globalLimit uint, maxWaiters int, slots *resourceBudget) *clientState {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,7 +22,9 @@ import (
 )
 
 const (
-	shutdownTimeout    = 20 * time.Second
+	// drainTimeout covers a request under the default QUEUE_TIMEOUT and REQUEST_TIMEOUT.
+	drainTimeout       = 15 * time.Second
+	shutdownTimeout    = 5 * time.Second
 	cleanupTimeout     = 5 * time.Second
 	configReferenceURL = "https://github.com/Vetox-Inc/VetoxBot-Sluice/blob/master/CONFIG.md"
 )
@@ -92,9 +95,9 @@ func run() error {
 			_ = running.listener.Close()
 		}
 	}()
-	requestLifetime := config.proxy.QueueTimeout + config.proxy.UpstreamTimeout + 5*time.Second
+	requestLifetime := config.proxy.RequestLifetime()
 	publicAddress := net.JoinHostPort(config.bindIP, fmt.Sprint(config.port))
-	publicServer := newProxyServer(publicAddress, serverProxy, requestLifetime)
+	publicServer := newProxyServer(publicAddress, serverProxy.PublicHandler(), requestLifetime)
 	publicListener, err := net.Listen("tcp", publicAddress)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", publicAddress, err)
@@ -177,30 +180,60 @@ func run() error {
 		"disableHTTP2", config.proxy.DisableHTTP2,
 		"queueTimeout", config.proxy.QueueTimeout.String(),
 		"requestTimeout", config.proxy.UpstreamTimeout.String(),
+		"clientAuth", config.proxy.ClientAuthSecret != "",
+		"stateFile", config.proxy.StateFile,
 	)
 
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 	select {
 	case <-signalContext.Done():
-		logger.Info("Shutdown signal received")
+		// A second signal now stops the process at once instead of waiting for the drain.
+		stopSignals()
+		logger.Info("Shutdown signal received; draining requests in flight", "timeout", drainTimeout.String())
 	case err := <-serveErrors:
 		return err
 	}
-
-	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancelShutdown()
-	var shutdownErrors []error
-	if err := serverProxy.Close(shutdownContext); err != nil {
-		shutdownErrors = append(shutdownErrors, fmt.Errorf("close proxy: %w", err))
-	}
-	for _, running := range servers {
-		if err := running.server.Shutdown(shutdownContext); err != nil {
-			shutdownErrors = append(shutdownErrors, fmt.Errorf("shutdown %s server: %w", running.name, err))
-		}
-	}
+	err = shutdownGracefully(serverProxy, servers, drainTimeout)
 	logger.Info("Proxy stopped")
-	return errors.Join(shutdownErrors...)
+	return err
+}
+
+// shutdownGracefully lets admitted requests finish: the proxy fails its health checks and leaves
+// its cluster, the listeners close, requests in flight get until drain to complete, and Close
+// cancels whatever remains.
+func shutdownGracefully(serverProxy *proxy.Proxy, servers []runningServer, drain time.Duration) error {
+	shutdownServers := func(ctx context.Context) error {
+		errs := make([]error, len(servers))
+		var shutdowns sync.WaitGroup
+		for index, running := range servers {
+			shutdowns.Go(func() {
+				if err := running.server.Shutdown(ctx); err != nil {
+					errs[index] = fmt.Errorf("shutdown %s server: %w", running.name, err)
+				}
+			})
+		}
+		shutdowns.Wait()
+		return errors.Join(errs...)
+	}
+
+	drainContext, cancelDrain := context.WithTimeout(context.Background(), drain)
+	defer cancelDrain()
+	var leaveErr error
+	if err := serverProxy.Drain(drainContext); err != nil {
+		leaveErr = fmt.Errorf("leave cluster: %w", err)
+	}
+	if err := shutdownServers(drainContext); err != nil {
+		logger.Warn("Cancelling requests still running after the drain", "error", err)
+	}
+
+	closeContext, cancelClose := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelClose()
+	var closeErr error
+	if err := serverProxy.Close(closeContext); err != nil {
+		closeErr = fmt.Errorf("close proxy: %w", err)
+	}
+	return errors.Join(leaveErr, closeErr, shutdownServers(closeContext))
 }
 
 func loadDotEnv() error {

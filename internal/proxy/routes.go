@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -15,6 +16,8 @@ import (
 const (
 	discordEpochMilliseconds = 1420070400000
 	interactionTokenPrefix   = "aW50ZXJhY3Rpb246"
+	oldestCurrentAPIVersion  = 9
+	maxKnownApplications     = 4096
 
 	majorChannels     = "channels"
 	majorGuilds       = "guilds"
@@ -192,7 +195,8 @@ func GetOptimisticBucketPath(path, method string) string {
 			if decodedPart, err := base64.StdEncoding.DecodeString(part); err == nil {
 				_, interactionID, _ = strings.Cut(string(decodedPart), ":")
 				interactionID, _, _ = strings.Cut(interactionID, ":")
-				if interactionID == "" {
+				// A client can put anything after the prefix; only a real interaction ID may name a bucket.
+				if !isNumericInput(interactionID) {
 					interactionID = "Unknown"
 				}
 			}
@@ -246,6 +250,61 @@ func isInteractionEndpoint(path string) bool {
 		return true
 	}
 	return len(parts) >= 3 && parts[0] == majorWebhooks && strings.HasPrefix(parts[2], interactionTokenPrefix)
+}
+
+// applicationSet holds the user IDs of bots Discord has accepted. For all but some older
+// applications a bot's user ID is also its application's ID, and interaction follow-ups are
+// webhook calls under the application's ID, so they stay recognisable even if Discord changes
+// the interaction-token format isInteractionEndpoint relies on.
+type applicationSet struct {
+	mu  sync.RWMutex
+	ids map[string]struct{}
+}
+
+func newApplicationSet() *applicationSet {
+	return &applicationSet{ids: make(map[string]struct{})}
+}
+
+func (s *applicationSet) add(id string) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ids) < maxKnownApplications {
+		s.ids[id] = struct{}{}
+	}
+}
+
+func (s *applicationSet) followUp(path string) bool {
+	parts := cleanAPIPath(path)
+	if len(parts) < 3 || parts[0] != majorWebhooks {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, known := s.ids[parts[1]]
+	return known
+}
+
+// outdatedAPIVersion names the version a path asks for when Discord has deprecated or
+// discontinued it, and returns "none" for a path without one, which Discord serves as its
+// deprecated default, v6. It returns "" for a current version.
+func outdatedAPIVersion(path string) string {
+	rest, versioned := strings.CutPrefix(path, "/api/")
+	if !versioned {
+		return "none"
+	}
+	segment, _, _ := strings.Cut(rest, "/")
+	number, versioned := strings.CutPrefix(segment, "v")
+	if !versioned || !isNumericInput(number) {
+		return "none"
+	}
+	version, err := strconv.Atoi(number)
+	if err != nil || version >= oldestCurrentAPIVersion {
+		return ""
+	}
+	return "v" + strconv.Itoa(version)
 }
 
 // isCleanDiscordPath rejects dot segments, encoded separators and encoded question marks, which

@@ -3,8 +3,11 @@ package proxy
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -22,6 +25,7 @@ const (
 
 	hopHeader        = "X-Sluice-Hop"
 	proxyErrorHeader = "X-Sluice-Proxy-Error"
+	clientAuthHeader = "X-Sluice-Auth"
 	sluiceVia        = "1.1 sluice"
 
 	// DefaultDiscordURL is where requests go unless Config.DiscordURL points elsewhere.
@@ -47,7 +51,21 @@ type Config struct {
 	InvalidRequestLimit    int
 	DiscordURL             string
 	CloudflareBanDetection bool
-	Transport              http.RoundTripper
+	// ClientAuthSecret, when set, must arrive in X-Sluice-Auth on every request to PublicHandler.
+	ClientAuthSecret string
+	// StateFile keeps the invalid-request, webhook and Cloudflare guards across restarts; "" keeps
+	// them in memory only.
+	StateFile string
+	// BotWideRoutes lists routes, as "GET /guilds/!/vanity-url", that Discord limits per bot
+	// rather than per channel, guild or webhook.
+	BotWideRoutes string
+	Transport     http.RoundTripper
+}
+
+// RequestLifetime bounds a request that makes no progress: its queue deadline, one attempt and
+// time to write the response.
+func (c Config) RequestLifetime() time.Duration {
+	return c.QueueTimeout + c.UpstreamTimeout + 5*time.Second
 }
 
 type requestContextKey uint8
@@ -55,6 +73,8 @@ type requestContextKey uint8
 const (
 	requestMetadataContextKey requestContextKey = iota
 	peerTargetContextKey
+	// connectionProgressContextKey holds a func that renews the inbound connection's deadlines.
+	connectionProgressContextKey
 )
 
 type requestMetadata struct {
@@ -89,12 +109,20 @@ type Proxy struct {
 	noAuth    *clientState
 
 	globalOverrides map[string]uint
+	botWideRoutes   map[string]bool
 	invalidRequests *invalidRequestGuard
 	webhooks        *webhookGuard
 	cloudflare      *cloudflareGuard
+	applications    *applicationSet
 	bucketSlots     *resourceBudget
 	inFlight        *resourceBudget
 	retryCapture    *resourceBudget
+
+	// backgroundMu orders goroutines started for requests before Close waits for them.
+	backgroundMu    sync.Mutex
+	draining        atomic.Bool
+	versionWarnings sync.Map
+	aliasWarning    sync.Once
 
 	transport    http.RoundTripper
 	discordProxy *httputil.ReverseProxy
@@ -187,6 +215,10 @@ func New(config Config) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
+	botWideRoutes, err := parseBotWideRoutes(config.BotWideRoutes)
+	if err != nil {
+		return nil, err
+	}
 	transport := config.Transport
 	if transport == nil {
 		transport, err = newHTTPTransport(config.OutboundIP, config.DisableHTTP2)
@@ -207,9 +239,11 @@ func New(config Config) (*Proxy, error) {
 		bots:            make(map[[sha256.Size]byte]*clientState),
 		bearers:         make(map[[sha256.Size]byte]*clientState),
 		globalOverrides: overrides,
+		botWideRoutes:   botWideRoutes,
 		invalidRequests: newInvalidRequestGuard(invalidLimit, invalidRequestWindow),
 		webhooks:        newWebhookGuard(),
 		cloudflare:      &cloudflareGuard{},
+		applications:    newApplicationSet(),
 		bucketSlots:     newResourceBudget(int64(config.MaxBucketStates)),
 		inFlight:        newResourceBudget(int64(config.MaxInFlightRequests)),
 		retryCapture:    newResourceBudget(config.MaxRetryCaptureBytes),
@@ -221,6 +255,11 @@ func New(config Config) (*Proxy, error) {
 	p.initReverseProxies()
 	p.wg.Add(1)
 	go p.sweepLoop()
+	if config.StateFile != "" {
+		p.loadState()
+		p.wg.Add(1)
+		go p.stateLoop()
+	}
 	activeProxy.Store(p)
 	return p, nil
 }
@@ -258,20 +297,57 @@ func (p *Proxy) upstreamProblem(now time.Time) string {
 	return ""
 }
 
+// PublicHandler serves clients. With ClientAuthSecret set, it admits only requests carrying the
+// secret in X-Sluice-Auth, apart from the health endpoints. Cluster peers authenticate with
+// mutual TLS instead and are served by the Proxy itself.
+func (p *Proxy) PublicHandler() http.Handler {
+	if p.config.ClientAuthSecret == "" {
+		return p
+	}
+	want := sha256.Sum256([]byte(p.config.ClientAuthSecret))
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		collapseSlashes(request.URL)
+		got := sha256.Sum256([]byte(request.Header.Get(clientAuthHeader)))
+		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 && !isHealthPath(request.URL.Path) {
+			ProxyFailures.WithLabelValues("client_auth").Inc()
+			// 403, not 401: discord.js discards its bot token on a 401.
+			writeProxyError(writer, "Sluice client authentication failed", http.StatusForbidden)
+			return
+		}
+		p.ServeHTTP(writer, request)
+	})
+}
+
+func isHealthPath(path string) bool {
+	return path == "/sluice/healthz" || path == "/nirn/healthz" || path == "/sluice/health/upstream"
+}
+
+// Drain starts a graceful shutdown: health checks fail so load balancers stop sending traffic,
+// and the node leaves its cluster so peers stop routing to it. Admitted requests keep running
+// until Close.
+func (p *Proxy) Drain(ctx context.Context) error {
+	p.draining.Store(true)
+	return p.closeCluster(ctx)
+}
+
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	collapseSlashes(request.URL)
+	request.Header.Del(clientAuthHeader)
 	switch request.URL.Path {
 	case "/sluice/healthz", "/nirn/healthz":
-		select {
-		case <-p.ctx.Done():
+		if request.URL.Path == "/nirn/healthz" {
+			p.aliasWarning.Do(func() {
+				logger.Warn("/nirn/healthz is deprecated and will be removed in Sluice 2.0; use /sluice/healthz")
+			})
+		}
+		switch {
+		case p.ctx.Err() != nil || p.draining.Load():
 			writeUnavailable(writer, "proxy is shutting down")
+		case p.clusterOverCapacity.Load():
+			writeUnavailable(writer, "cluster exceeds CLUSTER_MAX_NODES")
 		default:
-			if p.clusterOverCapacity.Load() {
-				writeUnavailable(writer, "cluster exceeds CLUSTER_MAX_NODES")
-			} else {
-				markGenerated(writer.Header())
-				writer.WriteHeader(http.StatusOK)
-			}
+			markGenerated(writer.Header())
+			writer.WriteHeader(http.StatusOK)
 		}
 		return
 	case "/sluice/health/upstream":
@@ -318,10 +394,24 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		stop()
 		cancel()
 	}()
+	if request.Body != http.NoBody {
+		// An upload can outlast the server's read and write timeouts; each chunk it sends renews them.
+		controller := http.NewResponseController(writer)
+		lifetime := p.config.RequestLifetime()
+		requestContext = context.WithValue(requestContext, connectionProgressContextKey, func() {
+			deadline := time.Now().Add(lifetime)
+			_ = controller.SetReadDeadline(deadline)
+			_ = controller.SetWriteDeadline(deadline)
+		})
+	}
 	request = request.WithContext(requestContext)
 
 	bucketPath := GetOptimisticBucketPath(request.URL.Path, request.Method)
 	metricsPath := MetricsPathFromBucket(bucketPath)
+	botWide := p.botWideRoutes[request.Method+" "+metricsPath]
+	if botWide {
+		bucketPath = metricsPath
+	}
 	if p.config.EnableMetrics {
 		metricsPath = metricsRouteLabel(metricsPath)
 	} else if len(metricsPath) > maxMetricsRouteLabelBytes {
@@ -334,8 +424,25 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		defer openConnections.Dec()
 	}
 
+	if version := outdatedAPIVersion(request.URL.Path); version != "" {
+		if p.config.EnableMetrics {
+			DeprecatedAPIRequests.WithLabelValues(version).Inc()
+		}
+		if _, warned := p.versionWarnings.LoadOrStore(version, struct{}{}); !warned {
+			logger.Warn("A client uses a deprecated or discontinued Discord API version; none means Discord's default, v6", "version", version, "route", metricsPath)
+		}
+	}
+
 	identity := identify(request.Header.Get("Authorization"))
-	interaction := isInteractionEndpoint(request.URL.Path)
+	interaction := isInteractionEndpoint(request.URL.Path) || p.applications.followUp(request.URL.Path)
+	webhookKey := webhookCredentialKey(request.URL.Path, interaction)
+	credentialScoped := !interaction && webhookKey == ""
+	if identity.unsupported && credentialScoped {
+		// Discord rejects every other scheme with a 401 that counts against this IP.
+		ProxyFailures.WithLabelValues("unsupported_authorization").Inc()
+		writeResponse(writer, unauthorizedResponse(request))
+		return
+	}
 	routingHash := affinityHash(identity, bucketPath, interaction)
 	hop := forwardedHop(request.Header.Get(hopHeader))
 	request.Header.Del(hopHeader)
@@ -360,7 +467,9 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	defer state.end()
 
 	majorKey := majorParameter(request.URL.Path)
-	webhookKey := webhookCredentialKey(request.URL.Path, interaction)
+	if botWide {
+		majorKey = ""
+	}
 	metadata := &requestMetadata{
 		state:            state,
 		routeHash:        routeHash(request.Method, bucketPath, majorKey),
@@ -369,7 +478,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		metricsPath:      metricsPath,
 		majorKey:         majorKey,
 		interaction:      interaction,
-		credentialScoped: !interaction && webhookKey == "",
+		credentialScoped: credentialScoped,
 		webhookKey:       webhookKey,
 	}
 	ctx := context.WithValue(request.Context(), requestMetadataContextKey, metadata)
@@ -413,12 +522,27 @@ func writeUnavailable(writer http.ResponseWriter, message string) {
 	writeProxyError(writer, message, http.StatusServiceUnavailable)
 }
 
+// writeProxyError answers in Discord's error shape, which Discord libraries such as discord.js
+// read to report the message.
 func writeProxyError(writer http.ResponseWriter, message string, status int) {
-	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	body, _ := json.Marshal(struct {
+		Message string `json:"message"`
+		Code    int    `json:"code"`
+	}{message, 0})
+	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set(proxyErrorHeader, "true")
 	markGenerated(writer.Header())
 	writer.WriteHeader(status)
-	_, _ = writer.Write([]byte(message + "\n"))
+	_, _ = writer.Write(body)
+}
+
+func writeResponse(writer http.ResponseWriter, response *http.Response) {
+	defer func() { _ = response.Body.Close() }()
+	for name, values := range response.Header {
+		writer.Header()[name] = values
+	}
+	writer.WriteHeader(response.StatusCode)
+	_, _ = io.Copy(writer, response.Body)
 }
 
 func markGenerated(header http.Header) {
@@ -440,9 +564,26 @@ func (p *Proxy) sweepLoop() {
 	}
 }
 
+// goBackground runs fn on a goroutine Close waits for, unless the proxy is already closing.
+func (p *Proxy) goBackground(fn func()) bool {
+	p.backgroundMu.Lock()
+	defer p.backgroundMu.Unlock()
+	if p.ctx.Err() != nil {
+		return false
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		fn()
+	}()
+	return true
+}
+
 func (p *Proxy) Close(ctx context.Context) error {
 	p.closeOnce.Do(func() {
+		p.backgroundMu.Lock()
 		p.cancel()
+		p.backgroundMu.Unlock()
 		go p.finishClose()
 	})
 
@@ -466,5 +607,10 @@ func (p *Proxy) finishClose() {
 		closer.CloseIdleConnections()
 	}
 	p.wg.Wait()
+	if p.config.StateFile != "" {
+		if err := p.saveState(); err != nil {
+			logger.Warn("Could not save STATE_FILE at shutdown", "error", err)
+		}
+	}
 	close(p.closeDone)
 }

@@ -106,9 +106,14 @@ func TestQueueTimeoutAndCapacity(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, path, nil, true))
-		if !errors.Is(err, errQueueDeadline) {
-			t.Fatalf("queued request error = %v, want %v", err, errQueueDeadline)
+		response, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, path, nil, true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("Retry-After") == "" ||
+			response.Header.Get("X-RateLimit-Remaining") != "0" || response.Header.Get("X-RateLimit-Scope") != "user" {
+			t.Fatalf("queue deadline answered %d %v, want a retryable bucket 429", response.StatusCode, response.Header)
 		}
 		bucket.release()
 		if calls.Load() != 0 || bucket.active.Load() != 0 {
@@ -149,9 +154,13 @@ func TestQueueTimeoutAndCapacity(t *testing.T) {
 		}()
 		waitForGateWaiters(t, &bucket.gate, 1)
 
-		_, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, path, nil, true))
-		if !errors.Is(err, errQueueFull) {
-			t.Fatalf("over-capacity request error = %v, want errQueueFull", err)
+		response, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, path, nil, true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("Retry-After") == "" {
+			t.Fatalf("over-capacity request answered %d %v, want a retryable 429", response.StatusCode, response.Header)
 		}
 		cancelFirst()
 		if err := <-firstResult; !errors.Is(err, context.Canceled) {
@@ -600,7 +609,8 @@ func TestClusterPeerTimeoutLeavesServerResponseMargin(t *testing.T) {
 	if !ok {
 		t.Fatalf("peer transport = %T, want *timeoutTransport", proxy.peerProxy.Transport)
 	}
-	if want := config.QueueTimeout + config.UpstreamTimeout; transport.timeout != want {
+	// The peer can wait out QUEUE_TIMEOUT and then spend a whole REQUEST_TIMEOUT on its attempt.
+	if want := config.RequestLifetime(); transport.timeout != want || want <= config.QueueTimeout+config.UpstreamTimeout {
 		t.Fatalf("peer timeout = %s, want %s", transport.timeout, want)
 	}
 }

@@ -58,9 +58,9 @@ func TestErrorLogsIncrementErrorCounter(t *testing.T) {
 
 func TestMetricsNamespaceNamesEveryMetric(t *testing.T) {
 	suffixes := []string{
-		"cloudflare_blocked", "cloudflare_blocks_total", "error", "failures_total", "invalid_requests", "open_connections",
-		"queue_wait_seconds", "requests", "requests_routed_error", "requests_routed_received", "requests_routed_sent",
-		"webhook_short_circuits_total",
+		"cloudflare_blocked", "cloudflare_blocks_total", "deprecated_api_requests_total", "edge_refusals_total", "error",
+		"failures_total", "invalid_requests", "open_connections", "queue_wait_seconds", "requests", "requests_routed_error",
+		"requests_routed_received", "requests_routed_sent", "webhook_short_circuits_total",
 	}
 	for _, namespace := range []string{"nirn_proxy", DefaultMetricsNamespace} {
 		t.Run(namespace, func(t *testing.T) {
@@ -74,6 +74,7 @@ func TestMetricsNamespaceNamesEveryMetric(t *testing.T) {
 			set.requests.WithLabelValues("GET", "200 OK", "/gateway", "NoAuth").Observe(0.1)
 			set.openConnections.WithLabelValues("GET", "/gateway").Inc()
 			set.queueWait.WithLabelValues("GET", "/gateway").Observe(0.1)
+			set.deprecatedAPI.WithLabelValues("none").Inc()
 			families, err := set.registry.Gather()
 			if err != nil {
 				t.Fatal(err)

@@ -54,6 +54,8 @@ func TestGetOptimisticBucketPath(t *testing.T) {
 		{path: "/api/v9/applications/203039963636301824/commands", method: "GET", want: "/applications/203039963636301824/commands"},
 		{path: "/api/v9/applications/203039963636301824/commands/203039963636301824", method: "GET", want: "/applications/203039963636301824/commands/!"},
 		{path: "/api/v10/webhooks/203039963636301824/aW50ZXJhY3Rpb246!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", method: "POST", want: "/webhooks/203039963636301824/Unknown"},
+		// "interaction:hello" is a client's text, not an interaction ID, so it must not name a bucket or metric label.
+		{path: "/api/v10/webhooks/203039963636301824/aW50ZXJhY3Rpb246aGVsbG8", method: "POST", want: "/webhooks/203039963636301824/Unknown"},
 		{path: "/api/version/channels", method: "GET", want: "/version/channels"},
 		{path: "/api/v/channels", method: "GET", want: "/v/channels"},
 	}

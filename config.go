@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -25,9 +26,9 @@ var settingGroups = []struct {
 	title string
 	names []string
 }{
-	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2", "DISCORD_API_URL"}},
-	{"Scheduling and retries", []string{"QUEUE_TIMEOUT", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES", "MAX_BEARER_COUNT", "MAX_CLIENT_STATES", "MAX_BUCKET_STATES"}},
-	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION"}},
+	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "CLIENT_AUTH_SECRET", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2", "DISCORD_API_URL"}},
+	{"Scheduling and retries", []string{"QUEUE_TIMEOUT", "BOT_WIDE_ROUTES", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES", "MAX_BEARER_COUNT", "MAX_CLIENT_STATES", "MAX_BUCKET_STATES"}},
+	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION", "STATE_FILE"}},
 	{"Observability", []string{"ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
 	{"Clustering", []string{"CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_ADVERTISE_ADDR", "CLUSTER_MAX_NODES", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_MEMBERS", "CLUSTER_DNS", "NODE_NAME"}},
 }
@@ -67,7 +68,8 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
-	queueTimeout, err := envDurationMilliseconds("QUEUE_TIMEOUT", time.Minute)
+	// With REQUEST_TIMEOUT's default, a request is answered within discord.js's default timeout.
+	queueTimeout, err := envDurationMilliseconds("QUEUE_TIMEOUT", 10*time.Second)
 	if err != nil {
 		return appConfig{}, err
 	}
@@ -177,6 +179,10 @@ func loadConfig() (appConfig, error) {
 	if clusterEnabled {
 		invalidRequestLimit = max(1, proxy.InvalidRequestSafetyLimit/clusterMaxNodes)
 	}
+	clientAuthSecret := os.Getenv("CLIENT_AUTH_SECRET")
+	if clientAuthSecret != "" && utf8.RuneCountInString(clientAuthSecret) < 32 {
+		return appConfig{}, fmt.Errorf("CLIENT_AUTH_SECRET must contain at least 32 characters")
+	}
 
 	return appConfig{
 		bindIP:               envString("BIND_IP", "0.0.0.0"),
@@ -204,6 +210,7 @@ func loadConfig() (appConfig, error) {
 			Disable401Lock:         disable401Lock,
 			EnableMetrics:          enableMetrics,
 			GlobalOverrides:        strings.TrimSpace(os.Getenv("BOT_RATELIMIT_OVERRIDES")),
+			BotWideRoutes:          strings.TrimSpace(os.Getenv("BOT_WIDE_ROUTES")),
 			MaxBearerClients:       maxBearerClients,
 			MaxClientStates:        maxClientStates,
 			MaxInFlightRequests:    maxInFlightRequests,
@@ -214,8 +221,23 @@ func loadConfig() (appConfig, error) {
 			InvalidRequestLimit:    invalidRequestLimit,
 			DiscordURL:             discordURL,
 			CloudflareBanDetection: cloudflareBanDetection,
+			ClientAuthSecret:       clientAuthSecret,
+			StateFile:              stateFilePath(port),
 		},
 	}, nil
+}
+
+// stateFilePath is STATE_FILE, where an empty value turns the file off, or by default a file
+// named after the proxy port in the user cache directory.
+func stateFilePath(port int) string {
+	if value, set := os.LookupEnv("STATE_FILE"); set {
+		return strings.TrimSpace(value)
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(cache, "sluice", fmt.Sprintf("state-%d.json", port))
 }
 
 func (c appConfig) clusteringEnabled() bool {

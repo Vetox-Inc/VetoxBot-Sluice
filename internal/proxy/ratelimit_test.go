@@ -40,7 +40,7 @@ func TestGlobalPacerDefaultSpacingAndCancellation(t *testing.T) {
 	}
 }
 
-func testCooldownExtensionWakesWaiter(t *testing.T, wait func(context.Context, time.Duration) (time.Duration, error), extend func()) {
+func testCooldownExtensionWakesWaiter(t *testing.T, wait func(context.Context) (time.Duration, error), extend func()) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -50,7 +50,7 @@ func testCooldownExtensionWakesWaiter(t *testing.T, wait func(context.Context, t
 	}
 	done := make(chan result, 1)
 	go func() {
-		delay, err := wait(ctx, 100*time.Millisecond)
+		delay, err := wait(ctx)
 		done <- result{delay: delay, err: err}
 	}()
 	select {
@@ -170,7 +170,7 @@ func TestHugeRateLimitDelaysAreClampedBeforeDurationConversion(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			info, err := parseRateLimitHeaders(test.header, test.status, time.Now())
+			info, err := parseRateLimitHeaders(test.header, test.status, discordRetryAfter(test.header, nil), time.Now())
 			if err != nil {
 				t.Fatal(err)
 			}

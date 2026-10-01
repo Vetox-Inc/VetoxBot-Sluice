@@ -53,6 +53,7 @@ try {
       PORT: String(port),
       METRICS_PORT: String(await freePort()),
       DISCORD_API_URL: `http://127.0.0.1:${discordPort}`,
+      STATE_FILE: '',
     },
   });
   const base = `http://127.0.0.1:${port}`;

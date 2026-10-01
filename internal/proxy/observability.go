@@ -44,6 +44,9 @@ var (
 	RequestsRoutedError  prometheus.Counter
 	WebhookShortCircuits prometheus.Counter
 	CloudflareBlocks     prometheus.Counter
+	EdgeRefusals         prometheus.Counter
+	// DeprecatedAPIRequests is labelled by version: v0 through v8, or none.
+	DeprecatedAPIRequests *prometheus.CounterVec
 
 	metricsRegistry *prometheus.Registry
 	metricsRoutes   = newRouteLabelLimiter(maxMetricsRouteLabels)
@@ -80,6 +83,8 @@ type metricSet struct {
 	routedError          prometheus.Counter
 	webhookShortCircuits prometheus.Counter
 	cloudflareBlocks     prometheus.Counter
+	edgeRefusals         prometheus.Counter
+	deprecatedAPI        *prometheus.CounterVec
 }
 
 func newMetricSet(namespace string) metricSet {
@@ -127,12 +132,21 @@ func newMetricSet(namespace string) metricSet {
 			Namespace: namespace, Name: "cloudflare_blocks_total",
 			Help: "Times Discord's edge blocked this IP and outbound traffic was paused",
 		}),
+		edgeRefusals: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "edge_refusals_total",
+			Help: "Responses from Discord's edge rather than Discord: a 429 or 403 without Via",
+		}),
+		deprecatedAPI: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "deprecated_api_requests_total",
+			Help: "Requests naming a deprecated or discontinued Discord API version, or none (Discord's default, v6)",
+		}, []string{"version"}),
 	}
 	set.registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		set.errors, set.failures, set.requests, set.queueWait, set.openConnections,
 		set.routedSent, set.routedReceived, set.routedError, set.webhookShortCircuits, set.cloudflareBlocks,
+		set.edgeRefusals, set.deprecatedAPI,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "invalid_requests",
 			Help: "Invalid Discord responses (401, 403, non-shared 429) in the rolling 10-minute window",
@@ -170,6 +184,8 @@ func ConfigureMetrics(namespace string) {
 	RequestsRoutedError = set.routedError
 	WebhookShortCircuits = set.webhookShortCircuits
 	CloudflareBlocks = set.cloudflareBlocks
+	EdgeRefusals = set.edgeRefusals
+	DeprecatedAPIRequests = set.deprecatedAPI
 }
 
 type routeLabelLimiter struct {

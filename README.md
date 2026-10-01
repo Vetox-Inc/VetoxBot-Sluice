@@ -38,18 +38,23 @@ http://127.0.0.1:8080/api/v10/gateway
 ```
 
 In discord.js, that is `new Client({ intents, rest: { api: 'http://127.0.0.1:8080/api' } })`. Most libraries have a
-similar base-URL option; otherwise, remap the host.
+similar base-URL option; otherwise, remap the host. With its defaults, Sluice answers within discord.js's 15-second
+request timeout. Its own errors use Discord's JSON error shape, and its own 429s carry Discord's rate-limit headers, so
+discord.js reports and waits them out as it would Discord's.
 
-Sluice forwards the method, path, query, headers and body as sent. Like any reverse proxy, it rewrites `Host`, drops
-hop-by-hop, `Forwarded` and `X-Forwarded-*` headers, and supplies a `User-Agent` when the client sends none. A path
-without the `/api` prefix is forwarded under it, and repeated slashes are collapsed, as Discord does.
+Sluice forwards the method, path, query, headers and body as sent. Like any reverse proxy, it rewrites `Host` and
+drops hop-by-hop, `Forwarded` and `X-Forwarded-*` headers. It supplies a `User-Agent` when the client sends none, and
+puts its own in front of one that does not start with `DiscordBot`, the format Discord requires. It asks Discord for
+gzip itself, so clients receive responses uncompressed. A path without the `/api` prefix is forwarded under it, and
+repeated slashes are collapsed, as Discord does.
 
 ## Security
 
-The proxy, metrics and pprof listeners have no authentication, and `BIND_IP` defaults to `0.0.0.0`. Anyone who can
-reach the proxy port can send requests to Discord from your IP, and your clients' tokens cross that hop in plain HTTP.
-Keep the listeners on loopback or a private network, or restrict them with a firewall or network policy. Only the
-cluster-peer listener has built-in mutual TLS.
+`BIND_IP` defaults to `0.0.0.0`, and the metrics and pprof listeners have no authentication. Anyone who can reach the
+proxy port can send requests to Discord from your IP, spending its invalid-request budget, unless you set
+`CLIENT_AUTH_SECRET`; clients then send it in the `X-Sluice-Auth` header. Your clients' tokens cross that hop in plain
+HTTP, so keep the listeners on loopback or a private network, or restrict them with a firewall or network policy. Only
+the cluster-peer listener has built-in mutual TLS.
 
 Sluice redacts tokens from every log field, including webhook and interaction tokens in paths. Report vulnerabilities
 privately, as [SECURITY.md](SECURITY.md) describes.
@@ -71,19 +76,27 @@ time, first in first out, and moves on as soon as Discord's response headers arr
 the queue. The global limit is taken when a request is sent, never while it waits.
 
 Waits are bounded. `MAX_QUEUE_DEPTH` caps the requests waiting on one bucket, and `MAX_IN_FLIGHT_REQUESTS` caps
-everything admitted. `QUEUE_TIMEOUT` is each request's whole deadline, covering waiting, attempts, retries and the
-response stream, and a request whose client disconnects leaves its queue at once.
+everything admitted. `QUEUE_TIMEOUT` bounds how long a request waits for its turn. A request that cannot get it in
+time, or finds its queue full, gets a `429` with `Retry-After`: it never reached Discord, so clients retry it safely.
+`REQUEST_TIMEOUT` bounds how long an attempt may go without progress, so an upload that keeps moving is not cut
+short; no attempt lasts more than 10 minutes. A request whose client disconnects leaves its queue at once.
 
 ### 429 retries
 
 When Discord answers 429, Sluice retries the request itself if it can replay the body: when there is none, or when it
 captured the whole body while sending it, up to `MAX_RETRY_BODY_BYTES`. Retries go back through the scheduler and must
-finish within `QUEUE_TIMEOUT`. If the known cooldown leaves no time for a full `REQUEST_TIMEOUT` attempt, Sluice
-returns the 429 straight away, with `Retry-After`. A body it cannot replay gets Discord's original 429, never a partial
+start within `QUEUE_TIMEOUT`. If the known cooldown outlasts `QUEUE_TIMEOUT`, Sluice returns the 429 straight away,
+with `Retry-After`. A body it cannot replay gets Discord's original 429, never a partial
 or altered retry. No other status is retried.
 
+A shared-scope 429 limits one resource, such as one message's reactions, while its bucket keeps capacity. Sluice keeps
+the bucket open for everything else and makes only that request wait, or returns the 429 at once when the wait is too
+long. Cooldowns are timed by the `retry_after` in Discord's body, which is more precise than the whole seconds of
+`Retry-After`.
+
 Sluice prevents avoidable requests and absorbs the 429s it can, but it cannot promise zero. Discord can change limits
-and omit headers, and requests made outside Sluice with the same token are invisible to it. Clients should still
+and omit headers, and requests made outside Sluice with the same token are invisible to it. Some routes are limited
+per bot across guilds although their headers say otherwise; list those in `BOT_WIDE_ROUTES`. Clients should still
 handle 429s.
 
 ### Protecting your IP
@@ -93,12 +106,17 @@ handle 429s.
   share: 9,500 divided by `CLUSTER_MAX_NODES`.
 - **Invalid tokens.** After a 401 on a route the token authenticates, later requests on such routes get a 401 from
   Sluice without reaching Discord. Webhook-token and interaction calls, which Discord authenticates by the token in
-  their path, neither mark a token invalid nor are refused because of one. `DISABLE_401_LOCK=true` turns this off.
+  their path, neither mark a token invalid nor are refused because of one. `DISABLE_401_LOCK=true` turns this off. An
+  `Authorization` scheme Discord never accepts, anything but `Bot`, `Bearer` and `Basic`, gets a 401 from Sluice.
 - **Deleted webhooks.** Once Discord reports a webhook as unknown (code 10015) or its token as invalid (code 50027),
   Sluice answers further calls to that webhook itself for an hour. Other 404s pass through.
-- **Cloudflare blocks.** Discord's own responses carry `Via: 1.1 google`, so a 429 or 403 without it came from
-  Cloudflare. Sluice then pauses all outbound traffic for the response's `Retry-After` and answers `429` meanwhile. Set
-  `CLOUDFLARE_BAN_DETECTION=false` if something between Sluice and Discord strips `Via`.
+- **Cloudflare blocks.** Discord's own responses carry `Via: 1.1 google`, so a 429 or 403 without it came from Discord's
+  edge. Sluice returns it without a retry, backs that route off, and checks with a request of its own whether the edge
+  blocks this IP or only that client. For a block, Sluice pauses all outbound traffic for the response's `Retry-After`
+  and answers `429` meanwhile. Set `CLOUDFLARE_BAN_DETECTION=false` if something between Sluice and Discord strips
+  `Via`.
+- **Restarts.** The invalid-request history, a Cloudflare block and the deleted webhooks survive a restart in
+  `STATE_FILE`, which defaults to a file in the user cache directory.
 
 ## Clustering
 
@@ -125,17 +143,19 @@ details.
 
 Discord's response passes through unchanged, after any retry. Responses Sluice generates itself carry
 `generated-by-proxy: true` and `Via: 1.1 sluice`. The exception is the Cloudflare-pause 429, which omits `Via` so
-clients treat it like the block it reports. Sluice's own errors (`400`, `408`, `502`, `503`, and `404` on a reserved
-path) also carry `X-Sluice-Proxy-Error: true`.
+clients treat it like the block it reports. Sluice's own errors (`400`, `403`, `408`, `502`, `503`, and `404` on a
+reserved path) also carry `X-Sluice-Proxy-Error: true`, and their body is Discord's error shape,
+`{"message": "...", "code": 0}`, which discord.js reports as `DiscordAPIError[0]` with Sluice's message.
 
 | Status | When |
 | --- | --- |
-| `429` | A known cooldown outlasts the request's deadline, or a Cloudflare block has paused traffic. Carries `Retry-After`. |
-| `401` | Discord already rejected the token (see `DISABLE_401_LOCK`), or a webhook's token is known to be invalid. |
+| `429` | The request could not get its turn within `QUEUE_TIMEOUT` or found its queue full, a known cooldown outlasts that deadline, or a Cloudflare block has paused traffic. Carries `Retry-After` and Discord's rate-limit headers. |
+| `401` | Discord already rejected the token (see `DISABLE_401_LOCK`), a webhook's token is known to be invalid, or the `Authorization` scheme is one Discord never accepts. |
+| `403` | `CLIENT_AUTH_SECRET` is set and the request did not carry it. |
 | `404` | The webhook is known to be deleted, or the path is under the reserved `/sluice/` or `/nirn/` prefix. |
-| `408` | A Discord attempt exceeded `REQUEST_TIMEOUT`, or the request's `QUEUE_TIMEOUT` expired. |
+| `408` | A Discord attempt went `REQUEST_TIMEOUT` without progress. Discord may have acted on it, so it is not retried. |
 | `502` | Discord could not be reached or returned an unusable response. |
-| `503` | Sluice could not safely take the request: a full queue, exhausted capacity or invalid-request budget, an unavailable peer, or shutdown. Carries `Retry-After: 1`. |
+| `503` | Sluice could not safely take the request: exhausted capacity or invalid-request budget, an unavailable peer, or shutdown. Carries `Retry-After: 1`. |
 | `400` | `CONNECT`, protocol upgrades, and paths containing dot segments, encoded separators or an encoded `?`. |
 
 If a deadline expires after Discord's response headers were forwarded, Sluice aborts the stream, because the status
@@ -151,9 +171,11 @@ for a single node, and `sluice --help` lists them all. The ones most deployments
 | `BIND_IP` | `0.0.0.0` | Address every listener binds to |
 | `PORT` | `8080` | Proxy port |
 | `METRICS_PORT` | `9000` | Prometheus `/metrics` port |
+| `CLIENT_AUTH_SECRET` | empty | Secret clients must send in `X-Sluice-Auth` |
 | `BOT_RATELIMIT_OVERRIDES` | empty | Raised global limits, as `bot_id:requests_per_second` |
-| `REQUEST_TIMEOUT` | `5000` | Milliseconds allowed for each Discord attempt |
-| `QUEUE_TIMEOUT` | `60000` | Milliseconds allowed for a request in total |
+| `REQUEST_TIMEOUT` | `5000` | Milliseconds a Discord attempt may go without progress |
+| `QUEUE_TIMEOUT` | `10000` | Milliseconds a request may wait for its turn |
+| `STATE_FILE` | a file in the user cache directory | Where protection state survives restarts |
 | `LOG_LEVEL`, `LOG_FORMAT` | `info`, `text` | Log verbosity; `json` for structured logs |
 
 [CONFIG.md](CONFIG.md) documents every setting with its range and default.
@@ -173,8 +195,10 @@ and alerts.
 | `sluice_error` | none | Errors logged |
 | `sluice_invalid_requests` | none | Invalid responses in the rolling 10 minutes |
 | `sluice_cloudflare_blocked` | none | 1 while a Cloudflare block pauses traffic |
-| `sluice_cloudflare_blocks_total` | none | Cloudflare blocks detected |
+| `sluice_cloudflare_blocks_total` | none | Cloudflare blocks confirmed |
+| `sluice_edge_refusals_total` | none | Responses from Discord's edge rather than Discord |
 | `sluice_webhook_short_circuits_total` | none | Calls to deleted webhooks answered by Sluice |
+| `sluice_deprecated_api_requests_total` | `version` | Requests naming a deprecated API version, or none |
 | `sluice_requests_routed_sent`, `_received`, `_error` | none | Requests forwarded between cluster nodes |
 
 `clientId` is a bot's user ID once Discord has accepted its token, and `Unverified` before that. Bearer and
@@ -184,10 +208,13 @@ an importable Grafana dashboard for either metric prefix.
 
 The proxy port also serves two health endpoints:
 
-- `/sluice/healthz`, or nirn-proxy's `/nirn/healthz`, is liveness: `200`, or `503` while shutting down or when the
-  cluster exceeds `CLUSTER_MAX_NODES`.
+- `/sluice/healthz` is liveness: `200`, or `503` while draining or shutting down, or when the cluster exceeds
+  `CLUSTER_MAX_NODES`. nirn-proxy's `/nirn/healthz` still answers, but it is deprecated and goes in Sluice 2.0.
 - `/sluice/health/upstream` answers `503` while a Cloudflare block is active or at least 80% of the invalid-request
   budget is used. Alert on it; do not restart on it.
+
+On `SIGTERM`, Sluice drains: liveness fails, the node leaves its cluster, and requests already admitted get up to 15
+seconds to finish; a second signal stops it at once. Give your process manager at least 20 seconds to stop it.
 
 With `ENABLE_PPROF=true`, profiles are served at `/debug/pprof/` on `PPROF_PORT`. Never expose that port publicly.
 
