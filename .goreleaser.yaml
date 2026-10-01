@@ -35,3 +35,7 @@ release:
   github:
     owner: Vetox-Inc
     name: VetoxBot-Sluice
+  # A tag such as v1.0.0-rc.1 makes a pre-release, never the latest release.
+  prerelease: auto
+  # Lets a re-run finish a release whose later steps failed.
+  replace_existing_artifacts: true

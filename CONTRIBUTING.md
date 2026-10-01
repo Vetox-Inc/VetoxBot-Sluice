@@ -76,13 +76,19 @@ A change must not break these. If one has to bend, say so in the pull request.
 ## Releasing
 
 The version lives only in the git tag: GoReleaser stamps it into the binaries, the image and the npm packages. To
-release, maintainers move the `Unreleased` entries in `CHANGELOG.md` under the new version and date, then push a
-`vX.Y.Z` tag on `master`. The release workflow waits for approval in the `release` environment, then publishes, all
-with build provenance:
+release, maintainers move the `Unreleased` entries in `CHANGELOG.md` under a `## X.Y.Z - YYYY-MM-DD` heading, then
+push a `vX.Y.Z` tag on `master`. The release workflow waits for approval in the `release` environment, then publishes,
+all with build provenance:
 
-- the GitHub release, with binaries, checksums and SBOMs
+- the GitHub release, with that changelog section as its notes, and binaries, checksums and SBOMs
 - the multi-arch image `ghcr.io/vetox-inc/sluice`, tagged `X.Y.Z`, `X.Y` and `X`
 - the npm packages: `@vetox-bot/sluice` and one package per platform
+
+The workflow stops before publishing anything when the changelog has no section for the version. A tag with a
+pre-release suffix, such as `v1.0.0-rc.1`, can leave its entries under `Unreleased` instead. It publishes a GitHub
+pre-release, the npm `next` tag and only its exact image tag, so the pipeline can be rehearsed without moving
+`latest`. The exception is a package's first version, which npm always makes `latest`. If a release fails partway,
+re-run the workflow: npm skips the packages it already has, and the GitHub release's assets are replaced.
 
 The first release needs one-time setup:
 
