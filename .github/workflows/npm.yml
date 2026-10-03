@@ -1,0 +1,92 @@
+name: npm
+
+# Publishes the npm packages of a release tag, built from that release's own archives so they hold the released
+# binaries. The release workflow calls it, and it can be run by hand for a release whose own run stopped before npm.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish the npm packages of, such as v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    # Publishing waits for an owner to approve this environment.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag
+        run: |
+          if ! printf '%s' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'; then
+            echo "::error::$TAG is not a release tag"
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Rebuilds the part of GoReleaser's dist/ that scripts/npm-packages.mjs reads, from archives checked against
+      # the release's checksums.
+      - name: Fetch the released binaries
+        run: |
+          version="${TAG#v}"
+          base="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG"
+          mkdir dist
+          cd dist
+          curl -fsSLO "$base/checksums.txt"
+          entries=""
+          while read -r hash archive; do
+            target="${archive#"sluice_${version}_"}"
+            target="${target%%.*}"
+            case "$archive" in
+              *.tar.gz) binary=sluice ;;
+              *.zip) binary=sluice.exe ;;
+              *) continue ;;
+            esac
+            curl -fsSLO "$base/$archive"
+            echo "$hash  $archive" | sha256sum -c -
+            mkdir "$target"
+            case "$archive" in
+              *.zip) unzip -q "$archive" "$binary" -d "$target" ;;
+              *) tar -xzf "$archive" -C "$target" "$binary" ;;
+            esac
+            entry="\"goos\":\"${target%%_*}\",\"goarch\":\"${target#*_}\",\"path\":\"dist/$target/$binary\""
+            entries="$entries{\"type\":\"Binary\",$entry},"
+          done < checksums.txt
+          echo "[${entries%,}]" > artifacts.json
+          echo "{\"version\":\"$version\"}" > metadata.json
+      - run: node scripts/npm-packages.mjs
+      # Platform packages first, so the main package never points at a version that is not live yet.
+      # A pre-release goes to the "next" tag, and a re-run skips what an earlier run published.
+      - name: Publish to npm
+        run: |
+          version="$(node -p "require('./dist/npm/sluice/package.json').version")"
+          tag=latest
+          case "$version" in *-*) tag=next ;; esac
+          for package in dist/npm/sluice-*/ dist/npm/sluice/; do
+            name="$(node -p "require('./${package}package.json').name")"
+            if [ -n "$(npm view "$name@$version" version 2>/dev/null)" ]; then
+              echo "$name@$version is already published"
+              continue
+            fi
+            npm publish "$package" --provenance --access public --tag "$tag"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -19,7 +19,8 @@ it; so can anyone else. It is a standalone service with no Kafka, Redis, MongoDB
 - Settings: `settingGroups` in `config.go`, the variables the code reads, and `CONFIG.md` must agree.
   `TestConfigurationReferenceMatchesCodeAndDocs` enforces it.
 - npm: a launcher plus one exactly pinned optional dependency per platform, built from GoReleaser's `dist/` by
-  `scripts/npm-packages.mjs`, with no postinstall script.
+  `scripts/npm-packages.mjs`, with no postinstall script. A release rebuilds that `dist/` from its published archives,
+  so npm ships the released binaries.
 - `STATE_FILE` defaults to a file in the user cache directory, so anything that runs the binary for a test or a tool
   sets `STATE_FILE=` (empty) to keep it from writing there.
 - Responses Sluice generates keep Discord's shapes: JSON errors, and 429s with `X-RateLimit-*` headers. discord.js reads

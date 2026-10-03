@@ -75,31 +75,33 @@ A change must not break these. If one has to bend, say so in the pull request.
 
 ## Releasing
 
-The version lives only in the git tag: GoReleaser stamps it into the binaries, the image and the npm packages. To
-release, maintainers move the `Unreleased` entries in `CHANGELOG.md` under a `## X.Y.Z - YYYY-MM-DD` heading, then
-push a `vX.Y.Z` tag on `master`. The release workflow waits for approval in the `release` environment, then publishes,
-all with build provenance:
+The version lives only in the git tag, which is stamped into the binaries, the image and the npm packages. To release,
+maintainers move the `Unreleased` entries in `CHANGELOG.md` under a `## X.Y.Z - YYYY-MM-DD` heading, then push a
+`vX.Y.Z` tag on `master`. The release workflow waits for approval in the `release` environment, then publishes, all
+with build provenance:
 
 - the GitHub release, with that changelog section as its notes, and binaries, checksums and SBOMs
-- the multi-arch image `ghcr.io/vetox-inc/sluice`, tagged `X.Y.Z`, `X.Y` and `X`
-- the npm packages: `@vetox-bot/sluice` and one package per platform
+- the npm packages, `@vetox-bot/sluice` and one package per platform, built from that release's archives
+- the multi-arch image `ghcr.io/vetox-inc/sluice`, tagged `X.Y.Z`, `X.Y`, `X` and `latest`
 
 The workflow stops before publishing anything when the changelog has no section for the version or npm rejects the
 token. A tag with a pre-release suffix, such as `v1.0.0-rc.1`, can leave its entries under `Unreleased` instead. It
 publishes a GitHub pre-release, the npm `next` tag and only its exact image tag, so the pipeline can be rehearsed
 without moving `latest`. The exception is a package's first version, which npm always makes `latest`.
 
-If a release fails partway, re-run its failed jobs: npm skips the packages it already has, the GitHub release's assets
-are replaced, and an image that is already published is left alone. The image is pushed last, so a failure before it
-leaves it unpublished. When that failure cannot be fixed at once, run the Image workflow by hand for the tag.
+npm and the image are published by jobs of their own once the GitHub release exists, so one failing leaves the other
+alone. If a job fails, re-run the failed jobs: npm skips the packages it already has, an image that is already
+published is left alone, and the GitHub release's assets are replaced only if its own job runs again. The npm and
+Image workflows can also be run by hand for a tag, to finish a release whose run can no longer be re-run.
 
 The first release needs one-time setup:
 
-- A `release` environment with required reviewers.
-- An `NPM_TOKEN` secret in that environment, from an npm account allowed to publish under `@vetox-bot`.
-- After the first image push, make the `sluice` package on GHCR public.
-- After the first npm publish, configure npm trusted publishing for `release.yml` on each package, then delete
-  `NPM_TOKEN`.
+- A `release` environment with required reviewers, limited to `v*` tags and, for runs by hand, `master`.
+- An `NPM_TOKEN` secret in that environment: a granular token that can publish under `@vetox-bot` and bypasses 2FA,
+  since nobody is there to answer npm's prompt.
+- An organization that allows public container packages. After the first image push, make the `sluice` package on
+  GHCR public.
+- After the first npm publish, configure npm trusted publishing on each package, then delete `NPM_TOKEN`.
 
 ## Reporting bugs
 

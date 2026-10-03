@@ -48,26 +48,18 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
 
-      - run: node scripts/npm-packages.mjs
-      # Platform packages first, so the main package never points at a version that is not live yet.
-      # A pre-release goes to the "next" tag, and a re-run skips what an earlier run published.
-      - name: Publish to npm
-        run: |
-          version="$(node -p "require('./dist/npm/sluice/package.json').version")"
-          tag=latest
-          case "$version" in *-*) tag=next ;; esac
-          for package in dist/npm/sluice-*/ dist/npm/sluice/; do
-            name="$(node -p "require('./${package}package.json').name")"
-            if [ -n "$(npm view "$name@$version" version 2>/dev/null)" ]; then
-              echo "$name@$version is already published"
-              continue
-            fi
-            npm publish "$package" --provenance --access public --tag "$tag"
-          done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  # npm and the image are published from the release that now exists, each on its own: one failing leaves the other
+  # alone, and its job can be re-run by itself.
+  npm:
+    needs: release
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/npm.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
 
-  # The image goes last, once the rest is out.
   image:
     needs: release
     permissions:
