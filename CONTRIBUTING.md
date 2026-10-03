@@ -87,9 +87,11 @@ all with build provenance:
 The workflow stops before publishing anything when the changelog has no section for the version or npm rejects the
 token. A tag with a pre-release suffix, such as `v1.0.0-rc.1`, can leave its entries under `Unreleased` instead. It
 publishes a GitHub pre-release, the npm `next` tag and only its exact image tag, so the pipeline can be rehearsed
-without moving `latest`. The exception is a package's first version, which npm always makes `latest`. If a release
-fails partway, re-run the workflow: npm skips the packages it already has, the GitHub release's assets are replaced,
-and the image, which is pushed last, is built once.
+without moving `latest`. The exception is a package's first version, which npm always makes `latest`.
+
+If a release fails partway, re-run its failed jobs: npm skips the packages it already has, the GitHub release's assets
+are replaced, and an image that is already published is left alone. The image is pushed last, so a failure before it
+leaves it unpublished. When that failure cannot be fixed at once, run the Image workflow by hand for the tag.
 
 The first release needs one-time setup:
 
