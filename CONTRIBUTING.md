@@ -97,11 +97,12 @@ Image workflows can also be run by hand for a tag, to finish a release whose run
 The first release needs one-time setup:
 
 - A `release` environment with required reviewers, limited to `v*` tags and, for runs by hand, `master`.
-- An `NPM_TOKEN` secret in that environment: a granular token that can publish under `@vetox-bot` and bypasses 2FA,
-  since nobody is there to answer npm's prompt.
 - An organization that allows public container packages. After the first image push, make the `sluice` package on
   GHCR public.
-- After the first npm publish, configure npm trusted publishing on each package, then delete `NPM_TOKEN`.
+- npm packages that exist: trusted publishing cannot create one, and a token cannot answer npm's 2FA prompt. Put an
+  `NPM_TOKEN` in the environment, a granular token that can stage under `@vetox-bot`, and run the npm workflow by hand
+  for the tag with `staged` on. Then approve each staged package on npmjs.com, the platform packages first.
+- After that, configure npm trusted publishing on each package and delete `NPM_TOKEN`.
 
 ## Reporting bugs
 

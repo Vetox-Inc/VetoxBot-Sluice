@@ -8,12 +8,19 @@ on:
       tag:
         required: true
         type: string
+      staged:
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       tag:
         description: Release tag to publish the npm packages of, such as v1.0.0
         required: true
         type: string
+      staged:
+        description: Stage the packages for approval on npmjs.com, which a package's first version needs
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -74,19 +81,28 @@ jobs:
           echo "{\"version\":\"$version\"}" > metadata.json
       - run: node scripts/npm-packages.mjs
       # Platform packages first, so the main package never points at a version that is not live yet.
-      # A pre-release goes to the "next" tag, and a re-run skips what an earlier run published.
+      # A pre-release goes to the "next" tag, and a re-run skips what an earlier run published or staged.
+      # Trusted publishing cannot create a package, and a token cannot answer npm's 2FA prompt: staging uploads
+      # with the token and leaves the publishing to a maintainer's approval.
       - name: Publish to npm
         run: |
           version="$(node -p "require('./dist/npm/sluice/package.json').version")"
           tag=latest
           case "$version" in *-*) tag=next ;; esac
+          publish=(npm publish)
+          if [ "$STAGED" = true ]; then publish=(npm stage publish); fi
           for package in dist/npm/sluice-*/ dist/npm/sluice/; do
             name="$(node -p "require('./${package}package.json').name")"
             if [ -n "$(npm view "$name@$version" version 2>/dev/null)" ]; then
               echo "$name@$version is already published"
               continue
             fi
-            npm publish "$package" --provenance --access public --tag "$tag"
+            if [ "$STAGED" = true ] && npm stage list "$name" 2>/dev/null | grep -Fq "$version"; then
+              echo "$name@$version is already staged"
+              continue
+            fi
+            "${publish[@]}" "$package" --provenance --access public --tag "$tag"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          STAGED: ${{ inputs.staged }}
