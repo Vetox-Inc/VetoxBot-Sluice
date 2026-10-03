@@ -6,7 +6,7 @@ and [Semantic Versioning](https://semver.org/). Earlier history is in nirn-proxy
 
 ## Unreleased
 
-## 1.0.0 - 2026-10-01
+## 1.0.0 - 2026-10-03
 
 The first release as Sluice, continuing nirn-proxy 1.3.3 on Melonly-Moderation's engine rewrite.
 [MIGRATING.md](MIGRATING.md) covers upgrading.
