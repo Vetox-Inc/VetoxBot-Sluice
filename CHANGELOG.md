@@ -5,6 +5,10 @@ and [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.0.1 - 2026-10-04
+
+Documentation and wording only: requests are handled exactly as in 1.0.0.
+
 ### Added
 
 - A benchmark of traffic through Sluice against the same traffic sent directly, reported in
@@ -12,6 +16,7 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The documentation is rewritten, and the npm package's description and README with it.
 - `sluice --help` lists the settings in the groups [CONFIG.md](CONFIG.md) now uses.
 - The startup warning for `BUFFER_SIZE` names `MAX_QUEUE_DEPTH` as what bounds a queue.
 - A node that is not part of a cluster logs "Running as a single node" at startup, in place of "Running in
