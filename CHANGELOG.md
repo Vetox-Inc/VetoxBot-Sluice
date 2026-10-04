@@ -5,6 +5,11 @@ and [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.1.0 - 2026-10-04
+
+A request Discord answers is handled as in 1.0.1. This release is about the ones Sluice refuses: each is counted by
+reason, the faults among them are logged, and the limits behind them can be watched before they are reached.
+
 ### Added
 
 - `sluice --check`, which reads the settings as a start would and exits without opening a port or joining a
