@@ -165,7 +165,7 @@ func run() error {
 		default:
 		}
 	} else {
-		logger.Info("Running in stand-alone mode")
+		logger.Info("Running as a single node")
 	}
 	last := len(servers)
 	if clustered {
@@ -276,7 +276,7 @@ func configureLogger() error {
 	return nil
 }
 
-// parseLogLevel accepts nirn-proxy's logrus level names; slog has no trace, fatal or panic.
+// parseLogLevel also takes trace, fatal and panic, which older configurations use and slog lacks.
 func parseLogLevel(value string) (slog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "trace", "debug":

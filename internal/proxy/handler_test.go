@@ -271,7 +271,7 @@ func TestDrainFailsHealthButFinishesAdmittedRequests(t *testing.T) {
 	}
 }
 
-func TestNirnHealthAliasWarnsOnce(t *testing.T) {
+func TestLegacyHealthAliasWarnsOnce(t *testing.T) {
 	var output bytes.Buffer
 	previous := logger
 	SetLogger(NewLogger(&output, slog.LevelInfo, "text"))

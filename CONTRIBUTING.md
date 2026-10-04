@@ -46,6 +46,13 @@ node scripts/pack-test.mjs             # installs the npm packages from dist/ an
 docker build .
 ```
 
+A change that could move latency or throughput should come with a run of the benchmark, which needs only Docker.
+[BENCHMARKS.md](BENCHMARKS.md) explains what it measures and how to read it:
+
+```sh
+bench/run.sh
+```
+
 A behavior change needs a test that fails without it, and a user-visible change needs a `CHANGELOG.md` entry under
 `Unreleased`. A new or changed setting goes in `settingGroups` in `config.go` and in `CONFIG.md`; a test fails when
 they disagree.
@@ -71,7 +78,8 @@ A change must not break these. If one has to bend, say so in the pull request.
   which clients retry safely; one that may have reached it never does.
 - **Credentials never reach logs or metric labels.** Every log goes through the redacting logger, and `clientId` holds
   only validated bot user IDs.
-- **nirn-proxy's settings keep their meaning**, so existing deployments keep working.
+- **A setting keeps its name and meaning** from one release to the next, so existing deployments keep working. One
+  that no longer has an effect is still accepted, with a warning, until the next major release.
 
 ## Releasing
 

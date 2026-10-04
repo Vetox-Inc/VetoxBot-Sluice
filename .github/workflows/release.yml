@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      # Release notes come from CHANGELOG.md: GoReleaser's own list would start at nirn-proxy's first commit.
+      # Release notes come from CHANGELOG.md: GoReleaser's own list would name every commit in the history.
       # A release with no section for its version stops here, before anything is published.
       - run: node scripts/release-notes.mjs "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
       # So does one whose npm token is missing its value, expired or mistyped. Trusted publishing has no token to check.

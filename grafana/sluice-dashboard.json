@@ -85,7 +85,7 @@
         }
       ],
       "timeFrom": "1h",
-      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Sluice retries.",
+      "description": "429s Discord sent, shared-scope ones apart. Those Sluice retried, which the client never saw, are included.",
       "title": "Non-shared Discord 429s (1h)",
       "type": "stat"
     },
@@ -338,7 +338,7 @@
           "refId": "A"
         }
       ],
-      "description": "Non-shared Discord 429 attempts observed upstream, including 429s transparently absorbed by Sluice retries.",
+      "description": "429s Discord sent, shared-scope ones apart. Those Sluice retried, which the client never saw, are included.",
       "title": "Non-shared Discord 429s",
       "type": "timeseries"
     },
@@ -429,7 +429,7 @@
           "refId": "A"
         }
       ],
-      "description": "Discord upstream 5xx attempts only; proxy-generated local failures are not part of the request histogram.",
+      "description": "5xx responses that came from Discord. Errors Sluice answered itself are not in this histogram; the failures panel shows them.",
       "title": "Discord 5xx",
       "type": "timeseries"
     },
@@ -1813,31 +1813,24 @@
       },
       {
         "current": {
-          "selected": true,
+          "selected": false,
           "text": "sluice",
           "value": "sluice"
         },
+        "description": "The value of METRICS_NAMESPACE on the instances shown.",
         "hide": 0,
-        "includeAll": false,
         "label": "Metric prefix",
-        "multi": false,
         "name": "namespace",
         "options": [
           {
             "selected": true,
             "text": "sluice",
             "value": "sluice"
-          },
-          {
-            "selected": false,
-            "text": "nirn_proxy",
-            "value": "nirn_proxy"
           }
         ],
-        "query": "sluice,nirn_proxy",
-        "queryValue": "",
+        "query": "sluice",
         "skipUrlSync": false,
-        "type": "custom"
+        "type": "textbox"
       },
       {
         "current": {

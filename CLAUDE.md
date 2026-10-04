@@ -6,10 +6,14 @@ it; so can anyone else. It is a standalone service with no Kafka, Redis, MongoDB
 
 - **Invariants that must never regress:** [CONTRIBUTING.md → Design invariants](CONTRIBUTING.md#design-invariants).
 - **Releasing:** [CONTRIBUTING.md → Releasing](CONTRIBUTING.md#releasing). The version lives only in the git tag.
-- **Lineage stays intact.** Sluice is a GPL-3.0 fork of nirn-proxy through Melonly-Moderation's rewrite. The owner
-  requires every credit kept: the upstream commits, README.md → Lineage and credits, and nirn-proxy's acknowledgements
-  verbatim. README.md → License is also the GPL §5(a) modification notice. Code from another project must be
-  GPL-3.0-compatible and keep its notice.
+- **Lineage stays intact.** Sluice is a GPL-3.0 fork of nirn-proxy through Melonly-Moderation's rewrite. The upstream
+  commits stay in the history, and README.md → Origins and license keeps the credits, nirn-proxy's acknowledgements
+  verbatim and the GPL §5(a) modification notice. Code from another project must be GPL-3.0-compatible and keep its
+  notice.
+- **The docs speak for Sluice.** The owner wants nirn-proxy named only where it is a fact a reader needs: README.md's
+  final section, MIGRATING.md, and the closing line of the changelog's 1.0.0 entry and of the npm README. Nowhere else,
+  and never as the frame for describing Sluice. The identifiers kept for compatibility (`/nirn/healthz`, the
+  `nirn_proxy` metrics prefix) are documented in MIGRATING.md only.
 - **Public repository:** no Vetox production figures, hostnames, tokens or Doppler names anywhere: code, docs, tests
   or commits.
 
@@ -34,3 +38,8 @@ fuzzer writes to `testdata/fuzz/` as a regression seed. Packaging changes also p
 `goreleaser release --snapshot --clean` and `node scripts/pack-test.mjs`. Without a local Go toolchain, run
 them in `golang:1.27` (not `-alpine`, which cannot run `-race`) and `golangci/golangci-lint:v2.14.0`, with
 `MSYS_NO_PATHCONV=1` under Git Bash.
+
+`bench/` is a stand-alone command that the proxy never imports. `bench/run.sh` reproduces BENCHMARKS.md against a
+released image, or against `SLUICE_IMAGE`; a full run takes about 90 minutes and wants a machine doing nothing else,
+so never run the gates above beside it. Its results are checked against the mock's own counts, and a mismatch fails
+the run.

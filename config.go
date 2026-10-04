@@ -26,16 +26,19 @@ var settingGroups = []struct {
 	title string
 	names []string
 }{
-	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "CLIENT_AUTH_SECRET", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2", "DISCORD_API_URL"}},
-	{"Scheduling and retries", []string{"QUEUE_TIMEOUT", "BOT_WIDE_ROUTES", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES", "MAX_BEARER_COUNT", "MAX_CLIENT_STATES", "MAX_BUCKET_STATES"}},
-	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION", "STATE_FILE"}},
-	{"Observability", []string{"ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
-	{"Clustering", []string{"CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_ADVERTISE_ADDR", "CLUSTER_MAX_NODES", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_MEMBERS", "CLUSTER_DNS", "NODE_NAME"}},
+	{"Listening", []string{"BIND_IP", "PORT", "CLIENT_AUTH_SECRET"}},
+	{"Reaching Discord", []string{"DISCORD_API_URL", "OUTBOUND_IP", "DISABLE_HTTP_2", "REQUEST_TIMEOUT"}},
+	{"Queues and limits", []string{"QUEUE_TIMEOUT", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "BOT_RATELIMIT_OVERRIDES", "BOT_WIDE_ROUTES"}},
+	{"Retries", []string{"MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES"}},
+	{"Protecting your IP", []string{"DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION", "STATE_FILE"}},
+	{"Memory bounds", []string{"MAX_CLIENT_STATES", "MAX_BEARER_COUNT", "MAX_BUCKET_STATES"}},
+	{"Logs, metrics and profiling", []string{"LOG_LEVEL", "LOG_FORMAT", "ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
+	{"Cluster", []string{"CLUSTER_MEMBERS", "CLUSTER_DNS", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_ADVERTISE_ADDR", "CLUSTER_MAX_NODES", "NODE_NAME"}},
 }
 
-// obsoleteSettings are nirn-proxy variables that are accepted but no longer have an effect.
+// obsoleteSettings are accepted from older configurations but no longer have an effect.
 var obsoleteSettings = []struct{ name, advice string }{
-	{"BUFFER_SIZE", "use MAX_QUEUE_DEPTH; the channel-buffer scheduler no longer exists"},
+	{"BUFFER_SIZE", "it sized a queue that no longer exists; MAX_QUEUE_DEPTH bounds each queue"},
 	{"DISABLE_GLOBAL_RATELIMIT_DETECTION", "Sluice never guesses the global limit; set BOT_RATELIMIT_OVERRIDES for raised limits"},
 }
 

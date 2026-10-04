@@ -18,8 +18,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// DefaultMetricsNamespace prefixes every metric unless METRICS_NAMESPACE overrides it;
-// "nirn_proxy" reproduces nirn-proxy's metric names exactly.
+// DefaultMetricsNamespace prefixes every metric unless METRICS_NAMESPACE overrides it. Metric
+// names after the prefix must not change: MIGRATING.md promises a prefix that keeps old dashboards.
 const DefaultMetricsNamespace = "sluice"
 
 const (

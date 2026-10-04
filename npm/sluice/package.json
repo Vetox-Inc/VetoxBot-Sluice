@@ -1,15 +1,14 @@
 {
   "name": "@vetox-bot/sluice",
   "version": "0.0.0-dev",
-  "description": "Discord REST rate-limit proxy, the maintained successor to nirn-proxy, shipped as a native binary",
+  "description": "Rate-limit proxy for Discord's REST API, shipped as a native binary",
   "keywords": [
     "discord",
     "discord-api",
     "rate-limit",
     "ratelimit",
     "proxy",
-    "rest",
-    "nirn-proxy"
+    "rest"
   ],
   "license": "GPL-3.0-only",
   "author": "Vetox Inc.",

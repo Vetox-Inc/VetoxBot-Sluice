@@ -22,7 +22,7 @@ func TestMalformedDotEnvDoesNotEchoItsContents(t *testing.T) {
 	}
 }
 
-func TestParseLogLevelAcceptsNirnLevelNames(t *testing.T) {
+func TestParseLogLevelAcceptsLegacyNames(t *testing.T) {
 	for value, want := range map[string]slog.Level{
 		"trace": slog.LevelDebug, "debug": slog.LevelDebug, "INFO": slog.LevelInfo,
 		"warn": slog.LevelWarn, "warning": slog.LevelWarn,
