@@ -7,3 +7,6 @@
 /sluice.exe
 /dist/
 /bench/.out/
+node_modules/
+/compat/discordjs/sluice
+/compat/discordjs/sluice.exe

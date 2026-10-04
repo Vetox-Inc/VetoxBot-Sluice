@@ -12,3 +12,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # discord.js, which CI runs against Sluice.
+  - package-ecosystem: npm
+    directory: /compat/discordjs
+    schedule:
+      interval: weekly

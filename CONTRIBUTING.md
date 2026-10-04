@@ -38,6 +38,21 @@ needs cgo:
 docker run --rm -v "$PWD:/src" -w /src golang:1.27 go test -race ./...
 ```
 
+A change to what Sluice answers its clients must also pass discord.js, which CI runs against the built binary and a
+mock Discord:
+
+```sh
+go build -o compat/discordjs/sluice .
+cd compat/discordjs && npm ci && node harness.mjs
+```
+
+A change to a metric or to `prometheus/alerts.yml` must keep the tests of the alert rules passing. `promtool` comes
+with Prometheus:
+
+```sh
+promtool test rules prometheus/alerts.test.yml
+```
+
 A change to packaging, the Dockerfile or the npm launcher must also pass:
 
 ```sh
@@ -55,7 +70,8 @@ bench/run.sh
 
 A behavior change needs a test that fails without it, and a user-visible change needs a `CHANGELOG.md` entry under
 `Unreleased`. A new or changed setting goes in `settingGroups` in `config.go` and in `CONFIG.md`; a test fails when
-they disagree.
+they disagree. The same holds for a reason of `sluice_failures_total`: `failureReasons` in
+`internal/proxy/failures.go`, the calls that count it and the tables in `CONFIG.md` must agree.
 
 ## Design invariants
 
@@ -85,8 +101,8 @@ A change must not break these. If one has to bend, say so in the pull request.
 
 The version lives only in the git tag, which is stamped into the binaries, the image and the npm packages. To release,
 maintainers move the `Unreleased` entries in `CHANGELOG.md` under a `## X.Y.Z - YYYY-MM-DD` heading, then push a
-`vX.Y.Z` tag on `master`. The release workflow waits for approval in the `release` environment, then publishes, all
-with build provenance:
+`vX.Y.Z` tag on `master`. The release workflow runs the whole of CI on the tagged commit and waits for approval in
+the `release` environment, then publishes, all with build provenance:
 
 - the GitHub release, with that changelog section as its notes, and binaries, checksums and SBOMs
 - the multi-arch image `ghcr.io/vetox-inc/sluice`, tagged `X.Y.Z`, `X.Y`, `X` and `latest`
@@ -94,17 +110,23 @@ with build provenance:
   staged: each goes live once a maintainer approves it on npmjs.com under Staged Packages, the platform packages
   first and `@vetox-bot/sluice` last, so it never points at a platform package that is not live yet
 
-The workflow stops before publishing anything when the changelog has no section for the version or npm rejects the
-token. A tag with a pre-release suffix, such as `v1.0.0-rc.1`, can leave its entries under `Unreleased` instead. It
-publishes a GitHub pre-release, the npm `next` tag and only its exact image tag, so the pipeline can be rehearsed
-without moving `latest`. The exception is a package's first version, which npm always makes `latest`.
+The workflow stops before publishing anything when a CI job fails, the tag is not on `master`, the changelog has no
+section for the version or npm rejects the token. A tag with a pre-release suffix, such as `v1.0.0-rc.1`, can leave
+its entries under `Unreleased` instead. It publishes a GitHub pre-release, the npm `next` tag and only its exact image
+tag, so the pipeline can be rehearsed without moving `latest`. The exception is a package's first version, which npm
+always makes `latest`.
 
 npm and the image are published by jobs of their own once the GitHub release exists, so one failing leaves the other
 alone. If a job fails, re-run the failed jobs: an image that is already published is left alone, npm skips the
 packages that are already published, and the GitHub release's assets are replaced only if its own job runs again. A
 package that is staged but not approved yet is skipped only when the job can list staged packages, which trusted
 publishing cannot. Otherwise npm refuses that version as already staged: approve it, then re-run. The npm and Image
-workflows can also be run by hand for a tag, to finish a release whose run can no longer be re-run.
+workflows can also be run by hand for a tag on `master`, to finish a release whose run can no longer be re-run.
+
+The approval is asked for where a secret or a registry is at stake: before the checks that read the npm token, and
+before npm and the image are published. The job that builds the GitHub release runs after the first of those and
+holds no secret of the environment, so re-running that job alone publishes the commit the run was approved for
+without asking again.
 
 The setup behind this, done once:
 

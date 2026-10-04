@@ -4,6 +4,11 @@ on:
   push:
     branches: [master]
   pull_request:
+  # The release workflow runs these checks before it publishes anything.
+  workflow_call:
+  # Weekly, so that a vulnerability published since the last push still shows up.
+  schedule:
+    - cron: "23 5 * * 1"
 
 permissions:
   contents: read
@@ -57,6 +62,35 @@ jobs:
         with:
           go-version-input: "1.27.x"
 
+  # discord.js, the client most bots use, against the built binary and a mock Discord.
+  discordjs:
+    name: discord.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+      - run: go build -o compat/discordjs/sluice .
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: compat/discordjs
+      - run: node harness.mjs
+        working-directory: compat/discordjs
+
+  alerts:
+    name: Alert rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # promtool comes in the Prometheus image, pinned so that the same tool checks every run.
+      - run: >
+          docker run --rm -v "$PWD/prometheus:/rules:ro" -w /rules --entrypoint promtool
+          quay.io/prometheus/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+          test rules alerts.test.yml
+
   package:
     name: Build and pack
     runs-on: ubuntu-latest
@@ -76,9 +110,24 @@ jobs:
         with:
           node-version: 24
       - run: node scripts/pack-test.mjs
+      # The notes a release would publish for the newest version in the changelog.
+      - name: Release notes
+        run: node scripts/release-notes.mjs "v$(sed -n 's/^## \([0-9][^ ]*\) .*/\1/p' CHANGELOG.md | head -n 1)" > /dev/null
       - uses: docker/setup-buildx-action@v4
+      # Every platform a release publishes, built as the release builds them: without emulation,
+      # which works because no step of the Dockerfile runs on the target platform.
       - uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: false
           build-args: VERSION=ci
+      # And the image for this runner, started.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: sluice:ci
+          build-args: VERSION=ci
+      - name: Run the image
+        run: test "$(docker run --rm sluice:ci --version)" = "sluice ci"

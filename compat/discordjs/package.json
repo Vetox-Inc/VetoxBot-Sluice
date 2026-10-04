@@ -1,0 +1,13 @@
+{
+  "name": "sluice-discordjs-compat",
+  "private": true,
+  "description": "Runs discord.js against Sluice and a mock Discord",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "test": "node harness.mjs"
+  },
+  "dependencies": {
+    "discord.js": "14.27.0"
+  }
+}

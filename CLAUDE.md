@@ -35,9 +35,17 @@ it; so can anyone else. It is a standalone service with no Kafka, Redis, MongoDB
 `gofmt -l .` prints nothing; `go vet ./...`, `go test -race ./...` and `golangci-lint run` pass. Path-handling changes
 also get the fuzz targets in `internal/proxy/routes_fuzz_test.go`, which CI runs for 30 s each; keep a failing input the
 fuzzer writes to `testdata/fuzz/` as a regression seed. Packaging changes also pass
-`goreleaser release --snapshot --clean` and `node scripts/pack-test.mjs`. Without a local Go toolchain, run
+`goreleaser release --snapshot --clean` and `node scripts/pack-test.mjs`. A change to what Sluice answers its clients
+also passes `compat/discordjs/harness.mjs` (real discord.js against the built binary), and a change to a metric or to
+`prometheus/alerts.yml` passes `promtool test rules prometheus/alerts.test.yml`. Without a local Go toolchain, run
 them in `golang:1.27` (not `-alpine`, which cannot run `-race`) and `golangci/golangci-lint:v2.14.0`, with
 `MSYS_NO_PATHCONV=1` under Git Bash.
+
+A reason of `sluice_failures_total` lives in three places that a test keeps equal: `failureReasons`, the `fail` calls
+and the tables in CONFIG.md. Every error Sluice answers a request with on its own goes through `Proxy.fail`; the
+exceptions are a health check's answer and the repeated answer for a webhook that is gone, which
+`sluice_webhook_short_circuits_total` counts. `prometheus/alerts.yml` is tied to the same list: a test fails when a
+rule names a reason or a metric the code does not export.
 
 `bench/` is a stand-alone command that the proxy never imports. `bench/run.sh` reproduces BENCHMARKS.md against a
 released image, or against `SLUICE_IMAGE`; a full run takes about 90 minutes and wants a machine doing nothing else,

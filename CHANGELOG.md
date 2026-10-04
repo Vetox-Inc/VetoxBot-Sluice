@@ -38,6 +38,11 @@ and [Semantic Versioning](https://semver.org/).
 - `sluice_queue_wait_seconds` includes the wait of a request that Sluice answered itself after it had queued.
 - With `DISABLE_401_LOCK=true`, a token Discord answered `401` is sent one request at a time until Discord accepts
   one, as a token Sluice has not seen before is. Its requests used to go out side by side.
+- The image is published from the `release` environment, as the npm packages are, and a run by hand of either
+  workflow refuses a tag that is not on `master`.
+- A release is published only after the whole of CI has passed on its commit, and only from a tag on `master`.
+- CI runs discord.js against the built binary, the alert-rule tests and a build of the image for its three
+  platforms, and it also runs once a week.
 
 ### Fixed
 
