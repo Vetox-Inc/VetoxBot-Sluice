@@ -1,0 +1,433 @@
+{
+  "scenario": "rate-0040-default",
+  "kind": "rate",
+  "via": "sluice",
+  "rep": 2,
+  "sut": "ghcr.io/vetox-inc/sluice:1.0.0 (sha256:979073b66fc916cfc09bd9237af5392183a72dbfd4b83a01065dd566f2a3d735)",
+  "startedAt": "2026-10-04T08:04:28Z",
+  "parameters": {
+    "bodyBytes": "256",
+    "channels": "1000",
+    "duration": "1m0s",
+    "rate": "40",
+    "warmup": "10s",
+    "workers": "64"
+  },
+  "measuredSeconds": 59.976421078,
+  "requests": 2400,
+  "failed": 0,
+  "throughput": 40.01572546115703,
+  "latencyMicros": {
+    "count": 2400,
+    "min": 559.86,
+    "mean": 1439.443,
+    "p50": 1319.18,
+    "p90": 1824.315,
+    "p99": 5770.3,
+    "p999": 11497.001,
+    "max": 13425.55
+  },
+  "generatorLagP99Micros": 1092.199,
+  "attempts": 2800,
+  "succeeded": 2800,
+  "responses": {
+    "200": 2800
+  },
+  "transportErrors": 0,
+  "limitedBySluice": 0,
+  "mock": {
+    "received": 2800,
+    "succeeded": 2800,
+    "limitedGlobal": 0,
+    "limitedRoute": 0,
+    "bodyBytes": 716800,
+    "responseBytes": 741
+  },
+  "mockMeasured": {
+    "received": 2399,
+    "succeeded": 2399,
+    "limitedGlobal": 0,
+    "limitedRoute": 0,
+    "bodyBytes": 614144,
+    "responseBytes": 741
+  },
+  "sluice": {
+    "idleRssBytes": 12320768,
+    "cpuCoresMean": 0.02034424618398654,
+    "rssPeakBytes": 18219008,
+    "rssEndBytes": 17895424,
+    "goroutinesPeak": 15,
+    "goroutinesEnd": 14,
+    "failures": {},
+    "series": [
+      {
+        "seconds": 0.79786965,
+        "cpuCores": 0.037600126787627565,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 1.797548253,
+        "cpuCores": 0.010003215003292421,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 2.797245689,
+        "cpuCores": 0.030009079667180392,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 3.7970987430000003,
+        "cpuCores": 0.020002939351926024,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 4.797125991,
+        "cpuCores": 0.019999455054848625,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 5.797621428,
+        "cpuCores": 0.019990096166725462,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 6.797025873,
+        "cpuCores": 0.03001787729691359,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 7.797715119,
+        "cpuCores": 0.029979336861985194,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 8.796955788,
+        "cpuCores": 0.02001519816043438,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 9.797138335,
+        "cpuCores": 0.01999634972634652,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 10.797364122,
+        "cpuCores": 0.019995485279365247,
+        "rssBytes": 17432576,
+        "goroutines": 15
+      },
+      {
+        "seconds": 11.797182593,
+        "cpuCores": 0.02000363123917512,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 12.796682158,
+        "cpuCores": 0.020010013711211586,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 13.79749129,
+        "cpuCores": 0.029975745664958645,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 14.797066557,
+        "cpuCores": 0.020008498269495516,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 15.798017935,
+        "cpuCores": 0.01998099052519614,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 16.79800696,
+        "cpuCores": 0.030000329253613473,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 17.797365516,
+        "cpuCores": 0.020012837114289955,
+        "rssBytes": 17432576,
+        "goroutines": 14
+      },
+      {
+        "seconds": 18.797265363,
+        "cpuCores": 0.02000200326063258,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 19.796885773,
+        "cpuCores": 0.020007594682865688,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 20.797316838,
+        "cpuCores": 0.01999138241473941,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 21.796769852,
+        "cpuCores": 0.030016418560722884,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 22.797007359,
+        "cpuCores": 0.009997625493961814,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 23.79736801,
+        "cpuCores": 0.02998918437066745,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 24.797220322,
+        "cpuCores": 0.020002954196299362,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 25.796994371,
+        "cpuCores": 0.010002260020653936,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 26.796401601,
+        "cpuCores": 0.020011862431693655,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 27.796815709,
+        "cpuCores": 0.029987581902433575,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 28.797591603,
+        "cpuCores": 0.00999224707544765,
+        "rssBytes": 17563648,
+        "goroutines": 14
+      },
+      {
+        "seconds": 29.797433248,
+        "cpuCores": 0.030004751402408245,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 30.797733262,
+        "cpuCores": 0.01999400151962811,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 31.797036312,
+        "cpuCores": 0.030020923082342266,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 32.797121661,
+        "cpuCores": 0.009999146582838311,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 33.796615712,
+        "cpuCores": 0.020010124102279443,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 34.796674193,
+        "cpuCores": 0.019998830448396565,
+        "rssBytes": 17694720,
+        "goroutines": 15
+      },
+      {
+        "seconds": 35.797106757,
+        "cpuCores": 0.019991352460614245,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 36.797236192,
+        "cpuCores": 0.019997411635025036,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 37.797581585,
+        "cpuCores": 0.01999309452510271,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 38.797907337,
+        "cpuCores": 0.01999348708159599,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 39.797354864,
+        "cpuCores": 0.020011055567902784,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 40.79687369,
+        "cpuCores": 0.020009628112797564,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 41.796635919,
+        "cpuCores": 0.020004756550969897,
+        "rssBytes": 17694720,
+        "goroutines": 14
+      },
+      {
+        "seconds": 42.797317298,
+        "cpuCores": 0.019986381699224183,
+        "rssBytes": 17956864,
+        "goroutines": 14
+      },
+      {
+        "seconds": 43.79711299,
+        "cpuCores": 0.020004086995005794,
+        "rssBytes": 18219008,
+        "goroutines": 14
+      },
+      {
+        "seconds": 44.797232289,
+        "cpuCores": 0.01999761430461109,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 45.797282185,
+        "cpuCores": 0.009999501064894875,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 46.796940383,
+        "cpuCores": 0.02000683837737108,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 47.797006209,
+        "cpuCores": 0.00999934178332778,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 48.798528689,
+        "cpuCores": 0.019969596688433813,
+        "rssBytes": 17895424,
+        "goroutines": 15
+      },
+      {
+        "seconds": 49.796262298,
+        "cpuCores": 0.020045430783919817,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 50.796600842,
+        "cpuCores": 0.019993231411465053,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 51.797317408,
+        "cpuCores": 0.00999283947099164,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 52.79663914,
+        "cpuCores": 0.02001357456719434,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 53.796380465,
+        "cpuCores": 0.020005174838601394,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 54.797282246,
+        "cpuCores": 0.01998198062952594,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 55.796980707,
+        "cpuCores": 0.020006032599063906,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 56.797132881,
+        "cpuCores": 0.019996956983068078,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 57.796755188,
+        "cpuCores": 0.020007556714118042,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 58.79718044,
+        "cpuCores": 0.019991498575247894,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      },
+      {
+        "seconds": 59.797455071,
+        "cpuCores": 0.009997254444014796,
+        "rssBytes": 17895424,
+        "goroutines": 14
+      }
+    ]
+  },
+  "host": {
+    "cpuModel": "AMD Ryzen 5 5600GT with Radeon Graphics",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "cpus": 1,
+    "loadBefore": "0.65 0.59 0.56",
+    "loadAfter": "0.94 0.70 0.59"
+  },
+  "reconcile": "ok"
+}

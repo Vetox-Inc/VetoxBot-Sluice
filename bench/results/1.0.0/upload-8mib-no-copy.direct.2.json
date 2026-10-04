@@ -1,0 +1,59 @@
+{
+  "scenario": "upload-8mib-no-copy",
+  "kind": "closed",
+  "via": "direct",
+  "rep": 2,
+  "sut": "ghcr.io/vetox-inc/sluice:1.0.0 (sha256:979073b66fc916cfc09bd9237af5392183a72dbfd4b83a01065dd566f2a3d735)",
+  "startedAt": "2026-10-04T08:33:31Z",
+  "parameters": {
+    "bodyBytes": "8388608",
+    "duration": "20s",
+    "warmup": "3s",
+    "workers": "4"
+  },
+  "measuredSeconds": 20.000376753,
+  "requests": 6410,
+  "failed": 0,
+  "throughput": 320.49396264690455,
+  "latencyMicros": {
+    "count": 6410,
+    "min": 2901.548,
+    "mean": 12477.228,
+    "p50": 12219.929,
+    "p90": 18915.164,
+    "p99": 21940.481,
+    "p999": 27679.329,
+    "max": 35076.358
+  },
+  "attempts": 7359,
+  "succeeded": 7359,
+  "responses": {
+    "200": 7359
+  },
+  "transportErrors": 0,
+  "limitedBySluice": 0,
+  "mock": {
+    "received": 7359,
+    "succeeded": 7359,
+    "limitedGlobal": 0,
+    "limitedRoute": 0,
+    "bodyBytes": 61731766272,
+    "responseBytes": 741
+  },
+  "mockMeasured": {
+    "received": 6409,
+    "succeeded": 6409,
+    "limitedGlobal": 0,
+    "limitedRoute": 0,
+    "bodyBytes": 53762588672,
+    "responseBytes": 741
+  },
+  "host": {
+    "cpuModel": "AMD Ryzen 5 5600GT with Radeon Graphics",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "cpus": 1,
+    "loadBefore": "2.78 2.67 1.92",
+    "loadAfter": "2.94 2.71 1.95"
+  },
+  "reconcile": "ok"
+}
