@@ -58,6 +58,8 @@ jobs:
     uses: ./.github/workflows/npm.yml
     with:
       tag: ${{ github.ref_name }}
+      # Staged: nothing goes live on npm until a maintainer approves it there with 2FA.
+      staged: true
     secrets: inherit
 
   image:

@@ -81,8 +81,10 @@ maintainers move the `Unreleased` entries in `CHANGELOG.md` under a `## X.Y.Z - 
 with build provenance:
 
 - the GitHub release, with that changelog section as its notes, and binaries, checksums and SBOMs
-- the npm packages, `@vetox-bot/sluice` and one package per platform, built from that release's archives
 - the multi-arch image `ghcr.io/vetox-inc/sluice`, tagged `X.Y.Z`, `X.Y`, `X` and `latest`
+- the npm packages, `@vetox-bot/sluice` and one package per platform, built from that release's archives. They are
+  staged: each goes live once a maintainer approves it on npmjs.com under Staged Packages, the platform packages
+  first and `@vetox-bot/sluice` last, so it never points at a platform package that is not live yet
 
 The workflow stops before publishing anything when the changelog has no section for the version or npm rejects the
 token. A tag with a pre-release suffix, such as `v1.0.0-rc.1`, can leave its entries under `Unreleased` instead. It
@@ -90,19 +92,22 @@ publishes a GitHub pre-release, the npm `next` tag and only its exact image tag,
 without moving `latest`. The exception is a package's first version, which npm always makes `latest`.
 
 npm and the image are published by jobs of their own once the GitHub release exists, so one failing leaves the other
-alone. If a job fails, re-run the failed jobs: npm skips the packages it already has, an image that is already
-published is left alone, and the GitHub release's assets are replaced only if its own job runs again. The npm and
-Image workflows can also be run by hand for a tag, to finish a release whose run can no longer be re-run.
+alone. If a job fails, re-run the failed jobs: an image that is already published is left alone, npm skips the
+packages that are already published, and the GitHub release's assets are replaced only if its own job runs again. A
+package that is staged but not approved yet is skipped only when the job can list staged packages, which trusted
+publishing cannot. Otherwise npm refuses that version as already staged: approve it, then re-run. The npm and Image
+workflows can also be run by hand for a tag, to finish a release whose run can no longer be re-run.
 
-The first release needs one-time setup:
+The setup behind this, done once:
 
 - A `release` environment with required reviewers, limited to `v*` tags and, for runs by hand, `master`.
-- An organization that allows public container packages. After the first image push, make the `sluice` package on
-  GHCR public.
-- npm packages that exist: trusted publishing cannot create one, and a token cannot answer npm's 2FA prompt. Put an
-  `NPM_TOKEN` in the environment, a granular token that can stage under `@vetox-bot`, and run the npm workflow by hand
-  for the tag with `staged` on. Then approve each staged package on npmjs.com, the platform packages first.
-- After that, configure npm trusted publishing on each package and delete `NPM_TOKEN`.
+- An organization that allows public container packages, and the `sluice` package on GHCR made public after its first
+  push.
+- npm trusted publishing on each package: `release.yml` and `npm.yml` as trusted publishers, both with the `release`
+  environment. Staging is the only action they need, and there is no secret to renew.
+- For a package that does not exist yet, an `NPM_TOKEN` secret in that environment: a granular token that can stage
+  under `@vetox-bot`, with no 2FA bypass. A trusted publisher can be added only to a package that exists, so the token
+  stages its first version. Delete the secret once every package has its trusted publishers.
 
 ## Reporting bugs
 

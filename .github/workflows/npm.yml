@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       staged:
-        default: false
+        default: true
         type: boolean
   workflow_dispatch:
     inputs:
@@ -18,8 +18,8 @@ on:
         required: true
         type: string
       staged:
-        description: Stage the packages for approval on npmjs.com, which a package's first version needs
-        default: false
+        description: Stage the packages for approval on npmjs.com instead of publishing them directly
+        default: true
         type: boolean
 
 permissions:
@@ -80,10 +80,13 @@ jobs:
           echo "[${entries%,}]" > artifacts.json
           echo "{\"version\":\"$version\"}" > metadata.json
       - run: node scripts/npm-packages.mjs
-      # Platform packages first, so the main package never points at a version that is not live yet.
-      # A pre-release goes to the "next" tag, and a re-run skips what an earlier run published or staged.
-      # Trusted publishing cannot create a package, and a token cannot answer npm's 2FA prompt: staging uploads
-      # with the token and leaves the publishing to a maintainer's approval.
+      # Platform packages first, so the main package never points at a version that is not live yet. A pre-release
+      # goes to the "next" tag.
+      # Staged unless asked otherwise: a token cannot answer npm's 2FA prompt, so staging uploads and leaves the
+      # publishing to a maintainer's approval. It also creates a package that does not exist yet, which trusted
+      # publishing cannot.
+      # A re-run skips what an earlier run published, and what it staged if the job can list that. Trusted publishing
+      # cannot, and npm then refuses the staged version itself.
       - name: Publish to npm
         run: |
           version="$(node -p "require('./dist/npm/sluice/package.json').version")"
@@ -97,7 +100,9 @@ jobs:
               echo "$name@$version is already published"
               continue
             fi
-            if [ "$STAGED" = true ] && npm stage list "$name" 2>/dev/null | grep -Fq "$version"; then
+            # Matched with its quotes, so a staged 1.1.0-rc.1 does not pass for 1.1.0.
+            if [ "$STAGED" = true ] &&
+              npm stage list "$name" --json 2>/dev/null | grep -Fq "\"version\": \"$version\""; then
               echo "$name@$version is already staged"
               continue
             fi
