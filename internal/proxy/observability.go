@@ -9,6 +9,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"regexp"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,7 @@ const (
 
 var (
 	ErrorCounter         prometheus.Counter
+	WarningCounter       prometheus.Counter
 	ProxyFailures        *prometheus.CounterVec
 	RequestHistogram     *prometheus.HistogramVec
 	QueueWaitHistogram   *prometheus.HistogramVec
@@ -61,7 +63,8 @@ var (
 		pattern     *regexp.Regexp
 		replacement string
 	}{
-		{regexp.MustCompile(`(/(?:webhooks|interactions)/[^/?\s]+/)[^/?\s]+`), "$1:token"},
+		// A lone "!" is the placeholder a route label carries there, and stays as it is.
+		{regexp.MustCompile(`(/(?:webhooks|interactions)/[^/?\s]+/)(?:[^/?\s!][^/?\s]*|![^/?\s]+)`), "$1:token"},
 		{regexp.MustCompile(`(?i)\b(Bot|Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}`), "$1 :token"},
 		{regexp.MustCompile(`[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}`), ":token"},
 	}
@@ -74,6 +77,7 @@ func init() {
 type metricSet struct {
 	registry             *prometheus.Registry
 	errors               prometheus.Counter
+	warnings             prometheus.Counter
 	failures             *prometheus.CounterVec
 	requests             *prometheus.HistogramVec
 	queueWait            *prometheus.HistogramVec
@@ -92,20 +96,24 @@ func newMetricSet(namespace string) metricSet {
 		registry: prometheus.NewRegistry(),
 		errors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Name: "error",
-			Help: "The total number of errors when processing requests",
+			Help: "Error-level log records; a request that fails is not logged at that level, see failures_total",
+		}),
+		warnings: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "warnings_total",
+			Help: "Warnings logged: when this moves, the log says what needs attention",
 		}),
 		failures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "failures_total",
-			Help: "Proxy failures by bounded reason",
+			Help: "Requests Sluice answered with an error of its own, or whose client left unanswered, by reason",
 		}, []string{"reason"}),
 		requests: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Name: "requests",
-			Help:    "Request histogram",
+			Help:    "Seconds until Discord's response headers, one observation for every attempt Discord answered",
 			Buckets: []float64{.1, .25, 1, 2.5, 5, 20},
 		}, []string{"method", "status", "route", "clientId"}),
 		queueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Name: "queue_wait_seconds",
-			Help:    "Time a request waited for its rate-limit bucket and the global limit before its first Discord attempt",
+			Help:    "Seconds a request waited for its bucket and the global limit before it was sent, or before Sluice answered it",
 			Buckets: []float64{.005, .025, .1, .25, 1, 2.5, 5, 10, 30, 60},
 		}, []string{"method", "route"}),
 		openConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -141,10 +149,13 @@ func newMetricSet(namespace string) metricSet {
 			Help: "Requests naming a deprecated or discontinued Discord API version, or none (Discord's default, v6)",
 		}, []string{"version"}),
 	}
+	for _, reason := range failureReasons {
+		set.failures.WithLabelValues(reason)
+	}
 	set.registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		set.errors, set.failures, set.requests, set.queueWait, set.openConnections,
+		set.errors, set.warnings, set.failures, set.requests, set.queueWait, set.openConnections,
 		set.routedSent, set.routedReceived, set.routedError, set.webhookShortCircuits, set.cloudflareBlocks,
 		set.edgeRefusals, set.deprecatedAPI,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -157,6 +168,15 @@ func newMetricSet(namespace string) metricSet {
 			return 0
 		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "invalid_requests_limit",
+			Help: "Invalid responses in that window at which this node stops sending: 9,500, split between the nodes of a cluster",
+		}, func() float64 {
+			if p := activeProxy.Load(); p != nil {
+				return float64(p.invalidRequests.limit)
+			}
+			return 0
+		}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "cloudflare_blocked",
 			Help: "1 while outbound traffic is paused because Discord's edge blocked this IP",
 		}, func() float64 {
@@ -165,8 +185,51 @@ func newMetricSet(namespace string) metricSet {
 			}
 			return 0
 		}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "build_info",
+			Help:        "1, labelled with the running Sluice version and the Go version that built it",
+			ConstLabels: prometheus.Labels{"version": Version, "goversion": runtime.Version()},
+		}, func() float64 { return 1 }),
+		newLimitCollector(namespace),
 	)
 	return set
+}
+
+// limitCollector reports the limits Sluice works under beside what is in use, so a limit shows
+// before it starts refusing or delaying requests.
+type limitCollector struct {
+	usage, limit, globalLimit *prometheus.Desc
+}
+
+func newLimitCollector(namespace string) limitCollector {
+	return limitCollector{
+		usage: prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "resource_usage"),
+			"How much of a bounded resource is in use, named after the MAX_ setting that bounds it", []string{"resource"}, nil),
+		limit: prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "resource_limit"),
+			"The limit a MAX_ setting puts on a bounded resource", []string{"resource"}, nil),
+		globalLimit: prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "global_limit"),
+			"Requests a second Sluice paces a client at: Discord's 50, or its entry in BOT_RATELIMIT_OVERRIDES", []string{"clientId"}, nil),
+	}
+}
+
+func (c limitCollector) Describe(descriptions chan<- *prometheus.Desc) {
+	descriptions <- c.usage
+	descriptions <- c.limit
+	descriptions <- c.globalLimit
+}
+
+func (c limitCollector) Collect(metrics chan<- prometheus.Metric) {
+	p := activeProxy.Load()
+	if p == nil {
+		return
+	}
+	for _, resource := range p.resources() {
+		metrics <- prometheus.MustNewConstMetric(c.usage, prometheus.GaugeValue, float64(resource.used), resource.name)
+		metrics <- prometheus.MustNewConstMetric(c.limit, prometheus.GaugeValue, float64(resource.limit), resource.name)
+	}
+	for client, limit := range p.globalLimits() {
+		metrics <- prometheus.MustNewConstMetric(c.globalLimit, prometheus.GaugeValue, float64(limit), client)
+	}
 }
 
 // ConfigureMetrics replaces the exported metrics with a set under namespace. Call it
@@ -175,6 +238,7 @@ func ConfigureMetrics(namespace string) {
 	set := newMetricSet(namespace)
 	metricsRegistry = set.registry
 	ErrorCounter = set.errors
+	WarningCounter = set.warnings
 	ProxyFailures = set.failures
 	RequestHistogram = set.requests
 	QueueWaitHistogram = set.queueWait
@@ -258,8 +322,11 @@ func SetLogger(replacement *slog.Logger) {
 type errorCountingHandler struct{ slog.Handler }
 
 func (h errorCountingHandler) Handle(ctx context.Context, record slog.Record) error {
-	if record.Level >= slog.LevelError {
+	switch {
+	case record.Level >= slog.LevelError:
 		ErrorCounter.Inc()
+	case record.Level >= slog.LevelWarn:
+		WarningCounter.Inc()
 	}
 	return h.Handler.Handle(ctx, record)
 }

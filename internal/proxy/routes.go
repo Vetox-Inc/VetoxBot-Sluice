@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -26,7 +27,11 @@ const (
 	majorInteractions = "interactions"
 )
 
-var crc64Table = crc64.MakeTable(crc64.ISO)
+var (
+	crc64Table = crc64.MakeTable(crc64.ISO)
+	// nonUTF8PathWarned is set once the warning about a path that is not UTF-8 has been logged.
+	nonUTF8PathWarned atomic.Bool
+)
 
 // identifierFollows names literal segments followed by a non-numeric identifier, so neither
 // buckets nor metric labels multiply per activity instance, provider identity or template code.
@@ -86,7 +91,10 @@ func MetricsPathFromBucket(route string) string {
 
 	result := path.String()
 	if !utf8.ValidString(result) {
-		logger.Warn("Non-UTF-8 path detected; invalid runes become @ in metric labels", "path", result)
+		// Said once: a client can send such a path with every request.
+		if nonUTF8PathWarned.CompareAndSwap(false, true) {
+			logger.Warn("A request path is not valid UTF-8; such bytes show as @ in metric labels")
+		}
 		result = strings.ToValidUTF8(result, "@")
 	}
 	return result
@@ -120,13 +128,13 @@ func GetOptimisticBucketPath(path, method string) string {
 	case majorChannels:
 		bucket.WriteString(majorChannels)
 		bucket.WriteByte('/')
-		bucket.WriteString(parts[1])
+		bucket.WriteString(identifierSlot(majorChannels, parts[1]))
 	case "users":
 		bucket.WriteString("users/")
 		if isSnowflake(parts[1]) {
 			bucket.WriteByte('!')
 		} else {
-			bucket.WriteString(parts[1])
+			bucket.WriteString(identifierSlot("users", parts[1]))
 		}
 	case majorInvites:
 		bucket.WriteString(majorInvites)
@@ -135,7 +143,7 @@ func GetOptimisticBucketPath(path, method string) string {
 		fallthrough
 	case majorInteractions:
 		if len(parts) == 4 && parts[3] == "callback" {
-			return "/" + majorInteractions + "/" + parts[1] + "/!/callback"
+			return "/" + majorInteractions + "/" + identifierSlot(majorInteractions, parts[1]) + "/!/callback"
 		}
 		fallthrough
 	case majorWebhooks:
@@ -143,7 +151,7 @@ func GetOptimisticBucketPath(path, method string) string {
 	default:
 		bucket.WriteString(parts[0])
 		bucket.WriteByte('/')
-		bucket.WriteString(parts[1])
+		bucket.WriteString(identifierSlot(parts[0], parts[1]))
 	}
 
 	if len(parts) == 2 {
@@ -211,6 +219,16 @@ func GetOptimisticBucketPath(path, method string) string {
 	}
 
 	return bucket.String()
+}
+
+// identifierSlot returns what a bucket path keeps of the segment after a route's first word. A
+// webhook's and an interaction's is an ID, so anything else there may be the token of a client
+// that swapped the two, and a segment as long as a token is never a word of a route.
+func identifierSlot(major, segment string) string {
+	if len(segment) >= 64 || (major == majorWebhooks || major == majorInteractions) && !isNumericInput(segment) {
+		return "!"
+	}
+	return segment
 }
 
 func cleanAPIPath(path string) []string {

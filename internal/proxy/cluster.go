@@ -85,24 +85,42 @@ func (e clusterEvents) NotifyUpdate(node *memberlist.Node) {
 	go e.proxy.reindexMembers()
 }
 
-func (p *Proxy) JoinCluster(config ClusterConfig) error {
-	if config.Port < 1 || config.Port > 65535 || config.PeerPort < 1 || config.PeerPort > 65535 {
-		return fmt.Errorf("cluster and peer ports must be between 1 and 65535")
-	}
-	if config.BindAddress != "" && net.ParseIP(config.BindAddress) == nil {
-		return fmt.Errorf("cluster BIND_IP must be an IP address")
-	}
-	if config.AdvertiseAddress != "" && net.ParseIP(config.AdvertiseAddress) == nil {
-		return fmt.Errorf("CLUSTER_ADVERTISE_ADDR must be an IP address")
-	}
-	if config.MaxNodes < 1 || config.MaxNodes > InvalidRequestSafetyLimit {
-		return fmt.Errorf("cluster max nodes must be between 1 and %d", InvalidRequestSafetyLimit)
-	}
-	secretKey, err := clusterSecretKey(config.Secret)
+// Validate reports what JoinCluster refuses before it reaches the network.
+func (config ClusterConfig) Validate() error {
+	_, peerTransport, err := config.prepare()
 	if err != nil {
 		return err
 	}
+	peerTransport.CloseIdleConnections()
+	return nil
+}
+
+func (config ClusterConfig) prepare() ([]byte, *http.Transport, error) {
+	if config.Port < 1 || config.Port > 65535 || config.PeerPort < 1 || config.PeerPort > 65535 {
+		return nil, nil, fmt.Errorf("cluster and peer ports must be between 1 and 65535")
+	}
+	if config.BindAddress != "" && net.ParseIP(config.BindAddress) == nil {
+		return nil, nil, fmt.Errorf("cluster BIND_IP must be an IP address")
+	}
+	if config.AdvertiseAddress != "" && net.ParseIP(config.AdvertiseAddress) == nil {
+		return nil, nil, fmt.Errorf("CLUSTER_ADVERTISE_ADDR must be an IP address")
+	}
+	if config.MaxNodes < 1 || config.MaxNodes > InvalidRequestSafetyLimit {
+		return nil, nil, fmt.Errorf("cluster max nodes must be between 1 and %d", InvalidRequestSafetyLimit)
+	}
+	secretKey, err := clusterSecretKey(config.Secret)
+	if err != nil {
+		return nil, nil, err
+	}
 	peerTransport, err := newPeerHTTPTransport(config.PeerTLS)
+	if err != nil {
+		return nil, nil, err
+	}
+	return secretKey, peerTransport, nil
+}
+
+func (p *Proxy) JoinCluster(config ClusterConfig) error {
+	secretKey, peerTransport, err := config.prepare()
 	if err != nil {
 		return err
 	}

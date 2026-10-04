@@ -16,7 +16,12 @@ import (
 	"github.com/Vetox-Inc/VetoxBot-Sluice/internal/proxy"
 )
 
-const maxConfiguredTimeout = 24 * time.Hour
+const (
+	maxConfiguredTimeout = 24 * time.Hour
+	// shortestUsualTimeout is the least a timeout is likely to be meant as: below it, the value
+	// was probably written in seconds.
+	shortestUsualTimeout = 100 * time.Millisecond
+)
 
 var metricsNamespacePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
@@ -64,6 +69,9 @@ type appConfig struct {
 	clusterClientTLS     *tls.Config
 
 	proxy proxy.Config
+
+	// warnings are settings that are valid and probably not what was meant.
+	warnings []string
 }
 
 func loadConfig() (appConfig, error) {
@@ -187,7 +195,25 @@ func loadConfig() (appConfig, error) {
 		return appConfig{}, fmt.Errorf("CLIENT_AUTH_SECRET must contain at least 32 characters")
 	}
 
+	var warnings []string
+	for _, timeout := range []struct {
+		name  string
+		value time.Duration
+	}{{"REQUEST_TIMEOUT", requestTimeout}, {"QUEUE_TIMEOUT", queueTimeout}} {
+		if timeout.value < shortestUsualTimeout {
+			warnings = append(warnings, fmt.Sprintf("%s is in milliseconds: %s is less than Discord takes to answer", timeout.name, timeout.value))
+		}
+	}
+	if maxRetryCaptureBytes > 0 && maxRetryCaptureBytes < maxRetryBodyBytes {
+		warnings = append(warnings, "MAX_RETRY_CAPTURE_BYTES is below MAX_RETRY_BODY_BYTES: a body larger than the first and within the second always gets a 503")
+	}
+	stateFile, stateWarning := stateFilePath(port)
+	if stateWarning != "" {
+		warnings = append(warnings, stateWarning)
+	}
+
 	return appConfig{
+		warnings:             warnings,
 		bindIP:               envString("BIND_IP", "0.0.0.0"),
 		port:                 port,
 		metricsPort:          metricsPort,
@@ -225,22 +251,23 @@ func loadConfig() (appConfig, error) {
 			DiscordURL:             discordURL,
 			CloudflareBanDetection: cloudflareBanDetection,
 			ClientAuthSecret:       clientAuthSecret,
-			StateFile:              stateFilePath(port),
+			StateFile:              stateFile,
 		},
 	}, nil
 }
 
 // stateFilePath is STATE_FILE, where an empty value turns the file off, or by default a file
-// named after the proxy port in the user cache directory.
-func stateFilePath(port int) string {
+// named after the proxy port in the user cache directory. Without such a directory there is no
+// file, and a warning that says so.
+func stateFilePath(port int) (path, warning string) {
 	if value, set := os.LookupEnv("STATE_FILE"); set {
-		return strings.TrimSpace(value)
+		return strings.TrimSpace(value), ""
 	}
 	cache, err := os.UserCacheDir()
 	if err != nil {
-		return ""
+		return "", "The protection state is not kept across restarts: there is no user cache directory to default to, so set STATE_FILE"
 	}
-	return filepath.Join(cache, "sluice", fmt.Sprintf("state-%d.json", port))
+	return filepath.Join(cache, "sluice", fmt.Sprintf("state-%d.json", port)), ""
 }
 
 func (c appConfig) clusteringEnabled() bool {

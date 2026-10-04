@@ -1,0 +1,358 @@
+# Proves that every rule in alerts.yml fires on the failure it is for, and that none fires on an
+# ordinary day. Run it with: promtool test rules prometheus/alerts.test.yml
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # An ordinary day: ten requests a second, a few timeouts, the answers clients expect.
+  - name: an ordinary day raises nothing
+    interval: 1m
+    input_series:
+      - series: 'sluice_build_info{instance="a", job="sluice", version="1.1.0", goversion="go1.27.1"}'
+        values: '1+0x60'
+      - series: 'process_start_time_seconds{instance="a", job="sluice"}'
+        values: '1000+0x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="upstream_timeout"}'
+        values: '0 0 1 1 1 1 2 2 2 2 2 3 3 3 3 3 3 3 4 4 4 4 4 4 4 4 4 4 4 4 4'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="rate_limit_deadline"}'
+        values: '0+3x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="client_closed"}'
+        values: '0+1x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="bucket_limit"}'
+        values: '0+0x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="queue_timeout"}'
+        values: '0+1x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="invalid_token"}'
+        values: '0+0x60'
+      - series: 'sluice_resource_usage{instance="a", job="sluice", resource="bucket_states"}'
+        values: '9000+0x60'
+      - series: 'sluice_resource_limit{instance="a", job="sluice", resource="bucket_states"}'
+        values: '65536+0x60'
+      # The retry copy switched off: a limit of 0 must not divide.
+      - series: 'sluice_resource_usage{instance="a", job="sluice", resource="retry_capture_bytes"}'
+        values: '0+0x60'
+      - series: 'sluice_resource_limit{instance="a", job="sluice", resource="retry_capture_bytes"}'
+        values: '0+0x60'
+      - series: 'sluice_requests_count{instance="a", job="sluice", clientId="111", method="POST", route="/channels/!/messages", status="200 OK"}'
+        values: '0+600x60'
+      - series: 'sluice_global_limit{instance="a", job="sluice", clientId="111"}'
+        values: '50+0x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="0.25"}'
+        values: '0+500x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="1.0"}'
+        values: '0+598x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="2.5"}'
+        values: '0+600x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="+Inf"}'
+        values: '0+600x60'
+      - series: 'sluice_invalid_requests{instance="a", job="sluice"}'
+        values: '40+0x60'
+      - series: 'sluice_invalid_requests_limit{instance="a", job="sluice"}'
+        values: '9500+0x60'
+      - series: 'sluice_cloudflare_blocked{instance="a", job="sluice"}'
+        values: '0+0x60'
+      - series: 'sluice_edge_refusals_total{instance="a", job="sluice"}'
+        values: '0+0x60'
+      - series: 'sluice_warnings_total{instance="a", job="sluice"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - { eval_time: 30m, alertname: SluiceDown, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceRestarting, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceUpstreamFailing, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceRefusingRequests, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceResourceNearLimit, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceQueueCongested, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceBotNearGlobalLimit, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceTokenRejected, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceInvalidRequestsHigh, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceInvalidRequestsCritical, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceCloudflareBlocked, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceEdgeRefusals, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceSlowResponses, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceLoggedWarnings, exp_alerts: [] }
+
+  # Discord cannot be reached: six requests a second get a 502. Nothing is logged at error level,
+  # so only the failure counter moves.
+  - name: an unreachable Discord
+    interval: 1m
+    input_series:
+      - series: 'sluice_build_info{instance="a", job="sluice", version="1.1.0", goversion="go1.27.1"}'
+        values: '1+0x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="upstream_error"}'
+        values: '0+0x10 360+360x40'
+      - series: 'sluice_error{instance="a", job="sluice"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SluiceUpstreamFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: 'Sluice is not getting answers from Discord'
+              description: '3600 requests in 10 minutes failed before Discord answered.'
+      - { eval_time: 30m, alertname: SluiceDown, exp_alerts: [] }
+
+  # No Sluice is scraped at all.
+  - name: a Sluice that is down
+    interval: 1m
+    input_series:
+      - series: 'up{instance="a", job="sluice"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SluiceDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: 'No Sluice is answering its metrics endpoint'
+              description: 'Bots that send their Discord requests through Sluice cannot reach Discord while it is down.'
+
+  # A crash loop: three new start times in half an hour. At the twentieth minute Sluice is down
+  # again and the scrape fails, which must not make the alert go away.
+  - name: a Sluice that keeps restarting
+    interval: 1m
+    input_series:
+      - series: 'sluice_build_info{instance="a", job="sluice", version="1.1.0", goversion="go1.27.1"}'
+        values: '1+0x19 stale 1+0x20'
+      - series: 'process_start_time_seconds{instance="a", job="sluice"}'
+        values: '1000+0x5 2000+0x5 3000+0x5 4000+0x1 stale 4000+0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SluiceRestarting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a
+              job: sluice
+            exp_annotations:
+              summary: 'Sluice keeps restarting'
+              description: 'a started 3 times in 30 minutes; its log says why.'
+
+  # The bucket table is full of buckets in use: first it nears its limit, then requests are refused.
+  - name: a limit that fills up and then refuses
+    interval: 1m
+    input_series:
+      - series: 'sluice_build_info{instance="a", job="sluice", version="1.1.0", goversion="go1.27.1"}'
+        values: '1+0x60'
+      - series: 'sluice_resource_usage{instance="a", job="sluice", resource="bucket_states"}'
+        values: '60000+0x60'
+      - series: 'sluice_resource_limit{instance="a", job="sluice", resource="bucket_states"}'
+        values: '65536+0x60'
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="bucket_limit"}'
+        values: '0+0x24 9+0x36'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SluiceResourceNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a
+              job: sluice
+              resource: bucket_states
+            exp_annotations:
+              summary: 'Sluice uses over 80% of bucket_states'
+              description: 'Its setting is MAX_ followed by that name in capitals: raise it, or find what fills it.'
+      - { eval_time: 15m, alertname: SluiceRefusingRequests, exp_alerts: [] }
+      - eval_time: 30m
+        alertname: SluiceRefusingRequests
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: bucket_limit
+            exp_annotations:
+              summary: 'Sluice is refusing requests: bucket_limit'
+              description: '9 requests in 10 minutes were answered 503. CONFIG.md names the setting behind each reason.'
+
+  # A congested bucket: thirty requests a minute miss their turn.
+  - name: a congested queue
+    interval: 1m
+    input_series:
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="queue_timeout"}'
+        values: '0+30x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SluiceQueueCongested
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Requests wait longer than QUEUE_TIMEOUT in Sluice'
+              description: '300 requests in 10 minutes missed their turn; see queue-wait p95 by route.'
+
+  # One bot sends 45 requests a second against a limit of 50. Its interaction callbacks do not
+  # count, and a bot with a raised limit that sends twice as much is far from it. Neither do the
+  # labels that stand for many clients: twenty bearer tokens at 5 a second each are nowhere near
+  # their limits, and interaction follow-ups without a token are not paced at all.
+  - name: a bot near its global limit
+    interval: 1m
+    input_series:
+      - series: 'sluice_requests_count{instance="a", job="sluice", clientId="Bearer", method="GET", route="/users/@me", status="200 OK"}'
+        values: '0+6000x60'
+      - series: 'sluice_global_limit{instance="a", job="sluice", clientId="Bearer"}'
+        values: '50+0x60'
+      - series: 'sluice_requests_count{instance="a", job="sluice", clientId="NoAuth", method="POST", route="/webhooks/!/!", status="200 OK"}'
+        values: '0+6000x60'
+      - series: 'sluice_global_limit{instance="a", job="sluice", clientId="NoAuth"}'
+        values: '50+0x60'
+      - series: 'sluice_requests_count{instance="a", job="sluice", clientId="111", method="GET", route="/guilds/!/audit-logs", status="200 OK"}'
+        values: '0+2700x60'
+      - series: 'sluice_requests_count{instance="a", job="sluice", clientId="111", method="POST", route="/interactions/!/!/callback", status="204 No Content"}'
+        values: '0+1800x60'
+      - series: 'sluice_global_limit{instance="a", job="sluice", clientId="111"}'
+        values: '50+0x60'
+      - series: 'sluice_requests_count{instance="a", job="sluice", clientId="222", method="GET", route="/guilds/!/audit-logs", status="200 OK"}'
+        values: '0+5400x60'
+      - series: 'sluice_global_limit{instance="a", job="sluice", clientId="222"}'
+        values: '500+0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SluiceBotNearGlobalLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              clientId: '111'
+            exp_annotations:
+              summary: 'Bot 111 is close to its global rate limit'
+              description: 'It sends at 90% of its limit. Send less, or set BOT_RATELIMIT_OVERRIDES if Discord raised the limit.'
+
+  # Discord rejected a token and the bot keeps calling.
+  - name: a rejected token
+    interval: 1m
+    input_series:
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="invalid_token"}'
+        values: '0+0x10 20+20x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SluiceTokenRejected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'A bot keeps using a token Discord rejected'
+              description: '200 requests in 10 minutes were answered 401 by Sluice; its log gives the ID in the token.'
+
+  # The invalid-request budget: past half, then nearly gone.
+  - name: an invalid-request budget that runs out
+    interval: 1m
+    input_series:
+      - series: 'sluice_invalid_requests{instance="a", job="sluice"}'
+        values: '4750+0x10 8550+0x10'
+      - series: 'sluice_invalid_requests_limit{instance="a", job="sluice"}'
+        values: '9500+0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SluiceInvalidRequestsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a
+              job: sluice
+            exp_annotations:
+              summary: 'Half of the invalid-request budget is used'
+              description: 'a has used 50% of it in the last 10 minutes; find the route that draws the 401s, 403s and 429s.'
+      - { eval_time: 5m, alertname: SluiceInvalidRequestsCritical, exp_alerts: [] }
+      - eval_time: 15m
+        alertname: SluiceInvalidRequestsCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: a
+              job: sluice
+            exp_annotations:
+              summary: 'The invalid-request budget is nearly used up'
+              description: 'a has used 90% of it; once it is gone Sluice refuses every request.'
+
+  # Two nodes of a cluster split the budget, 4,750 each. One has used over half of its share: a
+  # count that a rule reading the 9,500 of a single node would never reach.
+  - name: an invalid-request budget split between the nodes of a cluster
+    interval: 1m
+    input_series:
+      - series: 'sluice_invalid_requests{instance="a", job="sluice"}'
+        values: '2850+0x10'
+      - series: 'sluice_invalid_requests_limit{instance="a", job="sluice"}'
+        values: '4750+0x10'
+      - series: 'sluice_invalid_requests{instance="b", job="sluice"}'
+        values: '100+0x10'
+      - series: 'sluice_invalid_requests_limit{instance="b", job="sluice"}'
+        values: '4750+0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SluiceInvalidRequestsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a
+              job: sluice
+            exp_annotations:
+              summary: 'Half of the invalid-request budget is used'
+              description: 'a has used 60% of it in the last 10 minutes; find the route that draws the 401s, 403s and 429s.'
+      - { eval_time: 5m, alertname: SluiceInvalidRequestsCritical, exp_alerts: [] }
+
+  # Discord's edge refuses two requests, and then blocks the IP.
+  - name: an edge that refuses and blocks
+    interval: 1m
+    input_series:
+      - series: 'sluice_edge_refusals_total{instance="a", job="sluice"}'
+        values: '0+0x14 2+0x30'
+      - series: 'sluice_cloudflare_blocked{instance="a", job="sluice"}'
+        values: '0+0x15 1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SluiceEdgeRefusals
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Discord's edge is refusing requests"
+              description: "2 responses in 10 minutes came from Discord's edge instead of Discord."
+      - eval_time: 20m
+        alertname: SluiceCloudflareBlocked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Discord's edge blocks this IP"
+              description: 'Sluice has paused all traffic until the block ends. A restart does not lift it.'
+
+  # One response in ten takes longer than a second.
+  - name: slow answers from Discord
+    interval: 1m
+    input_series:
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="0.25"}'
+        values: '0+300x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="1.0"}'
+        values: '0+540x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="2.5"}'
+        values: '0+600x60'
+      - series: 'sluice_requests_bucket{instance="a", job="sluice", le="+Inf"}'
+        values: '0+600x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SluiceSlowResponses
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Discord answers slowly through Sluice'
+              description: 'The 95th percentile of response time is 1.75 s.'
+
+  # Sluice warned about something: only its log says what.
+  - name: warnings in the log
+    interval: 1m
+    input_series:
+      - series: 'sluice_warnings_total{instance="a", job="sluice"}'
+        values: '0+0x10 3+0x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SluiceLoggedWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: info
+            exp_annotations:
+              summary: 'Sluice logged warnings'
+              description: '3 warnings in 15 minutes; read its log.'

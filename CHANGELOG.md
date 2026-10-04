@@ -5,6 +5,59 @@ and [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- `sluice --check`, which reads the settings as a start would and exits without opening a port or joining a
+  cluster: with status 0 when they are valid, and otherwise with the error a start would stop on.
+- A warning at startup for a setting that is accepted and probably a mistake: a timeout under 100 milliseconds,
+  `MAX_RETRY_CAPTURE_BYTES` below `MAX_RETRY_BODY_BYTES`, and a state file that is off because the process has no
+  cache directory.
+- A reason in `sluice_failures_total` for every error Sluice answers with on its own and for a client that left
+  before its answer: 24 reasons where there were 9, listed in [CONFIG.md](CONFIG.md#enable_metrics). The nine keep
+  their meaning. Every reason is exported from the start, at 0, so that an alert sees its first failure.
+- A warning in the log for the failures an operator has to act on, such as a Discord that cannot be reached, a
+  rejected token or a `MAX_` limit that is reached. It names the method and the route, and comes at most once every 30
+  seconds for a reason, with a count of the failures in between.
+- Metrics: `sluice_warnings_total`; `sluice_resource_usage` and `sluice_resource_limit`, which show how close the
+  limits on clients, bearer tokens, buckets, requests in flight and retry copies are; `sluice_global_limit`, the
+  requests a second each bot is paced at; `sluice_invalid_requests_limit`, the count at which a node stops sending;
+  and `sluice_build_info`, which carries the version.
+- Alert rules for Prometheus in [`prometheus/alerts.yml`](prometheus/alerts.yml), with tests of every rule, and a row
+  for the new metrics in the Grafana dashboard.
+- A systemd unit in [`systemd/sluice.service`](systemd/sluice.service) that gives Sluice the network and its state
+  directory, and nothing else of the host.
+- The release archives carry the unit, the alert rules and the dashboard beside the binary.
+- A hangup (`SIGHUP`) stops Sluice the way `SIGTERM` does, letting the requests in flight finish, unless Sluice was
+  started to ignore it, as `nohup` does. The npm launcher passes a hangup on either way.
+- The startup log line names the upstream and counts the entries of `BOT_RATELIMIT_OVERRIDES` and `BOT_WIDE_ROUTES`.
+
+### Changed
+
+- At `MAX_BUCKET_STATES`, Sluice first drops the buckets that nothing uses, waits for or has to wait out, and refuses
+  a request only when that leaves no room. It used to answer `503` until the next periodic clean-up.
+- `sluice_queue_wait_seconds` includes the wait of a request that Sluice answered itself after it had queued.
+- With `DISABLE_401_LOCK=true`, a token Discord answered `401` is sent one request at a time until Discord accepts
+  one, as a token Sluice has not seen before is. Its requests used to go out side by side.
+
+### Fixed
+
+- A stop signal that arrived twice within a second ended Sluice at once and cut off the requests in flight. It does
+  when a process manager or a terminal signals a whole process group and a launcher, such as the npm one, passes the
+  signal on. The two now count as one stop.
+- With `DISABLE_401_LOCK=true`, a `401` from Discord counted as proof that the token was real, so the ID inside a
+  rejected token could become a `clientId` in metrics. Such a token now stays `Unverified`.
+- A webhook or interaction token sent where the ID belongs, by a client that swapped the two, was kept in the route
+  label of the metrics and the log. Anything but an ID in that place is now `!`.
+- A bot token whose first part decodes to more than 20 digits no longer has those digits kept as a bot ID.
+- A request path that is not valid UTF-8 was logged with every such request. It is logged once.
+- In a cluster, a request for another node whose client left was counted as `peer_error`. It is `client_closed`.
+- A `Retry-After` too large to be a duration, on a refusal by Discord's edge, could pause traffic for one second
+  instead of the longest pause.
+- A state file that cannot be saved is reported once, and once more when saving works again, instead of every 5
+  seconds.
+- The warning for an edge check that reached no verdict says why.
+- A route in a log line reads as its metric label does: `/webhooks/!/!` used to come out as `/webhooks/!/:token`.
+
 ## 1.0.1 - 2026-10-04
 
 Documentation and wording only: requests are handled exactly as in 1.0.0.

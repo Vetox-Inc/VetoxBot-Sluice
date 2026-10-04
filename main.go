@@ -23,10 +23,11 @@ import (
 
 const (
 	// drainTimeout covers a request under the default QUEUE_TIMEOUT and REQUEST_TIMEOUT.
-	drainTimeout       = 15 * time.Second
-	shutdownTimeout    = 5 * time.Second
-	cleanupTimeout     = 5 * time.Second
-	configReferenceURL = "https://github.com/Vetox-Inc/VetoxBot-Sluice/blob/master/CONFIG.md"
+	drainTimeout         = 15 * time.Second
+	shutdownTimeout      = 5 * time.Second
+	cleanupTimeout       = 5 * time.Second
+	repeatedSignalWindow = time.Second
+	configReferenceURL   = "https://github.com/Vetox-Inc/VetoxBot-Sluice/blob/master/CONFIG.md"
 )
 
 var logger = proxy.NewLogger(os.Stderr, slog.LevelInfo, "text")
@@ -40,10 +41,20 @@ type runningServer struct {
 
 func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	checkOnly := flag.Bool("check", false, "check the configuration and exit")
 	flag.Usage = printUsage
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("sluice", proxy.Version)
+		return
+	}
+	if *checkOnly {
+		if err := checkConfiguration(); err != nil {
+			// Through the logger, which redacts: an error can quote a setting.
+			logger.Error("The configuration is not valid", "error", err)
+			os.Exit(1)
+		}
+		fmt.Println("sluice: the configuration is valid")
 		return
 	}
 	if err := run(); err != nil {
@@ -55,7 +66,9 @@ func main() {
 func printUsage() {
 	output := flag.CommandLine.Output()
 	var usage strings.Builder
-	fmt.Fprintf(&usage, "Sluice %s, a Discord REST rate-limit proxy.\n\nUsage: sluice [--version]\n\n", proxy.Version)
+	fmt.Fprintf(&usage, "Sluice %s, a Discord REST rate-limit proxy.\n\nUsage: sluice [--version | --check]\n\n", proxy.Version)
+	usage.WriteString("  --version  print the version and exit\n")
+	usage.WriteString("  --check    check the configuration, as a start would, and exit without listening\n\n")
 	usage.WriteString("Configuration comes from environment variables and an optional .env file:\n")
 	for _, group := range settingGroups {
 		fmt.Fprintf(&usage, "\n  %s\n", group.title)
@@ -65,6 +78,32 @@ func printUsage() {
 	}
 	fmt.Fprintf(&usage, "\nDefaults and details: %s\n", configReferenceURL)
 	_, _ = io.WriteString(output, usage.String())
+}
+
+// checkConfiguration reads the configuration as a start does and stops short of the network, so
+// a mistake shows before a restart takes the running proxy down. It opens no port, resolves no
+// CLUSTER_DNS and joins no cluster: what only those can refuse still shows at the start.
+func checkConfiguration() error {
+	if err := loadDotEnv(); err != nil {
+		return err
+	}
+	if err := configureLogger(); err != nil {
+		return err
+	}
+	config, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	warnAboutSettings(config)
+	if err := config.proxy.Validate(); err != nil {
+		return fmt.Errorf("configure proxy: %w", err)
+	}
+	if config.clusteringEnabled() {
+		if err := clusterConfig(config, nil).Validate(); err != nil {
+			return fmt.Errorf("initialize cluster: %w", err)
+		}
+	}
+	return nil
 }
 
 func run() error {
@@ -79,7 +118,7 @@ func run() error {
 		return err
 	}
 	proxy.ConfigureMetrics(config.metricsNamespace)
-	warnObsoleteSettings()
+	warnAboutSettings(config)
 
 	serverProxy, err := proxy.New(config.proxy)
 	if err != nil {
@@ -177,19 +216,24 @@ func run() error {
 	logger.Info("Proxy started",
 		"version", proxy.Version,
 		"address", publicAddress,
+		"upstream", config.proxy.DiscordURL,
 		"disableHTTP2", config.proxy.DisableHTTP2,
 		"queueTimeout", config.proxy.QueueTimeout.String(),
 		"requestTimeout", config.proxy.UpstreamTimeout.String(),
+		"globalOverrides", len(splitNonempty(config.proxy.GlobalOverrides)),
+		"botWideRoutes", len(splitNonempty(config.proxy.BotWideRoutes)),
 		"clientAuth", config.proxy.ClientAuthSecret != "",
 		"stateFile", config.proxy.StateFile,
 	)
 
-	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), stopSignalsFor(signal.Ignored)...)
 	defer stopSignals()
 	select {
 	case <-signalContext.Done():
-		// A second signal now stops the process at once instead of waiting for the drain.
-		stopSignals()
+		// A second signal stops the process at once instead of waiting for the drain. One that
+		// follows the first within repeatedSignalWindow is the same stop arriving twice, as it
+		// does when a launcher forwards a signal its whole process group was sent.
+		time.AfterFunc(repeatedSignalWindow, stopSignals)
 		logger.Info("Shutdown signal received; draining requests in flight", "timeout", drainTimeout.String())
 	case err := <-serveErrors:
 		return err
@@ -197,6 +241,16 @@ func run() error {
 	err = shutdownGracefully(serverProxy, servers, drainTimeout)
 	logger.Info("Proxy stopped")
 	return err
+}
+
+// stopSignalsFor lists the signals that start a graceful stop. A hangup is one of them, unless
+// the process was started to ignore it, as nohup does: asking for it would undo that.
+func stopSignalsFor(ignored func(os.Signal) bool) []os.Signal {
+	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !ignored(syscall.SIGHUP) {
+		signals = append(signals, syscall.SIGHUP)
+	}
+	return signals
 }
 
 // shutdownGracefully lets admitted requests finish: the proxy fails its health checks and leaves
@@ -291,11 +345,15 @@ func parseLogLevel(value string) (slog.Level, error) {
 	return 0, fmt.Errorf("LOG_LEVEL must be trace, debug, info, warn, error, fatal or panic")
 }
 
-func warnObsoleteSettings() {
+// warnAboutSettings names the settings that are accepted and will not do what they seem to.
+func warnAboutSettings(config appConfig) {
 	for _, setting := range obsoleteSettings {
 		if os.Getenv(setting.name) != "" {
 			logger.Warn("Ignoring obsolete setting", "setting", setting.name, "advice", setting.advice)
 		}
+	}
+	for _, warning := range config.warnings {
+		logger.Warn(warning)
 	}
 }
 
@@ -313,7 +371,14 @@ func joinCluster(serverProxy *proxy.Proxy, config appConfig) error {
 			knownMembers = append(knownMembers, net.JoinHostPort(address.String(), fmt.Sprint(config.clusterPort)))
 		}
 	}
-	if err := serverProxy.JoinCluster(proxy.ClusterConfig{
+	if err := serverProxy.JoinCluster(clusterConfig(config, knownMembers)); err != nil {
+		return fmt.Errorf("initialize cluster: %w", err)
+	}
+	return nil
+}
+
+func clusterConfig(config appConfig, knownMembers []string) proxy.ClusterConfig {
+	return proxy.ClusterConfig{
 		KnownMembers:     knownMembers,
 		BindAddress:      config.bindIP,
 		AdvertiseAddress: config.clusterAdvertiseAddr,
@@ -323,8 +388,5 @@ func joinCluster(serverProxy *proxy.Proxy, config appConfig) error {
 		NodeName:         config.nodeName,
 		Secret:           config.clusterSecret,
 		PeerTLS:          config.clusterClientTLS,
-	}); err != nil {
-		return fmt.Errorf("initialize cluster: %w", err)
 	}
-	return nil
 }

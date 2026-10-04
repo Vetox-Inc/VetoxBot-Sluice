@@ -13,7 +13,12 @@ import (
 	"time"
 )
 
-const clientIdleTimeout = 10 * time.Minute
+const (
+	clientIdleTimeout = 10 * time.Minute
+	// bucketReclaimInterval spaces the sweeps a full bucket limit sets off, so that a limit which
+	// really is reached costs one sweep a second and not one for every request.
+	bucketReclaimInterval = time.Second
+)
 
 var (
 	errQueueFull        = errors.New("rate-limit queue is full")
@@ -86,7 +91,8 @@ func botIDFromToken(token string) string {
 	if err != nil {
 		decoded, err = base64.RawURLEncoding.DecodeString(encoded)
 	}
-	if err != nil || !isNumericInput(string(decoded)) {
+	// A user ID has at most 20 digits. Anything longer is not one, and would be kept and logged.
+	if err != nil || len(decoded) > 20 || !isNumericInput(string(decoded)) {
 		return ""
 	}
 	return string(decoded)
@@ -263,9 +269,11 @@ func (b *bucketState) merge(other *bucketState) {
 	b.blockUntil(readyAt)
 }
 
-func (b *bucketState) idle(now time.Time) bool {
+// idle reports whether nothing uses or waits for the bucket, no cooldown holds it, and its last
+// use is longer ago than quiet.
+func (b *bucketState) idle(now time.Time, quiet time.Duration) bool {
 	blocked := b.blocked(now)
-	return !blocked && b.active.Load() == 0 && now.Sub(time.Unix(0, b.lastUsed.Load())) > clientIdleTimeout
+	return !blocked && b.active.Load() == 0 && now.Sub(time.Unix(0, b.lastUsed.Load())) > quiet
 }
 
 func (b *bucketState) blocked(now time.Time) bool {
@@ -292,10 +300,12 @@ type clientState struct {
 	buckets map[uint64]*bucketState
 	aliases map[uint64]uint64
 
-	identity   identity
-	global     *pacer
-	validation fifoGate
-	validity   atomic.Int32
+	identity identity
+	global   *pacer
+	// globalLimit is the requests a second global paces at.
+	globalLimit uint
+	validation  fifoGate
+	validity    atomic.Int32
 	// applicationRecorded is set once the bot's ID has gone into Proxy.applications.
 	applicationRecorded atomic.Bool
 	active              atomic.Int64
@@ -303,17 +313,23 @@ type clientState struct {
 	aliasLimit          atomic.Bool
 	maxWaiters          int
 	slots               *resourceBudget
+	// reclaim frees slots other buckets no longer need, and reports whether one is free now.
+	reclaim func() bool
 }
 
 func newClientState(identity identity, globalLimit uint, maxWaiters int, slots *resourceBudget) *clientState {
+	if globalLimit == 0 {
+		globalLimit = discordGlobalLimit
+	}
 	state := &clientState{
-		buckets:    make(map[uint64]*bucketState),
-		aliases:    make(map[uint64]uint64),
-		identity:   identity,
-		global:     newPacer(globalLimit, maxWaiters),
-		validation: newFIFOGate(maxWaiters),
-		maxWaiters: maxWaiters,
-		slots:      slots,
+		buckets:     make(map[uint64]*bucketState),
+		aliases:     make(map[uint64]uint64),
+		identity:    identity,
+		global:      newPacer(globalLimit, maxWaiters),
+		globalLimit: globalLimit,
+		validation:  newFIFOGate(maxWaiters),
+		maxWaiters:  maxWaiters,
+		slots:       slots,
 	}
 	if identity.kind == authNone {
 		state.validity.Store(clientValid)
@@ -376,8 +392,18 @@ func (s *clientState) bucket(routeHash uint64) (*bucketState, error) {
 	return bucket, nil
 }
 
-func (s *clientState) acquireBucket(ctx context.Context, routeHash uint64) (*bucketState, error) {
+// bucketUnderPressure is bucket, with a second try once the slots of unused buckets have been
+// freed: the limit refuses a request only when that many buckets are really in use.
+func (s *clientState) bucketUnderPressure(routeHash uint64) (*bucketState, error) {
 	bucket, err := s.bucket(routeHash)
+	if errors.Is(err, errBucketStateLimit) && s.reclaim != nil && s.reclaim() {
+		return s.bucket(routeHash)
+	}
+	return bucket, err
+}
+
+func (s *clientState) acquireBucket(ctx context.Context, routeHash uint64) (*bucketState, error) {
+	bucket, err := s.bucketUnderPressure(routeHash)
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +411,7 @@ func (s *clientState) acquireBucket(ctx context.Context, routeHash uint64) (*buc
 		return nil, err
 	}
 	for {
-		target, err := s.bucket(routeHash)
+		target, err := s.bucketUnderPressure(routeHash)
 		if err != nil {
 			bucket.release()
 			return nil, err
@@ -424,10 +450,12 @@ func (s *clientState) learnBucket(routeHash uint64, discordBucket, majorKey stri
 		removals++
 	}
 	if net := additions - removals; net > 0 && !s.slots.reserve(int64(net)) {
-		if s.aliasLimit.CompareAndSwap(false, true) {
+		warn := s.aliasLimit.CompareAndSwap(false, true)
+		s.mu.Unlock()
+		if warn {
+			// Logged after the unlock: a slow log must not hold up this client's other requests.
 			logger.Warn("Rate-limit state capacity prevented shared-bucket alias learning")
 		}
-		s.mu.Unlock()
 		return current
 	}
 	if target != current {
@@ -447,12 +475,13 @@ func (s *clientState) learnBucket(routeHash uint64, discordBucket, majorKey stri
 	return target
 }
 
-func (s *clientState) sweep(now time.Time) {
+// sweep drops the buckets that have been idle for longer than quiet, and the aliases to them.
+func (s *clientState) sweep(now time.Time, quiet time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	released := int64(0)
 	for hash, bucket := range s.buckets {
-		if !bucket.idle(now) {
+		if !bucket.idle(now, quiet) {
 			continue
 		}
 		delete(s.buckets, hash)
@@ -465,7 +494,8 @@ func (s *clientState) sweep(now time.Time) {
 		}
 	}
 	s.slots.release(released)
-	if released > 0 {
+	// Only the periodic sweep lets the alias warning come again: a reclaim can run every second.
+	if released > 0 && quiet > 0 {
 		s.aliasLimit.Store(false)
 	}
 }
@@ -533,10 +563,34 @@ func (p *Proxy) client(identity identity) (*clientState, error) {
 			return nil, errTooManyClients
 		}
 		state = newClientState(identity, p.globalLimit(identity), p.config.MaxQueueDepth, p.bucketSlots)
+		state.reclaim = p.reclaimBuckets
 		states[identity.key] = state
 	}
 	state.begin()
 	return state, nil
+}
+
+// globalLimits reports the requests a second each client is paced at, by its metrics label.
+// Bots Discord has not accepted yet share a label, so they are left out.
+func (p *Proxy) globalLimits() map[string]uint {
+	p.clientsMu.Lock()
+	defer p.clientsMu.Unlock()
+	limits := make(map[string]uint, len(p.bots)+2)
+	record := func(state *clientState) {
+		if label := state.metricsLabel(); label != "Unverified" {
+			limits[label] = max(limits[label], state.globalLimit)
+		}
+	}
+	if p.noAuth != nil {
+		record(p.noAuth)
+	}
+	for _, state := range p.bots {
+		record(state)
+	}
+	for _, state := range p.bearers {
+		record(state)
+	}
+	return limits
 }
 
 func evictOldestIdle(now time.Time, groups ...map[[sha256.Size]byte]*clientState) bool {
@@ -575,6 +629,13 @@ func (p *Proxy) sweepClients(now time.Time) {
 			delete(p.bearers, key)
 		}
 	}
+	p.clientsMu.Unlock()
+	p.sweepBuckets(now, clientIdleTimeout)
+}
+
+// sweepBuckets drops, for every client, the buckets idle for longer than quiet.
+func (p *Proxy) sweepBuckets(now time.Time, quiet time.Duration) {
+	p.clientsMu.Lock()
 	states := make([]*clientState, 0, len(p.bots)+len(p.bearers)+1)
 	if p.noAuth != nil {
 		states = append(states, p.noAuth)
@@ -587,8 +648,19 @@ func (p *Proxy) sweepClients(now time.Time) {
 	}
 	p.clientsMu.Unlock()
 	for _, state := range states {
-		if state != nil {
-			state.sweep(now)
-		}
+		state.sweep(now, quiet)
 	}
+}
+
+// reclaimBuckets makes room when MAX_BUCKET_STATES is reached, by dropping every bucket nothing
+// uses, waits for or has to wait out, however lately it was used. Such a bucket holds nothing a
+// request needs: Discord's headers teach it again. It reports whether a slot is free now.
+func (p *Proxy) reclaimBuckets() bool {
+	p.reclaimMu.Lock()
+	defer p.reclaimMu.Unlock()
+	if now := time.Now(); now.Sub(p.reclaimedAt) >= bucketReclaimInterval {
+		p.reclaimedAt = now
+		p.sweepBuckets(now, 0)
+	}
+	return p.bucketSlots.used.Load() < p.bucketSlots.limit
 }

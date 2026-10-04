@@ -26,9 +26,12 @@ startup, until 2.0, so they can stay where they are for now.
 - `open_connections` counts requests in progress, not TCP connections.
 - `error` counts the errors Sluice logs, and a failed request is no longer one of them. Requests Sluice fails are
   counted in `failures_total`, by reason, so move an alert on `error` there.
-- New metrics: `queue_wait_seconds`, `failures_total`, `invalid_requests`, `cloudflare_blocked`,
+- New metrics: `queue_wait_seconds`, `failures_total`, `warnings_total`, `invalid_requests`,
+  `invalid_requests_limit`, `resource_usage`, `resource_limit`, `global_limit`, `build_info`, `cloudflare_blocked`,
   `cloudflare_blocks_total`, `edge_refusals_total`, `webhook_short_circuits_total` and
   `deprecated_api_requests_total`.
+- Alert rules for these metrics, written for the `sluice_` prefix, are in
+  [`prometheus/alerts.yml`](prometheus/alerts.yml).
 
 ### Health checks
 
@@ -83,8 +86,8 @@ startup, until 2.0, so they can stay where they are for now.
 ### Shutdown
 
 On `SIGTERM`, Sluice drains: liveness fails, the node leaves its cluster, the listeners close, and requests already
-accepted get up to 15 seconds to finish. Whatever is left then gets `503` with `Retry-After: 1`, and a second signal
-stops Sluice at once. Allow your process manager at least 20 seconds.
+accepted get up to 15 seconds to finish. Whatever is left then gets `503` with `Retry-After: 1`, and a second signal,
+a second or more after the first, stops Sluice at once. Allow your process manager at least 20 seconds.
 
 ### Logs
 

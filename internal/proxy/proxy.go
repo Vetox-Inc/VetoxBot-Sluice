@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -117,6 +118,10 @@ type Proxy struct {
 	bucketSlots     *resourceBudget
 	inFlight        *resourceBudget
 	retryCapture    *resourceBudget
+	failures        *failureLog
+
+	reclaimMu   sync.Mutex
+	reclaimedAt time.Time
 
 	// backgroundMu orders goroutines started for requests before Close waits for them.
 	backgroundMu    sync.Mutex
@@ -175,59 +180,98 @@ func (b *resourceBudget) release(size int64) {
 	}
 }
 
-func New(config Config) (*Proxy, error) {
-	if config.UpstreamTimeout <= 0 {
-		return nil, fmt.Errorf("upstream timeout must be positive")
+// resourceUse is how much of what one MAX_ setting bounds is in use.
+type resourceUse struct {
+	name        string
+	used, limit int64
+}
+
+// resources reports the bounded resources, each named after its setting without the MAX_.
+func (p *Proxy) resources() []resourceUse {
+	p.clientsMu.Lock()
+	bearers := int64(len(p.bearers))
+	clients := int64(len(p.bots)) + bearers
+	p.clientsMu.Unlock()
+	return []resourceUse{
+		{"client_states", clients, int64(p.config.MaxClientStates)},
+		{"bearer_count", bearers, int64(p.config.MaxBearerClients)},
+		{"bucket_states", p.bucketSlots.used.Load(), p.bucketSlots.limit},
+		{"in_flight_requests", p.inFlight.used.Load(), p.inFlight.limit},
+		{"retry_capture_bytes", p.retryCapture.used.Load(), p.retryCapture.limit},
 	}
-	if config.QueueTimeout <= 0 {
-		return nil, fmt.Errorf("queue timeout must be positive")
+}
+
+// prepared is what New takes from a Config once it has checked it.
+type prepared struct {
+	invalidLimit  int
+	overrides     map[string]uint
+	botWideRoutes map[string]bool
+	transport     http.RoundTripper
+	discordURL    *url.URL
+}
+
+// Validate reports the mistake New would refuse c for, without starting a proxy.
+func (c Config) Validate() error {
+	_, err := c.prepare()
+	return err
+}
+
+func (c Config) prepare() (prepared, error) {
+	if c.UpstreamTimeout <= 0 {
+		return prepared{}, fmt.Errorf("upstream timeout must be positive")
 	}
-	if config.MaxBearerClients <= 0 {
-		return nil, fmt.Errorf("max bearer clients must be positive")
+	if c.QueueTimeout <= 0 {
+		return prepared{}, fmt.Errorf("queue timeout must be positive")
 	}
-	if config.MaxBucketStates <= 0 {
-		return nil, fmt.Errorf("max bucket states must be positive")
+	if c.MaxBearerClients <= 0 {
+		return prepared{}, fmt.Errorf("max bearer clients must be positive")
 	}
-	if config.MaxClientStates <= 0 {
-		return nil, fmt.Errorf("max client states must be positive")
+	if c.MaxBucketStates <= 0 {
+		return prepared{}, fmt.Errorf("max bucket states must be positive")
 	}
-	if config.MaxInFlightRequests <= 0 {
-		return nil, fmt.Errorf("max in-flight requests must be positive")
+	if c.MaxClientStates <= 0 {
+		return prepared{}, fmt.Errorf("max client states must be positive")
 	}
-	if config.MaxQueueDepth <= 0 {
-		return nil, fmt.Errorf("max queue depth must be positive")
+	if c.MaxInFlightRequests <= 0 {
+		return prepared{}, fmt.Errorf("max in-flight requests must be positive")
 	}
-	if config.MaxRetryBodyBytes < 0 {
-		return nil, fmt.Errorf("max retry body bytes cannot be negative")
+	if c.MaxQueueDepth <= 0 {
+		return prepared{}, fmt.Errorf("max queue depth must be positive")
 	}
-	if config.MaxRetryCaptureBytes < 0 {
-		return nil, fmt.Errorf("max retry capture bytes cannot be negative")
+	if c.MaxRetryBodyBytes < 0 {
+		return prepared{}, fmt.Errorf("max retry body bytes cannot be negative")
 	}
-	if config.InvalidRequestLimit < 0 {
-		return nil, fmt.Errorf("invalid request limit cannot be negative")
+	if c.MaxRetryCaptureBytes < 0 {
+		return prepared{}, fmt.Errorf("max retry capture bytes cannot be negative")
 	}
-	invalidLimit := config.InvalidRequestLimit
-	if invalidLimit == 0 {
-		invalidLimit = InvalidRequestSafetyLimit
+	if c.InvalidRequestLimit < 0 {
+		return prepared{}, fmt.Errorf("invalid request limit cannot be negative")
+	}
+	ready := prepared{invalidLimit: c.InvalidRequestLimit, transport: c.Transport}
+	if ready.invalidLimit == 0 {
+		ready.invalidLimit = InvalidRequestSafetyLimit
 	}
 
-	overrides, err := parseGlobalOverrides(config.GlobalOverrides)
-	if err != nil {
-		return nil, err
+	var err error
+	if ready.overrides, err = parseGlobalOverrides(c.GlobalOverrides); err != nil {
+		return prepared{}, err
 	}
-	botWideRoutes, err := parseBotWideRoutes(config.BotWideRoutes)
-	if err != nil {
-		return nil, err
+	if ready.botWideRoutes, err = parseBotWideRoutes(c.BotWideRoutes); err != nil {
+		return prepared{}, err
 	}
-	transport := config.Transport
-	if transport == nil {
-		transport, err = newHTTPTransport(config.OutboundIP, config.DisableHTTP2)
-		if err != nil {
-			return nil, err
+	if ready.transport == nil {
+		if ready.transport, err = newHTTPTransport(c.OutboundIP, c.DisableHTTP2); err != nil {
+			return prepared{}, err
 		}
 	}
+	if ready.discordURL, err = ParseDiscordURL(c.DiscordURL); err != nil {
+		return prepared{}, err
+	}
+	return ready, nil
+}
 
-	discordURL, err := ParseDiscordURL(config.DiscordURL)
+func New(config Config) (*Proxy, error) {
+	ready, err := config.prepare()
 	if err != nil {
 		return nil, err
 	}
@@ -238,23 +282,26 @@ func New(config Config) (*Proxy, error) {
 		cancel:          cancel,
 		bots:            make(map[[sha256.Size]byte]*clientState),
 		bearers:         make(map[[sha256.Size]byte]*clientState),
-		globalOverrides: overrides,
-		botWideRoutes:   botWideRoutes,
-		invalidRequests: newInvalidRequestGuard(invalidLimit, invalidRequestWindow),
+		globalOverrides: ready.overrides,
+		botWideRoutes:   ready.botWideRoutes,
+		invalidRequests: newInvalidRequestGuard(ready.invalidLimit, invalidRequestWindow),
 		webhooks:        newWebhookGuard(),
 		cloudflare:      &cloudflareGuard{},
 		applications:    newApplicationSet(),
 		bucketSlots:     newResourceBudget(int64(config.MaxBucketStates)),
 		inFlight:        newResourceBudget(int64(config.MaxInFlightRequests)),
 		retryCapture:    newResourceBudget(config.MaxRetryCaptureBytes),
-		transport:       transport,
-		discordURL:      discordURL,
+		failures:        newFailureLog(),
+		transport:       ready.transport,
+		discordURL:      ready.discordURL,
 		closeDone:       make(chan struct{}),
 	}
 	p.noAuth = newClientState(identity{kind: authNone, label: "NoAuth"}, discordGlobalLimit, config.MaxQueueDepth, p.bucketSlots)
+	p.noAuth.reclaim = p.reclaimBuckets
 	p.initReverseProxies()
 	p.wg.Add(1)
 	go p.sweepLoop()
+	go p.failureLogLoop()
 	if config.StateFile != "" {
 		p.loadState()
 		p.wg.Add(1)
@@ -309,7 +356,7 @@ func (p *Proxy) PublicHandler() http.Handler {
 		collapseSlashes(request.URL)
 		got := sha256.Sum256([]byte(request.Header.Get(clientAuthHeader)))
 		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 && !isHealthPath(request.URL.Path) {
-			ProxyFailures.WithLabelValues("client_auth").Inc()
+			p.fail("client_auth", request, nil)
 			// 403, not 401: discord.js discards its bot token on a 401.
 			writeProxyError(writer, "Sluice client authentication failed", http.StatusForbidden)
 			return
@@ -361,29 +408,35 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	select {
 	case <-p.ctx.Done():
+		p.fail("shutting_down", request, nil)
 		writeUnavailable(writer, "proxy is shutting down")
 		return
 	default:
 	}
 	if !p.inFlight.reserve(1) {
+		p.fail("in_flight_limit", request, nil)
 		writeUnavailable(writer, "in-flight request capacity exhausted")
 		return
 	}
 	defer p.inFlight.release(1)
 	if strings.HasPrefix(request.URL.Path, "/sluice/") || strings.HasPrefix(request.URL.Path, "/nirn/") {
+		p.fail("unknown_endpoint", request, nil)
 		writeProxyError(writer, "unknown proxy endpoint", http.StatusNotFound)
 		return
 	}
 	if request.Method == http.MethodConnect || isUpgradeRequest(request) {
+		p.fail("bad_request", request, nil)
 		writeProxyError(writer, "protocol upgrades are not supported", http.StatusBadRequest)
 		return
 	}
 	if !isCleanDiscordPath(request.URL) {
+		p.fail("bad_request", request, nil)
 		writeProxyError(writer, "path contains dot segments or encoded separators", http.StatusBadRequest)
 		return
 	}
 	ensureAPIPrefix(request.URL)
 	if p.clusterOverCapacity.Load() {
+		p.fail("cluster_over_capacity", request, nil)
 		writeUnavailable(writer, "cluster exceeds CLUSTER_MAX_NODES")
 		return
 	}
@@ -439,7 +492,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	credentialScoped := !interaction && webhookKey == ""
 	if identity.unsupported && credentialScoped {
 		// Discord rejects every other scheme with a 401 that counts against this IP.
-		ProxyFailures.WithLabelValues("unsupported_authorization").Inc()
+		p.fail("unsupported_authorization", request, nil)
 		writeResponse(writer, unauthorizedResponse(request))
 		return
 	}
@@ -451,6 +504,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	if target := p.calculateRoute(routingHash); target != "" {
 		if hop >= maxPeerHops {
+			p.fail("cluster_routing", request, nil)
 			writeUnavailable(writer, "cluster routing did not converge")
 			return
 		}
@@ -461,6 +515,11 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 	state, err := p.client(identity)
 	if err != nil {
+		reason := "client_limit"
+		if errors.Is(err, errProxyClosed) {
+			reason = "shutting_down"
+		}
+		p.fail(reason, request, nil)
 		writeUnavailable(writer, err.Error())
 		return
 	}
@@ -612,5 +671,6 @@ func (p *Proxy) finishClose() {
 			logger.Warn("Could not save STATE_FILE at shutdown", "error", err)
 		}
 	}
+	<-p.failures.stopped
 	close(p.closeDone)
 }

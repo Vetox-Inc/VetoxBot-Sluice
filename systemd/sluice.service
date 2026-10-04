@@ -1,0 +1,60 @@
+# Runs Sluice on a Linux host under systemd.
+#
+#   install -m 0755 sluice /usr/local/bin/sluice
+#   install -D -m 0644 systemd/sluice.service /etc/systemd/system/sluice.service
+#   install -d /etc/sluice && touch /etc/sluice/config.env && chmod 0640 /etc/sluice/config.env
+#   systemctl daemon-reload && systemctl enable --now sluice
+#
+# The settings go in /etc/sluice/config.env, one NAME=value per line: see CONFIG.md. After a
+# change, check them before the restart takes the running proxy down. The check runs as an
+# unprivileged user, as the service does, so a file the service could not read fails here too:
+#   systemd-run --quiet --wait --pipe -p DynamicUser=yes \
+#     --setenv=STATE_FILE=/var/lib/sluice/state.json \
+#     -p EnvironmentFile=/etc/sluice/config.env /usr/local/bin/sluice --check
+
+[Unit]
+Description=Sluice, a rate-limit proxy for Discord's REST API
+Documentation=https://github.com/Vetox-Inc/VetoxBot-Sluice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sluice
+# What protects the IP from Discord's bans is kept here across restarts. A line in the settings
+# file overrides it.
+Environment=STATE_FILE=%S/sluice/state.json
+EnvironmentFile=-/etc/sluice/config.env
+StateDirectory=sluice
+Restart=always
+RestartSec=5
+# A stop lets the requests in flight finish for up to 15 seconds.
+TimeoutStopSec=20
+LimitNOFILE=65536
+
+# Sluice needs the network and its state directory, and nothing else of the host. A PORT below
+# 1024 also needs CAP_NET_BIND_SERVICE, in AmbientCapabilities and in CapabilityBoundingSet.
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

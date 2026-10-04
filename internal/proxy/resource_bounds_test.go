@@ -213,7 +213,7 @@ func TestBucketStateCapIsSharedAndReleasesOnSweep(t *testing.T) {
 
 	old := time.Now().Add(-clientIdleTimeout - time.Minute)
 	first.lastUsed.Store(old.UnixNano())
-	proxy.noAuth.sweep(time.Now())
+	proxy.noAuth.sweep(time.Now(), clientIdleTimeout)
 	if got := proxy.bucketSlots.used.Load(); got != 0 {
 		t.Fatalf("bucket slots after sweep = %d, want 0", got)
 	}
@@ -260,7 +260,7 @@ func TestSweepReclaimsLargeBucketAndAliasSet(t *testing.T) {
 	}
 	state.mu.Unlock()
 
-	state.sweep(now)
+	state.sweep(now, clientIdleTimeout)
 	state.mu.RLock()
 	buckets, aliases := len(state.buckets), len(state.aliases)
 	state.mu.RUnlock()

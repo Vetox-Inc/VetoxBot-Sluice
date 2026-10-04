@@ -1,0 +1,155 @@
+# Alert rules for Sluice, to load into Prometheus.
+#
+# They assume the default metric prefix: with METRICS_NAMESPACE set, replace "sluice_" with it. The
+# thresholds are starting points for one busy bot; tune them to your traffic. They read the metrics
+# of the release they come with: an older Sluice lacks some, and SluiceDown would then never clear.
+#
+# alerts.test.yml feeds every rule the failure it is for and an ordinary day, and CI runs it:
+#   promtool test rules prometheus/alerts.test.yml
+
+groups:
+  - name: sluice
+    rules:
+      # No Sluice is being scraped at all. With more than one node, alert on each target instead:
+      # up{job="<your scrape job>"} == 0.
+      - alert: SluiceDown
+        expr: absent(sluice_build_info)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'No Sluice is answering its metrics endpoint'
+          description: 'Bots that send their Discord requests through Sluice cannot reach Discord while it is down.'
+
+      # A process manager brings a crashed Sluice back, and with it empty queues and unlearned limits.
+      # build_info is read over the same half hour, because between two crashes no scrape finds it.
+      - alert: SluiceRestarting
+        expr: changes(process_start_time_seconds[30m]) > 2 and on (instance, job) last_over_time(sluice_build_info[30m])
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Sluice keeps restarting'
+          description: '{{ $labels.instance }} started {{ $value | printf "%.0f" }} times in 30 minutes; its log says why.'
+
+      # A request Sluice fails is counted and not logged at error level, so this is the signal:
+      # 502 when Discord could not be reached, 408 when an attempt ran past REQUEST_TIMEOUT, and
+      # a response that broke off after its status.
+      - alert: SluiceUpstreamFailing
+        expr: sum(increase(sluice_failures_total{reason=~"upstream_error|upstream_timeout|deadline|response_aborted"}[10m])) > 50
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Sluice is not getting answers from Discord'
+          description: '{{ $value | printf "%.0f" }} requests in 10 minutes failed before Discord answered.'
+
+      # A limit of Sluice's own, or the invalid-request budget, is used up and requests get a 503.
+      - alert: SluiceRefusingRequests
+        expr: sum by (reason) (increase(sluice_failures_total{reason=~".+_limit|invalid_request_budget"}[10m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Sluice is refusing requests: {{ $labels.reason }}'
+          description: '{{ $value | printf "%.0f" }} requests in 10 minutes were answered 503. CONFIG.md names the setting behind each reason.'
+
+      # Ahead of the rule above: a table that fills up refuses requests once it is full.
+      - alert: SluiceResourceNearLimit
+        expr: sluice_resource_usage / (sluice_resource_limit > 0) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Sluice uses over 80% of {{ $labels.resource }}'
+          description: 'Its setting is MAX_ followed by that name in capitals: raise it, or find what fills it.'
+
+      # A request that did not get its turn within QUEUE_TIMEOUT, or found its queue full, got a
+      # 429 from Sluice and was retried by its client. Sustained, a bucket or a bot's global limit
+      # is congested.
+      - alert: SluiceQueueCongested
+        expr: sum(increase(sluice_failures_total{reason=~"queue_timeout|queue_full"}[10m])) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Requests wait longer than QUEUE_TIMEOUT in Sluice'
+          description: '{{ $value | printf "%.0f" }} requests in 10 minutes missed their turn; see queue-wait p95 by route.'
+
+      # A bot that sends at four fifths of its global limit has little room left for a burst.
+      # Interaction callbacks are left out: Discord does not count them. So are Bearer, NoAuth and
+      # Other, which stand for many clients or for requests Sluice does not pace.
+      - alert: SluiceBotNearGlobalLimit
+        expr: |
+          sum by (clientId) (rate(sluice_requests_count{clientId=~"[0-9]+", route!="/interactions/!/!/callback"}[5m]))
+            / max by (clientId) (sluice_global_limit{clientId=~"[0-9]+"}) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Bot {{ $labels.clientId }} is close to its global rate limit'
+          description: 'It sends at {{ $value | humanizePercentage }} of its limit. Send less, or set BOT_RATELIMIT_OVERRIDES if Discord raised the limit.'
+
+      # Discord rejected a bot's token, and Sluice answers that bot 401 itself to protect the IP.
+      - alert: SluiceTokenRejected
+        expr: sum(increase(sluice_failures_total{reason="invalid_token"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'A bot keeps using a token Discord rejected'
+          description: '{{ $value | printf "%.0f" }} requests in 10 minutes were answered 401 by Sluice; its log gives the ID in the token.'
+
+      # Discord bans an IP for an hour at 10,000 invalid responses (401, 403 and 429 that is not
+      # shared-scope) in 10 minutes. Sluice stops sending at 9,500 on its own, and each node of a
+      # cluster at its share of that, which is why use is read against the node's own limit.
+      - alert: SluiceInvalidRequestsHigh
+        expr: sluice_invalid_requests / sluice_invalid_requests_limit >= 0.5
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Half of the invalid-request budget is used'
+          description: '{{ $labels.instance }} has used {{ $value | humanizePercentage }} of it in the last 10 minutes; find the route that draws the 401s, 403s and 429s.'
+
+      - alert: SluiceInvalidRequestsCritical
+        expr: sluice_invalid_requests / sluice_invalid_requests_limit >= 0.85
+        labels:
+          severity: critical
+        annotations:
+          summary: 'The invalid-request budget is nearly used up'
+          description: '{{ $labels.instance }} has used {{ $value | humanizePercentage }} of it; once it is gone Sluice refuses every request.'
+
+      - alert: SluiceCloudflareBlocked
+        expr: max(sluice_cloudflare_blocked) == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Discord's edge blocks this IP"
+          description: 'Sluice has paused all traffic until the block ends. A restart does not lift it.'
+
+      # A 429 or 403 without Via came from Discord's edge, not from Discord. Sluice checks with a
+      # request of its own whether the whole IP is blocked; if it is not, only the refused route
+      # backs off, and this is the only signal.
+      - alert: SluiceEdgeRefusals
+        expr: sum(increase(sluice_edge_refusals_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Discord's edge is refusing requests"
+          description: "{{ $value | printf \"%.0f\" }} responses in 10 minutes came from Discord's edge instead of Discord."
+
+      # More than one response in twenty takes over a second. This is Discord's time, not Sluice's.
+      - alert: SluiceSlowResponses
+        expr: histogram_quantile(0.95, sum by (le) (rate(sluice_requests_bucket[5m]))) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Discord answers slowly through Sluice'
+          description: 'The 95th percentile of response time is {{ $value | printf "%.2f" }} s.'
+
+      # Whatever Sluice warns about is in its log and nowhere else. Route this somewhere quiet.
+      - alert: SluiceLoggedWarnings
+        expr: sum(increase(sluice_warnings_total[15m])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: 'Sluice logged warnings'
+          description: '{{ $value | printf "%.0f" }} warnings in 15 minutes; read its log.'

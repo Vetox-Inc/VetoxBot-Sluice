@@ -5,8 +5,11 @@ one. A single node runs with nothing set. A cluster needs its secret and certifi
 [Cluster](#cluster).
 
 A value Sluice cannot use stops it at startup with an error that names the setting, and so does a port it cannot
-bind: it never starts half-configured. Times are whole milliseconds, sizes are bytes, and switches are `true` or
-`false`. `sluice --help` prints every name on this page.
+bind: it never starts half-configured. A value it can use that is probably a mistake, such as a timeout of 30
+milliseconds, gets a warning in the log instead. Times are whole milliseconds, sizes are bytes, and switches are
+`true` or `false`. `sluice --help` prints every name on this page, and `sluice --check` reads the settings as a start
+would and exits with status 0 when they are valid. It opens no port, looks up no `CLUSTER_DNS` and joins no cluster,
+so a port that is taken or an address that cannot be bound still shows only at the start.
 
 - [Listening](#listening)
 - [Reaching Discord](#reaching-discord)
@@ -232,6 +235,14 @@ and a bot token already marked invalid does not block them.
 
 Turn the lock off, with `true`, only when a token Discord has rejected can start working again as it is. Sluice
 forgets what it knew about a token once the token has been idle, with no cooldown in force, for more than 10 minutes.
+A request Sluice answers itself counts as use, so a bot that keeps calling with a rejected token stays locked until it
+has been quiet for those 10 minutes or Sluice restarts. Sluice warns in its log while it answers for a locked token,
+and counts those answers as `invalid_token` in `sluice_failures_total`.
+
+With the lock off, a `401` leaves the token unjudged: it proves nothing either way. Until Discord accepts one of its
+requests, Sluice sends that token's requests one at a time, as it does for a token it has not seen before, so a token
+Discord keeps rejecting cannot spend the invalid-request budget in bursts. The requests that wait behind may get a
+`429` once `QUEUE_TIMEOUT` has passed.
 
 ### `CLOUDFLARE_BAN_DETECTION`
 
@@ -262,9 +273,11 @@ renamed with `.invalid` at the end rather than overwritten. A saved block is not
 `CLOUDFLARE_BAN_DETECTION` is `false`.
 
 The default is `sluice/state-<PORT>.json` in the user's cache directory, which is `~/.cache` on Linux and
-`%LocalAppData%` on Windows. An empty value keeps the state in memory only. Two instances that use the same port on
-different addresses of one host need a file each. A container loses the default file when it is recreated, so mount a
-volume and point `STATE_FILE` at it, for example `/state/sluice.json` on a volume that user 65532 can write.
+`%LocalAppData%` on Windows. An empty value keeps the state in memory only, and so does a process without a cache
+directory, such as a service started with no `HOME`: Sluice then says so in a warning at startup. Two instances that
+use the same port on different addresses of one host need a file each. A container loses the default file when it is
+recreated, so mount a volume and point `STATE_FILE` at it, for example `/state/sluice.json` on a volume that user
+65532 can write.
 
 ## Memory bounds
 
@@ -291,7 +304,9 @@ token gets `503`.
 ### `MAX_BUCKET_STATES`
 
 How many buckets Sluice tracks, counting both the provisional bucket a route starts in and the names Discord then
-gives them. Idle buckets are cleared out periodically. At the limit, a request that needs a new bucket gets `503`.
+gives them. Buckets idle for 10 minutes are cleared out periodically. At the limit, Sluice first drops every bucket
+that nothing uses, waits for or has to wait out, however lately it was used, and a request that needs a new bucket
+gets `503` only when that leaves no room. It clears them out this way at most once a second.
 
 If the limit is reached just as Discord names a bucket, Sluice keeps the route in its provisional bucket, cooldown
 included. Until there is room again, two routes that Discord counts as one bucket are queued apart.
@@ -338,10 +353,55 @@ The histogram counts Discord's responses, one for every attempt that got as far 
 ended in a 429 and was retried is counted too, and an attempt that failed before any headers is not. It is therefore
 not a count of the requests clients sent.
 
-`sluice_failures_total` counts the requests Sluice answered with an error of its own, by `reason`: `queue_timeout`,
-`queue_full`, `rate_limit_deadline`, `upstream_timeout`, `upstream_error`, `deadline`, `peer_error`, `client_auth` and
-`unsupported_authorization`. Sluice does not log a request it fails, so this is the counter to alert on.
-`sluice_error` counts only the errors Sluice logs, which a failed request is not.
+`sluice_failures_total` counts, by `reason`, every request Sluice answered with an error of its own and every one
+whose client left before its answer was complete. Every reason is exported from the start, at 0, so that its first
+failure already shows as an increase. Two answers of Sluice's own are left out: a health check's, and the repeat of
+Discord's answer for a webhook that is gone, which `sluice_webhook_short_circuits_total` counts.
+
+These are faults and exhausted limits, the ones to alert on. Sluice also logs a warning for each, with the route and
+the cause, at most once every 30 seconds for a reason; a warning then says how many it left out.
+
+| Reason | Answer | When |
+| --- | --- | --- |
+| `upstream_error` | `502` | Discord could not be reached |
+| `upstream_timeout` | `408` | An attempt went `REQUEST_TIMEOUT` without progress, or lasted 10 minutes |
+| `deadline` | `408` | A timeout of the network ended an attempt first, such as the 30 seconds a connection may take to open |
+| `response_aborted` | cut short | Discord's response ended before its body did, after its status was passed on |
+| `invalid_request_budget` | `503` | The invalid-request budget is used up |
+| `in_flight_limit` | `503` | `MAX_IN_FLIGHT_REQUESTS` is reached |
+| `client_limit` | `503` | `MAX_CLIENT_STATES` or `MAX_BEARER_COUNT` is reached and no client is idle |
+| `bucket_limit` | `503` | `MAX_BUCKET_STATES` is reached and every bucket is in use or cooling down |
+| `retry_capture_limit` | `503` | `MAX_RETRY_CAPTURE_BYTES` is reached |
+| `retry_preparation` | `503` | The copy of a body kept for a retry could not be read back |
+| `invalid_token` | `401` | Discord rejected the token earlier; see `DISABLE_401_LOCK` |
+| `peer_error` | `503` | A cluster peer could not be reached |
+
+These are answers a client retries or expects, and are only counted:
+
+| Reason | Answer | When |
+| --- | --- | --- |
+| `queue_timeout` | `429` | A request did not get its turn within `QUEUE_TIMEOUT` |
+| `queue_full` | `429` | A queue already held `MAX_QUEUE_DEPTH` requests |
+| `rate_limit_deadline` | `429` | A cooldown outlasts the request's deadline, so it is told at once |
+| `cloudflare_pause` | `429` | A Cloudflare block has paused traffic |
+| `unsupported_authorization` | `401` | The `Authorization` scheme is one Discord never accepts |
+| `client_auth` | `403` | The request did not carry `CLIENT_AUTH_SECRET` |
+| `bad_request` | `400` | A protocol upgrade, or a path Sluice refuses |
+| `unknown_endpoint` | `404` | A reserved path that Sluice does not serve |
+| `client_closed` | none | The client left before its answer was complete |
+| `shutting_down` | `503` | Sluice was stopping; an answer already on its way is cut short |
+| `cluster_routing` | `503` | Cluster nodes did not agree on which of them owns the request |
+| `cluster_over_capacity` | `503` | The cluster has more nodes than `CLUSTER_MAX_NODES` |
+
+`sluice_error` counts only error-level log lines, which a failed request is not. `sluice_warnings_total` counts
+warnings, these included: when it moves, the log says what needs attention.
+
+`sluice_resource_usage` and `sluice_resource_limit` show how much of each limit in
+[Memory bounds](#memory-bounds) and of `MAX_IN_FLIGHT_REQUESTS` and `MAX_RETRY_CAPTURE_BYTES` is in use. Their
+`resource` label is the setting's name without `MAX_`, in lower case, such as `bucket_states`. `sluice_global_limit`
+gives the requests a second each `clientId` is paced at, so its request rate can be read against it.
+`sluice_invalid_requests_limit` is the count at which this node stops sending, to read `sluice_invalid_requests`
+against: 9,500, or a node's share of it in a cluster.
 
 `sluice_deprecated_api_requests_total` counts requests by the API `version` they name when that version is `v8` or
 older, and as `none` when they name no version, which Discord serves as v6. Sluice also logs each such version the
@@ -376,10 +436,14 @@ The proxy port answers two health checks, which do not count against `MAX_IN_FLI
 - **`/sluice/health/upstream`** says whether Discord is accepting this IP. It answers `503` during a Cloudflare block
   and once 80% of the invalid-request budget is used. Alert on it. Do not restart on it: a restart cures neither.
 
-On `SIGTERM` or `SIGINT` Sluice drains. `/sluice/healthz` turns to `503`, the node leaves its cluster, which may take
-up to 5 seconds, the listeners close, and the requests already accepted get up to 15 seconds in all to finish.
-Whatever is left then gets `503`, and a second signal stops Sluice immediately. Allow your process manager at least 20
-seconds, for instance `--stop-timeout 20` in Docker or `kill_timeout: 20000` in PM2.
+On `SIGTERM` or `SIGINT` Sluice drains, and on `SIGHUP` too unless it was started to ignore that signal, as `nohup`
+does. The npm launcher passes a hangup on either way, so `nohup` does not keep Sluice running there.
+`/sluice/healthz` turns to `503`, the node leaves its cluster, which may take up to 5 seconds, the listeners close,
+and the requests already accepted get up to 15 seconds in all to finish. Whatever is left then gets `503`. A second
+signal stops Sluice immediately when it comes a second or more after the first; one that follows sooner is the same
+stop arriving twice, as it does when a process manager signals a whole process group and a launcher passes the signal
+on. Allow your process manager at least 20 seconds, for instance `--stop-timeout 20` in Docker, `kill_timeout: 20000`
+in PM2 or `TimeoutStopSec=20` in systemd.
 
 ## Cluster
 

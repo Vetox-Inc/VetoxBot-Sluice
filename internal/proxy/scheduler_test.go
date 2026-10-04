@@ -424,7 +424,7 @@ func TestBlockedBucketAndPacerCannotBeEvicted(t *testing.T) {
 		proxy.bearers[identified.key] = state
 		proxy.clientsMu.Unlock()
 
-		if bucket.idle(now) {
+		if bucket.idle(now, clientIdleTimeout) {
 			t.Fatal("blocked bucket reported idle")
 		}
 		proxy.sweepClients(now)

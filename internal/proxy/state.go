@@ -128,7 +128,7 @@ func (p *Proxy) stateLoop() {
 	ticker := time.NewTicker(stateSaveInterval)
 	defer ticker.Stop()
 	saved := p.stateRevision()
-	lastError := ""
+	failing := false
 	for {
 		select {
 		case <-ticker.C:
@@ -137,13 +137,19 @@ func (p *Proxy) stateLoop() {
 				continue
 			}
 			if err := p.saveState(); err != nil {
-				if err.Error() != lastError {
-					lastError = err.Error()
-					logger.Warn("Could not save STATE_FILE", "file", p.config.StateFile, "error", err)
+				// Said once, when saving starts to fail: every try names a new temporary file, so
+				// no two errors read the same.
+				if !failing {
+					failing = true
+					logger.Warn("Could not save STATE_FILE; trying again every few seconds", "file", p.config.StateFile, "error", err)
 				}
 				continue
 			}
-			saved, lastError = revision, ""
+			if failing {
+				failing = false
+				logger.Info("Saving STATE_FILE works again", "file", p.config.StateFile)
+			}
+			saved = revision
 		case <-p.ctx.Done():
 			return
 		}

@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -66,6 +67,44 @@ func TestGetOptimisticBucketPath(t *testing.T) {
 				t.Fatalf("GetOptimisticBucketPath() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestMisplacedTokenNeverReachesABucketPath(t *testing.T) {
+	webhookToken := strings.Repeat("t", 68)
+	for path, want := range map[string]string{
+		// A client that swaps the ID and the token.
+		"/api/v10/webhooks/" + webhookToken + "/203039963636301824":              "/webhooks/!/!",
+		"/api/v10/webhooks/short-secret":                                         "/webhooks/!",
+		"/api/v10/webhooks/short-secret/203039963636301824/messages/@original":   "/webhooks/!/!/messages/@original",
+		"/api/v10/interactions/short-secret/203039963636301824/callback":         "/interactions/!/!/callback",
+		"/api/v10/interactions/short-secret/203039963636301824":                  "/interactions/!/!",
+		"/api/v10/channels/" + webhookToken + "/messages":                        "/channels/!/messages",
+		"/api/v10/users/" + webhookToken:                                         "/users/!",
+		"/api/v10/applications/" + webhookToken + "/commands":                    "/applications/!/commands",
+		"/api/v10/webhooks/203039963636301824/" + webhookToken + "/" + "slack":   "/webhooks/203039963636301824/!/slack",
+		"/api/v10/interactions/203039963636301824/" + webhookToken + "/callback": "/interactions/203039963636301824/!/callback",
+	} {
+		got := GetOptimisticBucketPath(path, http.MethodPost)
+		if got != want {
+			t.Errorf("GetOptimisticBucketPath(%q) = %q, want %q", path, got, want)
+		}
+		if label := MetricsPathFromBucket(got); strings.Contains(label, "secret") || strings.Contains(label, webhookToken) {
+			t.Errorf("the metric label for %q keeps the token: %q", path, label)
+		}
+	}
+}
+
+func TestPathThatIsNotUTF8IsWarnedAboutOnce(t *testing.T) {
+	output := captureLog(t)
+	nonUTF8PathWarned.Store(false)
+	for range 3 {
+		if got := MetricsPathFromBucket("/x/\xff"); got != "/x/@" {
+			t.Fatalf("MetricsPathFromBucket() = %q, want /x/@", got)
+		}
+	}
+	if warnings := strings.Count(output.String(), "not valid UTF-8"); warnings != 1 {
+		t.Fatalf("three such paths logged %d warnings, want 1:\n%s", warnings, output.String())
 	}
 }
 

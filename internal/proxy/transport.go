@@ -52,6 +52,17 @@ type cleanupBody struct {
 	io.ReadCloser
 	once    sync.Once
 	cleanup func()
+	// aborted, when set, is told once of the error that ended the body before its end.
+	aborted   func(error)
+	abortOnce sync.Once
+}
+
+func (b *cleanupBody) Read(target []byte) (int, error) {
+	read, err := b.ReadCloser.Read(target)
+	if err != nil && err != io.EOF && b.aborted != nil {
+		b.abortOnce.Do(func() { b.aborted(err) })
+	}
+	return read, err
 }
 
 func (b *cleanupBody) Close() error {
@@ -195,6 +206,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		return response, nil
 	}
 	if pause := t.proxy.cloudflare.retryAfter(queuedAt); pause > 0 {
+		t.proxy.fail("cloudflare_pause", request, nil)
 		return cloudflarePauseResponse(request, pause), nil
 	}
 	// Check before joining any rate-limit queue; reserve again immediately before
@@ -224,16 +236,25 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	}
 	// A request that never got its turn has not reached Discord, so a 429 lets its client retry
 	// it safely instead of failing it.
+	// The wait is recorded once: when the request is sent, or when Sluice answers it after the wait.
+	waitObserved := !t.proxy.config.EnableMetrics
+	observeWait := func() {
+		if !waitObserved {
+			waitObserved = true
+			QueueWaitHistogram.WithLabelValues(metadata.metricsMethod, metadata.metricsPath).Observe(time.Since(queuedAt).Seconds())
+		}
+	}
 	missedTurn := func(err error, current *bucketState, global bool) (*http.Response, error) {
 		err = contextCauseOrError(queueContext, err)
 		switch {
 		case errors.Is(err, errQueueDeadline):
-			ProxyFailures.WithLabelValues("queue_timeout").Inc()
+			t.proxy.fail("queue_timeout", request, nil)
 		case errors.Is(err, errQueueFull):
-			ProxyFailures.WithLabelValues("queue_full").Inc()
+			t.proxy.fail("queue_full", request, nil)
 		default:
 			return nil, err
 		}
+		observeWait()
 		delay := time.Second
 		if current != nil {
 			if known, knownGlobal := knownRateLimit(current); known > delay {
@@ -278,6 +299,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	}()
 
 	if metadata.credentialScoped && metadata.state.validity.Load() == clientInvalid {
+		t.proxy.fail("invalid_token", request, nil)
 		return unauthorizedResponse(request), nil
 	}
 
@@ -288,7 +310,8 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	defer replay.close()
 	for attempt := 0; ; attempt++ {
 		if delay, global := knownRateLimit(bucket); retryWouldExceedDeadline(queueContext, delay) {
-			ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+			t.proxy.fail("rate_limit_deadline", request, nil)
+			observeWait()
 			return rememberedRateLimitResponse(request, delay, global), nil
 		}
 		if delay, err := bucket.wait(queueContext); err != nil {
@@ -299,22 +322,27 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 				delay = currentDelay
 				global = currentGlobal
 			}
-			ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+			t.proxy.fail("rate_limit_deadline", request, nil)
+			observeWait()
 			return rememberedRateLimitResponse(request, delay, global), nil
 		}
 		if !metadata.interaction {
 			if delay, err := metadata.state.global.waitFor(queueContext); err != nil {
 				return missedTurn(err, bucket, true)
 			} else if delay > 0 {
-				ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+				t.proxy.fail("rate_limit_deadline", request, nil)
+				observeWait()
 				return rememberedRateLimitResponse(request, delay, true), nil
 			}
 		}
 
 		if response := shortCircuitWebhook(time.Now()); response != nil {
+			observeWait()
 			return response, nil
 		}
 		if pause := t.proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
+			t.proxy.fail("cloudflare_pause", request, nil)
+			observeWait()
 			return cloudflarePauseResponse(request, pause), nil
 		}
 		body, err := replay.body(attempt)
@@ -333,13 +361,8 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			endAttempt()
 			return nil, errInvalidRequestBudget
 		}
-		var started time.Time
-		if t.proxy.config.EnableMetrics {
-			started = time.Now()
-			if attempt == 0 {
-				QueueWaitHistogram.WithLabelValues(metadata.metricsMethod, metadata.metricsPath).Observe(started.Sub(queuedAt).Seconds())
-			}
-		}
+		observeWait()
+		started := time.Now()
 		response, err := t.base.RoundTrip(outbound)
 		if err != nil {
 			t.proxy.invalidRequests.complete(time.Now(), false)
@@ -397,8 +420,11 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			switch {
 			case edgeRefused || response.StatusCode >= http.StatusInternalServerError:
 				// Neither shows whether Discord accepts the credential, so the next request asks again.
-			case response.StatusCode == http.StatusUnauthorized && !t.proxy.config.Disable401Lock:
-				metadata.state.validity.Store(clientInvalid)
+			case response.StatusCode == http.StatusUnauthorized:
+				// A 401 never proves a credential: without the lock it stays unjudged.
+				if !t.proxy.config.Disable401Lock {
+					metadata.state.validity.Store(clientInvalid)
+				}
 			default:
 				metadata.state.validity.Store(clientValid)
 			}
@@ -421,14 +447,23 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 			RequestHistogram.WithLabelValues(metadata.metricsMethod, status, metadata.metricsPath, metadata.state.metricsLabel()).Observe(time.Since(started).Seconds())
 		}
-		if response.StatusCode != http.StatusTooManyRequests || edgeRefused {
+		// deliver hands Discord's response to the client. Its status has left by the time its body
+		// can fail, so a body that ends early can only be counted.
+		deliver := func() (*http.Response, error) {
 			releaseBucket()
-			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
-				endAttempt()
-				cancelQueue()
-			}}
+			response.Body = &cleanupBody{
+				ReadCloser: response.Body,
+				cleanup: func() {
+					endAttempt()
+					cancelQueue()
+				},
+				aborted: func(err error) { t.proxy.responseAborted(request, contextCauseOrError(attemptContext, err)) },
+			}
 			queueCleanupPending = false
 			return response, nil
+		}
+		if response.StatusCode != http.StatusTooManyRequests || edgeRefused {
+			return deliver()
 		}
 		retryable, prepareErr := replay.prepareRetry()
 		if prepareErr != nil {
@@ -444,18 +479,12 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		if retryable {
 			delay, _ := knownRateLimit(observedBucket)
 			if retryWouldExceedDeadline(queueContext, max(delay, resourceDelay)) {
-				ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+				t.proxy.fail("rate_limit_deadline", request, nil)
 				retryable = false
 			}
 		}
 		if !retryable {
-			releaseBucket()
-			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
-				endAttempt()
-				cancelQueue()
-			}}
-			queueCleanupPending = false
-			return response, nil
+			return deliver()
 		}
 
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, retryDrainLimit))
@@ -809,25 +838,33 @@ func (p *Proxy) initReverseProxies() {
 		Transport:  &scheduledTransport{base: p.transport, proxy: p},
 		BufferPool: buffers,
 		ErrorLog:   errorLog,
-		ErrorHandler: func(writer http.ResponseWriter, _ *http.Request, err error) {
+		ErrorHandler: func(writer http.ResponseWriter, request *http.Request, err error) {
 			switch {
 			case errors.Is(err, context.Canceled):
-				select {
-				case <-p.ctx.Done():
-					writeUnavailable(writer, "proxy is shutting down")
-				default:
-					return
-				}
+				p.answerCanceled(writer, request)
 			case errors.Is(err, errUpstreamDeadline):
-				ProxyFailures.WithLabelValues("upstream_timeout").Inc()
+				p.fail("upstream_timeout", request, nil)
 				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
 			case errors.Is(err, context.DeadlineExceeded):
-				ProxyFailures.WithLabelValues("deadline").Inc()
+				p.fail("deadline", request, nil)
 				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
-			case errors.Is(err, errTooManyClients), errors.Is(err, errBucketStateLimit), errors.Is(err, errInvalidRequestBudget), errors.Is(err, errRetryCaptureBudget), errors.Is(err, errRetryPreparation):
+			case errors.Is(err, errTooManyClients):
+				p.fail("client_limit", request, nil)
+				writeUnavailable(writer, err.Error())
+			case errors.Is(err, errBucketStateLimit):
+				p.fail("bucket_limit", request, nil)
+				writeUnavailable(writer, err.Error())
+			case errors.Is(err, errInvalidRequestBudget):
+				p.fail("invalid_request_budget", request, nil)
+				writeUnavailable(writer, err.Error())
+			case errors.Is(err, errRetryCaptureBudget):
+				p.fail("retry_capture_limit", request, nil)
+				writeUnavailable(writer, err.Error())
+			case errors.Is(err, errRetryPreparation):
+				p.fail("retry_preparation", request, err)
 				writeUnavailable(writer, err.Error())
 			default:
-				ProxyFailures.WithLabelValues("upstream_error").Inc()
+				p.fail("upstream_error", request, err)
 				writeProxyError(writer, "Discord upstream unavailable", http.StatusBadGateway)
 			}
 		},
@@ -848,13 +885,29 @@ func (p *Proxy) initReverseProxies() {
 			}
 			return nil
 		},
-		ErrorHandler: func(writer http.ResponseWriter, _ *http.Request, err error) {
+		ErrorHandler: func(writer http.ResponseWriter, request *http.Request, err error) {
+			if errors.Is(err, context.Canceled) {
+				p.answerCanceled(writer, request)
+				return
+			}
 			if p.config.EnableMetrics {
 				RequestsRoutedError.Inc()
 			}
-			ProxyFailures.WithLabelValues("peer_error").Inc()
+			p.fail("peer_error", request, err)
 			writeUnavailable(writer, "cluster peer unavailable")
 		},
+	}
+}
+
+// answerCanceled ends a request whose context was canceled: a shutdown gets its 503, and a
+// client that left gets nothing, because nobody is there to read it.
+func (p *Proxy) answerCanceled(writer http.ResponseWriter, request *http.Request) {
+	select {
+	case <-p.ctx.Done():
+		p.fail("shutting_down", request, nil)
+		writeUnavailable(writer, "proxy is shutting down")
+	default:
+		p.fail("client_closed", request, nil)
 	}
 }
 

@@ -665,7 +665,6 @@ func TestRequestCompletionDoesNotDependOnDebugOutput(t *testing.T) {
 
 func TestTimeoutResponseDoesNotDependOnLogOutput(t *testing.T) {
 	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
 	previousLogger := logger
 	SetLogger(NewLogger(blockingLogWriter{release: release}, slog.LevelInfo, "text"))
 	t.Cleanup(func() { logger = previousLogger })
@@ -676,6 +675,9 @@ func TestTimeoutResponseDoesNotDependOnLogOutput(t *testing.T) {
 	}))
 	config.UpstreamTimeout = 20 * time.Millisecond
 	proxy := newTestProxy(t, config)
+	// The timeout's warning is stuck in the log by now. Closing the proxy waits for it, so the
+	// log is released first: cleanups run last in, first out.
+	t.Cleanup(func() { close(release) })
 	response := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {

@@ -79,13 +79,15 @@ Waits are bounded. `MAX_QUEUE_DEPTH` caps the requests waiting in one queue, and
 everything Sluice has accepted. `QUEUE_TIMEOUT` bounds how long a request waits for its turn. A request that cannot
 get it in time, or finds its queue full, gets a `429` with `Retry-After`: it never reached Discord, so clients retry it
 safely. `REQUEST_TIMEOUT` bounds how long an attempt may go without progress, so an upload that keeps moving is not cut
-short; no attempt lasts more than 10 minutes. A request whose client disconnects leaves its queue at once.
+short; no attempt lasts more than 10 minutes. A request without a body leaves its queue at once when its client
+disconnects. One with a body is found out only when its turn comes, and may still reach Discord.
 
 ### Retries
 
 When Discord answers 429, Sluice retries the request itself if it can send the body again: when there is none, or when
-it kept a copy of the whole body while sending it, up to `MAX_RETRY_BODY_BYTES`. A retry goes back through the queue
-and must start within `QUEUE_TIMEOUT`. If the cooldown outlasts `QUEUE_TIMEOUT`, Sluice returns the 429 straight away,
+it kept a copy of the whole body while sending it, up to `MAX_RETRY_BODY_BYTES`. A retry goes to the back of its
+queue, behind the requests already waiting there, and must start within `QUEUE_TIMEOUT`. If the cooldown outlasts
+`QUEUE_TIMEOUT`, Sluice returns the 429 straight away,
 with `Retry-After`. A body it cannot send again gets Discord's original 429, never a partial or altered retry. No other
 status is retried.
 
@@ -157,7 +159,9 @@ for a single node, and `sluice --help` lists them all. The ones most deployments
 | `STATE_FILE` | a file in the user cache directory | Where protection state survives restarts |
 | `LOG_LEVEL`, `LOG_FORMAT` | `info`, `text` | Log verbosity; `json` for structured logs |
 
-[CONFIG.md](CONFIG.md) documents every setting with its range and default.
+[CONFIG.md](CONFIG.md) documents every setting with its range and default. `sluice --check` reads the settings as a
+start would, and exits without opening a port: with 0 when they are valid, and with the reason when they are not. Run
+it before a restart takes the running proxy down.
 
 ## Metrics
 
@@ -167,11 +171,16 @@ default. Their names start with `sluice_`, or with whatever `METRICS_NAMESPACE` 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
 | `sluice_requests` | `method`, `status`, `route`, `clientId` | Histogram of Discord responses, one per attempt |
-| `sluice_queue_wait_seconds` | `method`, `route` | Wait for the bucket and global limit before the first attempt |
+| `sluice_queue_wait_seconds` | `method`, `route` | Wait for the bucket and global limit, until a request is sent or Sluice answers it |
 | `sluice_open_connections` | `method`, `route` | Requests being handled now, not TCP sockets |
-| `sluice_failures_total` | `reason` | Requests Sluice failed itself; alert on this one, as they are not logged |
+| `sluice_failures_total` | `reason` | Requests Sluice answered with an error of its own, or whose client left |
 | `sluice_error` | none | Errors logged, which a failed request is not |
+| `sluice_warnings_total` | none | Warnings logged |
+| `sluice_resource_usage`, `sluice_resource_limit` | `resource` | Clients, bearer tokens, buckets, requests in flight and retry copies: in use, and their `MAX_` limit |
+| `sluice_global_limit` | `clientId` | Requests a second a client is paced at |
+| `sluice_build_info` | `version`, `goversion` | 1, labelled with the running version |
 | `sluice_invalid_requests` | none | Invalid responses in the rolling 10 minutes |
+| `sluice_invalid_requests_limit` | none | The count at which this node stops sending |
 | `sluice_cloudflare_blocked` | none | 1 while a Cloudflare block pauses traffic |
 | `sluice_cloudflare_blocks_total` | none | Cloudflare blocks confirmed |
 | `sluice_edge_refusals_total` | none | Responses from Discord's edge rather than Discord |
@@ -185,6 +194,11 @@ Route labels are normalised and capped, so cardinality stays bounded.
 [grafana/sluice-dashboard.json](grafana/sluice-dashboard.json) is an importable Grafana dashboard; its Metric prefix
 box takes the value of `METRICS_NAMESPACE`.
 
+Sluice does not log a request it fails: it counts it in `sluice_failures_total`, and warns at most once every 30
+seconds about the reasons that need someone's attention. [CONFIG.md](CONFIG.md#enable_metrics) lists the reasons.
+[prometheus/alerts.yml](prometheus/alerts.yml) holds alert rules for Prometheus, each tested against the failure it is
+for.
+
 With `ENABLE_PPROF=true`, profiles are served at `/debug/pprof/` on `PPROF_PORT`. Never expose that port publicly.
 
 ## Health and shutdown
@@ -196,8 +210,12 @@ The proxy port serves two health endpoints:
 - `/sluice/health/upstream` answers `503` while a Cloudflare block is active or at least 80% of the invalid-request
   budget is used. Alert on it; do not restart on it.
 
-On `SIGTERM`, Sluice drains: liveness fails, the node leaves its cluster, and requests already accepted get up to 15
-seconds to finish; a second signal stops it at once. Give your process manager at least 20 seconds to stop it.
+On `SIGTERM`, an interrupt or a hangup, Sluice drains: liveness fails, the node leaves its cluster, and requests
+already accepted get up to 15 seconds to finish. A second signal a second or more after the first stops it at once;
+one that follows sooner is taken for the same stop arriving twice, as it does when a process manager signals a whole
+process group. Give your process manager at least 20 seconds to stop it.
+[systemd/sluice.service](systemd/sluice.service) is a unit that runs Sluice on a Linux host with nothing but the
+network and its state directory.
 
 ## Clusters
 

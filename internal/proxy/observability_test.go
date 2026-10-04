@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -45,6 +46,19 @@ func TestLoggerRedactsCredentialsEverywhere(t *testing.T) {
 	}
 }
 
+func TestRedactionKeepsRouteLabelsReadable(t *testing.T) {
+	for value, want := range map[string]string{
+		"/webhooks/!/!":                         "/webhooks/!/!",
+		"/interactions/!/!/callback":            "/interactions/!/!/callback",
+		"/webhooks/123/!starts-with-the-mark":   "/webhooks/123/:token",
+		"/webhooks/123/path-secret/messages/45": "/webhooks/123/:token/messages/45",
+	} {
+		if got := redactLogSecrets(value); got != want {
+			t.Errorf("redactLogSecrets(%q) = %q, want %q", value, got, want)
+		}
+	}
+}
+
 func TestErrorLogsIncrementErrorCounter(t *testing.T) {
 	before := testutil.ToFloat64(ErrorCounter)
 	testLogger := NewLogger(&bytes.Buffer{}, slog.LevelInfo, "text")
@@ -56,16 +70,22 @@ func TestErrorLogsIncrementErrorCounter(t *testing.T) {
 	}
 }
 
+// metricSuffixes names every metric of Sluice's own, without its namespace.
+var metricSuffixes = []string{
+	"build_info", "cloudflare_blocked", "cloudflare_blocks_total", "deprecated_api_requests_total", "edge_refusals_total",
+	"error", "failures_total", "global_limit", "invalid_requests", "invalid_requests_limit", "open_connections", "queue_wait_seconds",
+	"requests",
+	"requests_routed_error", "requests_routed_received", "requests_routed_sent", "resource_limit", "resource_usage",
+	"warnings_total", "webhook_short_circuits_total",
+}
+
 func TestMetricsNamespaceNamesEveryMetric(t *testing.T) {
-	suffixes := []string{
-		"cloudflare_blocked", "cloudflare_blocks_total", "deprecated_api_requests_total", "edge_refusals_total", "error",
-		"failures_total", "invalid_requests", "open_connections", "queue_wait_seconds", "requests", "requests_routed_error",
-		"requests_routed_received", "requests_routed_sent", "webhook_short_circuits_total",
-	}
+	// The resource gauges read the running proxy.
+	newTestProxy(t, testConfig(nil))
 	for _, namespace := range []string{"nirn_proxy", DefaultMetricsNamespace} {
 		t.Run(namespace, func(t *testing.T) {
 			var want []string
-			for _, suffix := range suffixes {
+			for _, suffix := range metricSuffixes {
 				want = append(want, namespace+"_"+suffix)
 			}
 			set := newMetricSet(namespace)
@@ -174,5 +194,76 @@ func TestDisabledMetricsSkipRouteLabelCollection(t *testing.T) {
 	metricsRoutes.mu.Unlock()
 	if labels != 1 {
 		t.Fatalf("disabled metrics retained %d route labels, want only overflow sentinel", labels)
+	}
+}
+
+// gaugesByLabel gathers one gauge family and maps the value of label to each gauge's value.
+func gaugesByLabel(t *testing.T, name, label string) map[string]float64 {
+	t.Helper()
+	families, err := metricsRegistry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string]float64)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, pair := range metric.GetLabel() {
+				if pair.GetName() == label {
+					values[pair.GetValue()] = metric.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return values
+}
+
+func TestResourceUseIsExportedBesideItsLimit(t *testing.T) {
+	arrived, release := make(chan struct{}, 1), make(chan struct{})
+	config := testConfig(holdUpstream(arrived, release))
+	proxy := newTestProxy(t, config)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serve(proxy, http.MethodGet, "/api/v10/channels/111111111111111111/messages", "Bot "+fakeBotToken, nil)
+	}()
+	awaitSignal(t, arrived, "the request to reach the upstream")
+
+	usage := gaugesByLabel(t, "sluice_resource_usage", "resource")
+	limits := gaugesByLabel(t, "sluice_resource_limit", "resource")
+	for resource, want := range map[string][2]float64{
+		"client_states":       {1, float64(config.MaxClientStates)},
+		"bearer_count":        {0, float64(config.MaxBearerClients)},
+		"bucket_states":       {1, float64(config.MaxBucketStates)},
+		"in_flight_requests":  {1, float64(config.MaxInFlightRequests)},
+		"retry_capture_bytes": {0, float64(config.MaxRetryCaptureBytes)},
+	} {
+		if got, exported := usage[resource]; !exported || got != want[0] {
+			t.Errorf("usage of %s = %v (exported: %t), want %v", resource, got, exported, want[0])
+		}
+		if got, exported := limits[resource]; !exported || got != want[1] {
+			t.Errorf("limit of %s = %v (exported: %t), want %v", resource, got, exported, want[1])
+		}
+	}
+	if len(usage) != 5 || len(limits) != 5 {
+		t.Errorf("exported %d usages and %d limits, want 5 of each: %v %v", len(usage), len(limits), usage, limits)
+	}
+
+	close(release)
+	awaitSignal(t, done, "the held request to finish")
+	if got := gaugesByLabel(t, "sluice_resource_usage", "resource")["in_flight_requests"]; got != 0 {
+		t.Errorf("in-flight requests after the request finished = %v, want 0", got)
+	}
+}
+
+func TestBuildInfoNamesTheVersion(t *testing.T) {
+	versions := gaugesByLabel(t, "sluice_build_info", "version")
+	if len(versions) != 1 || versions[Version] != 1 {
+		t.Fatalf("build_info by version = %v, want one gauge of 1 for %q", versions, Version)
+	}
+	if runtimes := gaugesByLabel(t, "sluice_build_info", "goversion"); runtimes[runtime.Version()] != 1 {
+		t.Fatalf("build_info by goversion = %v, want %q", runtimes, runtime.Version())
 	}
 }

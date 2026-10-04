@@ -23,7 +23,16 @@ archives:
     format_overrides:
       - { goos: windows, formats: [zip] }
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
-    files: [LICENSE, README.md, CONFIG.md, MIGRATING.md, CHANGELOG.md]
+    # What an operator needs beside the binary, under the same checksum.
+    files:
+      - LICENSE
+      - README.md
+      - CONFIG.md
+      - MIGRATING.md
+      - CHANGELOG.md
+      - systemd/sluice.service
+      - prometheus/alerts.yml
+      - grafana/sluice-dashboard.json
 
 checksum:
   name_template: checksums.txt

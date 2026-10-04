@@ -32,6 +32,11 @@ func FuzzBucketPathsNeverCarryWebhookTokens(f *testing.F) {
 			if len(label) < 4 || label[3] != "!" && label[3] != "Unknown" {
 				t.Fatalf("metric label %q keeps an identifier where the token was", strings.Join(label, "/"))
 			}
+			// A client that swaps the two sends the token where the ID belongs.
+			swapped := strings.Split(GetOptimisticBucketPath("/api/v10/"+major+"/"+token+"/123456789012345678", method), "/")
+			if len(swapped) < 3 || swapped[2] != "!" {
+				t.Fatalf("bucket %q keeps the %s token %q sent as the ID", strings.Join(swapped, "/"), major, token)
+			}
 		}
 	})
 }
