@@ -169,8 +169,8 @@ default. Their names start with `sluice_`, or with whatever `METRICS_NAMESPACE` 
 | `sluice_requests` | `method`, `status`, `route`, `clientId` | Histogram of Discord responses, one per attempt |
 | `sluice_queue_wait_seconds` | `method`, `route` | Wait for the bucket and global limit before the first attempt |
 | `sluice_open_connections` | `method`, `route` | Requests being handled now, not TCP sockets |
-| `sluice_failures_total` | `reason` | Requests Sluice failed itself |
-| `sluice_error` | none | Errors logged |
+| `sluice_failures_total` | `reason` | Requests Sluice failed itself; alert on this one, as they are not logged |
+| `sluice_error` | none | Errors logged, which a failed request is not |
 | `sluice_invalid_requests` | none | Invalid responses in the rolling 10 minutes |
 | `sluice_cloudflare_blocked` | none | 1 while a Cloudflare block pauses traffic |
 | `sluice_cloudflare_blocks_total` | none | Cloudflare blocks confirmed |

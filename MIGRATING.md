@@ -24,6 +24,8 @@ startup, until 2.0, so they can stay where they are for now.
 - The `clientId` label is the bot's user ID once Discord has accepted its token, and `Unverified` until then. It used
   to be the bot's `username#discriminator`.
 - `open_connections` counts requests in progress, not TCP connections.
+- `error` counts the errors Sluice logs, and a failed request is no longer one of them. Requests Sluice fails are
+  counted in `failures_total`, by reason, so move an alert on `error` there.
 - New metrics: `queue_wait_seconds`, `failures_total`, `invalid_requests`, `cloudflare_blocked`,
   `cloudflare_blocks_total`, `edge_refusals_total`, `webhook_short_circuits_total` and
   `deprecated_api_requests_total`.

@@ -340,9 +340,12 @@ not a count of the requests clients sent.
 
 `sluice_failures_total` counts the requests Sluice answered with an error of its own, by `reason`: `queue_timeout`,
 `queue_full`, `rate_limit_deadline`, `upstream_timeout`, `upstream_error`, `deadline`, `peer_error`, `client_auth` and
-`unsupported_authorization`. `sluice_deprecated_api_requests_total` counts requests by the API `version` they name when
-that version is `v8` or older, and as `none` when they name no version, which Discord serves as v6. Sluice also logs
-each such version the first time it sees it. The README's [metrics table](README.md#metrics) lists the rest.
+`unsupported_authorization`. Sluice does not log a request it fails, so this is the counter to alert on.
+`sluice_error` counts only the errors Sluice logs, which a failed request is not.
+
+`sluice_deprecated_api_requests_total` counts requests by the API `version` they name when that version is `v8` or
+older, and as `none` when they name no version, which Discord serves as v6. Sluice also logs each such version the
+first time it sees it. The README's [metrics table](README.md#metrics) lists the rest.
 
 ### `METRICS_PORT`
 
