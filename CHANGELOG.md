@@ -44,6 +44,8 @@ and [Semantic Versioning](https://semver.org/).
 - A stop signal that arrived twice within a second ended Sluice at once and cut off the requests in flight. It does
   when a process manager or a terminal signals a whole process group and a launcher, such as the npm one, passes the
   signal on. The two now count as one stop.
+- On Windows, the npm launcher ended Sluice at once on Ctrl+C. It now leaves the stop to Sluice, which finishes the
+  requests in flight.
 - With `DISABLE_401_LOCK=true`, a `401` from Discord counted as proof that the token was real, so the ID inside a
   rejected token could become a `clientId` in metrics. Such a token now stays `Unverified`.
 - A webhook or interaction token sent where the ID belongs, by a client that swapped the two, was kept in the route
