@@ -155,11 +155,15 @@ Set this to `true` only if credentials can become valid again without changing t
 
 When `true`, a 429 or 403 without Discord's `Via` header means Discord's edge answered rather than Discord. Sluice passes that response to the client without retrying it, backs that client's route off for the response's `Retry-After` (60 seconds when it is absent, at most an hour), and requests `/api/v10/gateway` itself, with its own User-Agent and no credential, while other traffic continues:
 
-- If the edge refuses that request too, this IP is blocked. Every outbound request from this node pauses for the `Retry-After`; requests during the pause get a synthetic 429 without `Via`, so clients back off as they would for the real block; and `/sluice/health/upstream` reports 503.
+- If the edge refuses that request too, this IP is blocked. Every outbound request from this node pauses for the `Retry-After`, at most 25 hours, since Discord's edge can block an IP for a day; requests during the pause get a synthetic 429 without `Via`, so clients back off as they would for the real block; and `/sluice/health/upstream` reports 503. While the pause lasts, Sluice probes again every `CLOUDFLARE_PROBE_INTERVAL`.
 - If Discord answers it, the edge refused only that client's requests, for example over its User-Agent, and nothing else pauses. Sluice checks again no sooner than 30 seconds later.
 - If it gets no answer at all, which proves nothing, only the refused route backs off, and the next refusal checks again.
 
 Set `false` if an egress proxy between Sluice and Discord strips `Via`. Default: `true`.
+
+### `CLOUDFLARE_PROBE_INTERVAL`
+
+While a Cloudflare block pauses outbound traffic, how often Sluice requests `/api/v10/gateway` itself, as it does to confirm a block, to learn whether the block still holds. An answer from Discord ends the pause early; a refusal re-arms it from that refusal's `Retry-After`, never shortening it; and no answer at all leaves it as it is. One probe runs at a time, and client requests stay paused throughout. `0` turns the probe off, so every pause lasts its whole `Retry-After`. Valid values: `0`, or 1,000 through 86,400,000 milliseconds. Default: `900000` (15 minutes).
 
 ### `STATE_FILE`
 

@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -224,6 +226,220 @@ func waitForEdgeProbe(t *testing.T, proxy *Proxy) {
 			t.Fatal("edge probe never settled")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// lockedBuffer collects log output written from background goroutines.
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(data)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+func captureLogs(t *testing.T) *lockedBuffer {
+	t.Helper()
+	output := new(lockedBuffer)
+	previous := logger
+	SetLogger(NewLogger(output, slog.LevelInfo, "text"))
+	t.Cleanup(func() { logger = previous })
+	return output
+}
+
+func waitUntil(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting until %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func edgeRefusal(request *http.Request, retryAfter string) *http.Response {
+	header := http.Header{}
+	if retryAfter != "" {
+		header.Set("Retry-After", retryAfter)
+	}
+	return testResponse(request, http.StatusTooManyRequests, header, io.NopCloser(strings.NewReader("error code: 1015")))
+}
+
+func TestLongEdgeRetryAfterPausesForItsWholeLength(t *testing.T) {
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return edgeRefusal(request, "81151"), nil
+	}))
+	config.CloudflareBanDetection = true
+	proxy := newTestProxy(t, config)
+	path := "/api/v10/channels/1/messages"
+
+	serve(proxy, http.MethodGet, path, "", nil)
+	waitForEdgeProbe(t, proxy)
+	want := 81151 * time.Second
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause <= want-time.Minute || pause > want {
+		t.Fatalf("a block with Retry-After 81151 paused traffic for %v, want about %v", pause, want)
+	}
+	bucket := mustBucket(t, proxy.noAuth, routeHash(http.MethodGet, GetOptimisticBucketPath(path, http.MethodGet), majorParameter(path)))
+	if backoff := bucket.retryAfter(time.Now()); backoff <= 0 || backoff > maxEdgeRouteBackoff {
+		t.Fatalf("the refused route backed off for %v, want at most %v", backoff, maxEdgeRouteBackoff)
+	}
+	if pause := cloudflarePause(testHeaders(map[string]string{"Retry-After": "999999"})); pause != maxCloudflarePause {
+		t.Fatalf("a 999999-second Retry-After paused for %v, want the %v bound", pause, maxCloudflarePause)
+	}
+}
+
+func TestLongPauseForwardsNoClientRequest(t *testing.T) {
+	var calls atomic.Int64
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return jsonResponse(request, http.StatusOK, `{}`), nil
+	}))
+	config.CloudflareBanDetection = true
+	proxy := newTestProxy(t, config)
+	// A day-long block confirmed two hours ago and restored after a restart: the old one-hour
+	// bound would have resumed traffic an hour ago.
+	now := time.Now()
+	proxy.cloudflare.restore(now.Add(22*time.Hour), now)
+
+	for _, path := range []string{"/api/v10/gateway", "/api/v10/channels/1/messages", followUpPath("203039963636301824", 1)} {
+		for range 10 {
+			paused := serve(proxy, http.MethodPost, path, "", nil)
+			retryAfter, _ := strconv.Atoi(paused.Header().Get("Retry-After"))
+			if paused.Code != http.StatusTooManyRequests || paused.Header().Get("Via") != "" || retryAfter < 21*3600 {
+				t.Fatalf("%s during the pause got %d %v", path, paused.Code, paused.Header())
+			}
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("%d client requests reached Discord during the pause, want none", calls.Load())
+	}
+	if health := serve(proxy, http.MethodGet, "/sluice/health/upstream", "", nil); health.Code != http.StatusServiceUnavailable {
+		t.Fatalf("upstream health during the pause = %d, want 503", health.Code)
+	}
+	if pause := proxy.cloudflare.retryAfter(now.Add(90 * time.Minute)); pause <= 0 {
+		t.Fatal("the pause had ended 90 minutes in, past the old one-hour bound")
+	}
+	if pause := proxy.cloudflare.retryAfter(now.Add(22 * time.Hour)); pause != 0 {
+		t.Fatalf("the pause outlived its Retry-After by %v", pause)
+	}
+}
+
+func TestPausedEdgeProbeEndsALiftedBlock(t *testing.T) {
+	output := captureLogs(t)
+	var probes, calls atomic.Int64
+	var lifted atomic.Bool
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/api/v10/gateway" && strings.HasPrefix(request.Header.Get("User-Agent"), "DiscordBot (") {
+			probes.Add(1)
+			if !lifted.Load() {
+				return edgeRefusal(request, "72000"), nil
+			}
+			return jsonResponse(request, http.StatusOK, `{}`), nil
+		}
+		calls.Add(1)
+		return jsonResponse(request, http.StatusOK, `{}`), nil
+	}))
+	config.CloudflareBanDetection = true
+	config.CloudflareProbeInterval = 20 * time.Millisecond
+	proxy := newTestProxy(t, config)
+	proxy.cloudflare.settle(time.Now(), edgeBlocked, 20*time.Hour)
+
+	waitUntil(t, "three probes ran", func() bool { return probes.Load() >= 3 })
+	if paused := serve(proxy, http.MethodGet, "/api/v10/channels/1/messages", "", nil); paused.Code != http.StatusTooManyRequests || calls.Load() != 0 {
+		t.Fatalf("a request while the edge still refused got %d after %d upstream calls", paused.Code, calls.Load())
+	}
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 19*time.Hour {
+		t.Fatalf("probes the edge refused left a pause of %v, want about 20h", pause)
+	}
+
+	lifted.Store(true)
+	waitUntil(t, "a probe ended the pause", func() bool { return proxy.cloudflare.retryAfter(time.Now()) == 0 })
+	if resumed := serve(proxy, http.MethodGet, "/api/v10/channels/1/messages", "", nil); resumed.Code != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("after the block lifted a request got %d after %d upstream calls, want 200 after 1", resumed.Code, calls.Load())
+	}
+	settled := probes.Load()
+	time.Sleep(100 * time.Millisecond)
+	if probes.Load() != settled {
+		t.Fatalf("the edge was probed %d more times with no pause in force", probes.Load()-settled)
+	}
+	logs := output.String()
+	if strings.Count(logs, "no longer blocks this IP") != 1 || !strings.Contains(logs, "still blocks this IP") {
+		t.Fatalf("probe warnings missing or repeated:\n%s", logs)
+	}
+}
+
+func TestPausedEdgeProbeRearmsWhileRefused(t *testing.T) {
+	output := captureLogs(t)
+	var answer atomic.Value
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch retryAfter := answer.Load().(string); retryAfter {
+		case "unreachable":
+			return nil, errors.New("dial tcp: connection refused")
+		default:
+			return edgeRefusal(request, retryAfter), nil
+		}
+	}))
+	config.CloudflareBanDetection = true
+	proxy := newTestProxy(t, config)
+	proxy.cloudflare.settle(time.Now(), edgeBlocked, 10*time.Minute)
+
+	answer.Store("7200")
+	proxy.probePausedEdge()
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 2*time.Hour-time.Minute || pause > 2*time.Hour {
+		t.Fatalf("a refusal with Retry-After 7200 re-armed the pause to %v, want about 2h", pause)
+	}
+	answer.Store("")
+	proxy.probePausedEdge()
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 2*time.Hour-time.Minute {
+		t.Fatalf("a refusal without Retry-After cut the pause to %v", pause)
+	}
+	answer.Store("unreachable")
+	proxy.probePausedEdge()
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 2*time.Hour-time.Minute {
+		t.Fatalf("a probe that got no answer changed the pause to %v", pause)
+	}
+	if warnings := strings.Count(output.String(), "still blocks this IP"); warnings != 2 {
+		t.Fatalf("logged %d re-arm warnings, want 2 for the two refusals:\n%s", warnings, output.String())
+	}
+}
+
+func TestEdgeIsNotProbedWithoutAPause(t *testing.T) {
+	var probes atomic.Int64
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/api/v10/gateway" {
+			probes.Add(1)
+		}
+		return jsonResponse(request, http.StatusOK, `{}`), nil
+	})
+	config := testConfig(transport)
+	config.CloudflareBanDetection = true
+	config.CloudflareProbeInterval = 5 * time.Millisecond
+	proxy := newTestProxy(t, config)
+	if response := serve(proxy, http.MethodGet, "/api/v10/channels/1/messages", "", nil); response.Code != http.StatusOK {
+		t.Fatalf("a request with no pause got %d", response.Code)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if probes.Load() != 0 {
+		t.Fatalf("the edge was probed %d times with no pause in force", probes.Load())
+	}
+
+	// With the probe off, a pause runs its course unprobed.
+	config.CloudflareProbeInterval = 0
+	unprobed := newTestProxy(t, config)
+	unprobed.cloudflare.settle(time.Now(), edgeBlocked, time.Hour)
+	time.Sleep(50 * time.Millisecond)
+	if probes.Load() != 0 || unprobed.cloudflare.retryAfter(time.Now()) <= 0 {
+		t.Fatalf("with CLOUDFLARE_PROBE_INTERVAL=0 the edge was probed %d times", probes.Load())
 	}
 }
 

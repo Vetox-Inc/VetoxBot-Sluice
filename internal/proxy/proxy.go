@@ -30,6 +30,9 @@ const (
 
 	// DefaultDiscordURL is where requests go unless Config.DiscordURL points elsewhere.
 	DefaultDiscordURL = "https://discord.com"
+	// DefaultCloudflareProbeInterval is how often Sluice asks Discord's edge, while a block
+	// pauses traffic, whether the block still holds.
+	DefaultCloudflareProbeInterval = 15 * time.Minute
 )
 
 // Config controls request scheduling, resource bounds, transport, and metrics.
@@ -51,6 +54,9 @@ type Config struct {
 	InvalidRequestLimit    int
 	DiscordURL             string
 	CloudflareBanDetection bool
+	// CloudflareProbeInterval is how often, while a Cloudflare block pauses traffic, Sluice probes
+	// the edge to end the pause early or re-arm it; 0 lets every pause run its whole Retry-After.
+	CloudflareProbeInterval time.Duration
 	// ClientAuthSecret, when set, must arrive in X-Sluice-Auth on every request to PublicHandler.
 	ClientAuthSecret string
 	// StateFile keeps the invalid-request, webhook and Cloudflare guards across restarts; "" keeps
@@ -209,6 +215,9 @@ func New(config Config) (*Proxy, error) {
 	if config.InvalidRequestLimit < 0 {
 		return nil, fmt.Errorf("invalid request limit cannot be negative")
 	}
+	if config.CloudflareProbeInterval < 0 {
+		return nil, fmt.Errorf("Cloudflare probe interval cannot be negative")
+	}
 	invalidLimit := config.InvalidRequestLimit
 	if invalidLimit == 0 {
 		invalidLimit = InvalidRequestSafetyLimit
@@ -263,6 +272,10 @@ func New(config Config) (*Proxy, error) {
 		p.loadState()
 		p.wg.Add(1)
 		go p.stateLoop()
+	}
+	if config.CloudflareBanDetection && config.CloudflareProbeInterval > 0 {
+		p.wg.Add(1)
+		go p.watchEdge(config.CloudflareProbeInterval)
 	}
 	activeProxy.Store(p)
 	return p, nil
