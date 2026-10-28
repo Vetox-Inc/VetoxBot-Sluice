@@ -351,3 +351,19 @@ func webhookCredentialKey(path string, interaction bool) string {
 	digest := sha256.Sum256([]byte(parts[1] + "/" + parts[2]))
 	return hex.EncodeToString(digest[:16])
 }
+
+// sharedResourceKey names, as closely as a path shows it, the resource a shared-scope 429 limits:
+// the method and route with every identifier collapsed, plus the channel, guild or webhook acted
+// on. Discord does not say which resource a shared limit covers, and a follow-up's path names its
+// application but no channel, so every follow-up of one application shares a key. Webhook and
+// interaction tokens are left out, which also keeps credentials out of the key.
+func sharedResourceKey(method, route, path string) string {
+	major := ""
+	if parts := cleanAPIPath(path); len(parts) >= 2 {
+		switch parts[0] {
+		case majorChannels, majorGuilds, majorWebhooks:
+			major = parts[0] + ":" + parts[1]
+		}
+	}
+	return method + " " + route + " " + major
+}

@@ -155,11 +155,15 @@ Set this to `true` only if credentials can become valid again without changing t
 
 When `true`, a 429 or 403 without Discord's `Via` header means Discord's edge answered rather than Discord. Sluice passes that response to the client without retrying it, backs that client's route off for the response's `Retry-After` (60 seconds when it is absent, at most an hour), and requests `/api/v10/gateway` itself, with its own User-Agent and no credential, while other traffic continues:
 
-- If the edge refuses that request too, this IP is blocked. Every outbound request from this node pauses for the `Retry-After`; requests during the pause get a synthetic 429 without `Via`, so clients back off as they would for the real block; and `/sluice/health/upstream` reports 503.
+- If the edge refuses that request too, this IP is blocked. Every outbound request from this node pauses for the `Retry-After`, at most 25 hours, since Discord's edge can block an IP for a day; requests during the pause get a synthetic 429 without `Via`, so clients back off as they would for the real block; and `/sluice/health/upstream` reports 503. While the pause lasts, Sluice probes again every `CLOUDFLARE_PROBE_INTERVAL`.
 - If Discord answers it, the edge refused only that client's requests, for example over its User-Agent, and nothing else pauses. Sluice checks again no sooner than 30 seconds later.
 - If it gets no answer at all, which proves nothing, only the refused route backs off, and the next refusal checks again.
 
 Set `false` if an egress proxy between Sluice and Discord strips `Via`. Default: `true`.
+
+### `CLOUDFLARE_PROBE_INTERVAL`
+
+While a Cloudflare block pauses outbound traffic, how often Sluice requests `/api/v10/gateway` itself, as it does to confirm a block, to learn whether the block still holds. An answer from Discord ends the pause early; a refusal re-arms it from that refusal's `Retry-After`, never shortening it; and no answer at all leaves it as it is. One probe runs at a time, and client requests stay paused throughout. `0` turns the probe off, so every pause lasts its whole `Retry-After`. Valid values: `0`, or 1,000 through 86,400,000 milliseconds. Default: `900000` (15 minutes).
 
 ### `STATE_FILE`
 
@@ -175,7 +179,7 @@ Enables Prometheus metrics and serves them on `/metrics`. When `false`, Sluice d
 
 `sluice_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its `status` label is the HTTP status, with `429 Shared` for a shared-scope 429 and `429 Edge` or `403 Edge` for a refusal by Discord's edge. Its `clientId` label is the bot's user ID once Discord has accepted that token, `Unverified` until then, and `Bearer` or `NoAuth` for other traffic; once the label has 1,024 values, further bots share `Other`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
 
-`sluice_failures_total{reason}` counts bounded proxy failure reasons: `queue_timeout`, `queue_full`, `rate_limit_deadline`, `upstream_timeout`, `upstream_error`, `deadline`, `peer_error`, `client_auth` and `unsupported_authorization`.
+`sluice_failures_total{reason}` counts bounded proxy failure reasons: `queue_timeout`, `queue_full`, `rate_limit_deadline`, `shared_rate_limit` (a shared-scope 429 from Discord, returned unretried), `shared_rate_limit_breaker` (a request answered locally while its resource is closed after a storm of shared-scope 429s), `upstream_timeout`, `upstream_error`, `deadline`, `peer_error`, `client_auth` and `unsupported_authorization`.
 
 `sluice_queue_wait_seconds{method,route}` measures how long requests waited for their bucket and the global limit before their first Discord attempt. `sluice_invalid_requests` is the current rolling 10-minute invalid-response count, `sluice_webhook_short_circuits_total` counts requests answered from the webhook fail-fast cache, `sluice_cloudflare_blocked` and `sluice_cloudflare_blocks_total` track confirmed Cloudflare blocks, and `sluice_edge_refusals_total` counts every response from Discord's edge rather than Discord. `sluice_deprecated_api_requests_total{version}` counts requests that name a deprecated or discontinued API version (`v8` or earlier) or none (`none`), which Discord serves as its deprecated default, v6; Sluice also logs each version the first time it sees it.
 

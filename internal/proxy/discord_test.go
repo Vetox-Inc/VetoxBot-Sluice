@@ -3,17 +3,22 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestSharedScopeRateLimitLeavesItsBucketOpen(t *testing.T) {
@@ -49,7 +54,9 @@ func TestSharedScopeRateLimitLeavesItsBucketOpen(t *testing.T) {
 	}
 }
 
-func TestSharedScopeRateLimitRetriesOnlyItsRequest(t *testing.T) {
+func TestSharedScopeRateLimitReachesItsClientUnretried(t *testing.T) {
+	// Even a cooldown that fits the queue deadline is the client's to wait out: retried here, the
+	// request would add to the shared 429s Discord's edge sees while the client has no say.
 	var calls atomic.Int64
 	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
@@ -61,10 +68,185 @@ func TestSharedScopeRateLimitRetriesOnlyItsRequest(t *testing.T) {
 	}))
 	config.QueueTimeout = 3 * config.UpstreamTimeout
 	proxy := newTestProxy(t, config)
-	started := time.Now()
-	response := serve(proxy, http.MethodPut, "/api/v10/channels/1/messages/2/reactions/x/@me", "", nil)
-	if elapsed := time.Since(started); response.Code != http.StatusNoContent || calls.Load() != 2 || elapsed < 50*time.Millisecond || elapsed > 900*time.Millisecond {
-		t.Fatalf("status %d after %d calls in %v, want 204 after one retry in about 50ms", response.Code, calls.Load(), elapsed)
+	before := testutil.ToFloat64(ProxyFailures.WithLabelValues("shared_rate_limit"))
+	path := "/api/v10/channels/1/messages/2/reactions/x/@me"
+
+	limited := serve(proxy, http.MethodPut, path, "", nil)
+	if limited.Code != http.StatusTooManyRequests || calls.Load() != 1 || limited.Header().Get("Retry-After") != "1" ||
+		limited.Header().Get("X-RateLimit-Scope") != "shared" || limited.Header().Get("Generated-By-Proxy") != "" ||
+		limited.Body.String() != `{"retry_after": 0.05, "global": false}` {
+		t.Fatalf("got %d %v %q after %d calls, want Discord's own shared 429 after one", limited.Code, limited.Header(), limited.Body.String(), calls.Load())
+	}
+	if got := testutil.ToFloat64(ProxyFailures.WithLabelValues("shared_rate_limit")) - before; got != 1 {
+		t.Fatalf("shared_rate_limit counted %v times, want 1", got)
+	}
+	if retried := serve(proxy, http.MethodPut, path, "", nil); retried.Code != http.StatusNoContent || calls.Load() != 2 {
+		t.Fatalf("the client's own retry got %d after %d calls; the shared 429 closed the bucket", retried.Code, calls.Load())
+	}
+}
+
+// interactionToken builds a token in the shape Discord gives an interaction: base64 of
+// "interaction:<id>:<secret>", which is how Sluice tells a follow-up from a webhook call.
+func interactionToken(id string) string {
+	return strings.TrimRight(base64.StdEncoding.EncodeToString([]byte("interaction:"+id+":"+strings.Repeat("s", 64))), "=")
+}
+
+func followUpPath(application string, interaction int) string {
+	return "/api/v10/webhooks/" + application + "/" + interactionToken(strconv.Itoa(1103049420930568322+interaction))
+}
+
+func sharedRateLimitResponse(request *http.Request) *http.Response {
+	return testResponse(request, http.StatusTooManyRequests, testHeaders(map[string]string{
+		"Via": "1.1 google", "Retry-After": "1", "X-RateLimit-Scope": "shared",
+	}), io.NopCloser(strings.NewReader(`{"message": "The resource is being rate limited.", "retry_after": 0.5, "global": false}`)))
+}
+
+func TestSharedRateLimitStormClosesItsResource(t *testing.T) {
+	var output bytes.Buffer
+	previous := logger
+	SetLogger(NewLogger(&output, slog.LevelInfo, "text"))
+	t.Cleanup(func() { logger = previous })
+	const application, otherApplication = "203039963636301824", "303039963636301824"
+	var calls, otherCalls, channelCalls atomic.Int64
+	proxy := newTestProxy(t, testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(request.URL.Path, "/webhooks/"+application+"/"):
+			calls.Add(1)
+			return sharedRateLimitResponse(request), nil
+		case strings.Contains(request.URL.Path, "/webhooks/"+otherApplication+"/"):
+			otherCalls.Add(1)
+		default:
+			channelCalls.Add(1)
+		}
+		return testResponse(request, http.StatusNoContent, discordVia.Clone(), nil), nil
+	})))
+	revision := proxy.stateRevision()
+
+	for interaction := range sharedLimitThreshold {
+		if response := serve(proxy, http.MethodPost, followUpPath(application, interaction), "", nil); response.Code != http.StatusTooManyRequests ||
+			response.Header().Get("Generated-By-Proxy") != "" {
+			t.Fatalf("follow-up %d got %d %v, want Discord's shared 429", interaction, response.Code, response.Header())
+		}
+	}
+	refused := testutil.ToFloat64(ProxyFailures.WithLabelValues("shared_rate_limit_breaker"))
+	for interaction := sharedLimitThreshold; interaction < sharedLimitThreshold+50; interaction++ {
+		response := serve(proxy, http.MethodPost, followUpPath(application, interaction), "", nil)
+		retryAfter, _ := strconv.Atoi(response.Header().Get("Retry-After"))
+		if response.Code != http.StatusTooManyRequests || response.Header().Get("Generated-By-Proxy") != "true" ||
+			response.Header().Get("Via") != sluiceVia || response.Header().Get("X-RateLimit-Scope") != "shared" ||
+			response.Header().Get("X-RateLimit-Remaining") != "" || retryAfter < 9 || retryAfter > int(minSharedLimitCooldown/time.Second) ||
+			!strings.Contains(response.Body.String(), `"retry_after": `) {
+			t.Fatalf("follow-up %d after the storm got %d %v %q, want a local shared 429", interaction, response.Code, response.Header(), response.Body.String())
+		}
+	}
+	if calls.Load() != sharedLimitThreshold {
+		t.Fatalf("Discord was called %d times for the storming application, want %d", calls.Load(), sharedLimitThreshold)
+	}
+	if got := testutil.ToFloat64(ProxyFailures.WithLabelValues("shared_rate_limit_breaker")) - refused; got != 50 {
+		t.Fatalf("shared_rate_limit_breaker counted %v refusals, want 50", got)
+	}
+	if warnings := strings.Count(output.String(), "answering its requests locally"); warnings != 1 || strings.Contains(output.String(), "aW50") {
+		t.Fatalf("logged %d closure warnings, want 1 and no token:\n%s", warnings, output.String())
+	}
+
+	if response := serve(proxy, http.MethodPost, followUpPath(otherApplication, 0), "", nil); response.Code != http.StatusNoContent || otherCalls.Load() != 1 {
+		t.Fatalf("another application's follow-up got %d after %d calls; the closure spread", response.Code, otherCalls.Load())
+	}
+	if response := serve(proxy, http.MethodPost, "/api/v10/channels/1/messages", "", nil); response.Code != http.StatusNoContent || channelCalls.Load() != 1 {
+		t.Fatalf("a channel message got %d after %d calls; the closure spread", response.Code, channelCalls.Load())
+	}
+	if proxy.stateRevision() != revision {
+		t.Fatal("a shared-limit closure reached STATE_FILE; it must stay in memory")
+	}
+}
+
+func TestSharedRateLimitStormReachesDiscordBoundedTimes(t *testing.T) {
+	var calls atomic.Int64
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		time.Sleep(time.Millisecond)
+		return sharedRateLimitResponse(request), nil
+	}))
+	config.MaxInFlightRequests = 256
+	proxy := newTestProxy(t, config)
+	// Clients that retry at once, as if each 429 were a new request: without the guard each of
+	// these requests reaches Discord.
+	const clients, requestsEach = 16, 50
+	var wg sync.WaitGroup
+	for client := range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for request := range requestsEach {
+				serve(proxy, http.MethodPost, followUpPath("203039963636301824", client*requestsEach+request), "", nil)
+			}
+		}()
+	}
+	wg.Wait()
+	// Requests already in flight when the resource closed may still reach Discord, at most one per client.
+	t.Logf("Discord was called %d times for %d requests", calls.Load(), clients*requestsEach)
+	if got := calls.Load(); got > sharedLimitThreshold+clients {
+		t.Fatalf("Discord was called %d times for %d requests, want at most %d", got, clients*requestsEach, sharedLimitThreshold+clients)
+	}
+}
+
+func TestSharedLimitGuardClosesOnlyForABurst(t *testing.T) {
+	guard := newSharedLimitGuard()
+	const key = "POST /webhooks/!/! webhooks:1"
+	start := time.Now()
+
+	// Spread wider than the window, refusals never close the key.
+	spacing := sharedLimitWindow/(sharedLimitThreshold-1) + time.Millisecond
+	for refusal := range 3 * sharedLimitThreshold {
+		if _, closed := guard.record(key, time.Second, start.Add(time.Duration(refusal)*spacing)); closed {
+			t.Fatalf("refusal %d closed the key although no %d fell within %v", refusal, sharedLimitThreshold, sharedLimitWindow)
+		}
+	}
+
+	now := start.Add(time.Hour)
+	for refusal := 1; refusal < sharedLimitThreshold; refusal++ {
+		if _, closed := guard.record(key, time.Second, now); closed {
+			t.Fatalf("refusal %d of a burst closed the key early", refusal)
+		}
+	}
+	closure, closed := guard.record(key, time.Second, now)
+	if !closed || closure != minSharedLimitCooldown || guard.retryAfter(key, now) != minSharedLimitCooldown {
+		t.Fatalf("the burst's last refusal closed %v for %v, want %v", closed, closure, minSharedLimitCooldown)
+	}
+	if _, closed := guard.record(key, time.Hour, now.Add(time.Second)); closed || guard.retryAfter(key, now) != minSharedLimitCooldown {
+		t.Fatal("a refusal of a request in flight extended the closure")
+	}
+	if delay := guard.retryAfter(key, now.Add(minSharedLimitCooldown)); delay != 0 {
+		t.Fatalf("the key was still closed for %v after its cooldown", delay)
+	}
+
+	// Reopened, the key needs a whole new burst, and a long cooldown is capped.
+	now = now.Add(minSharedLimitCooldown)
+	for refusal := 1; refusal < sharedLimitThreshold; refusal++ {
+		if _, closed := guard.record(key, 10*time.Minute, now); closed {
+			t.Fatalf("refusal %d after reopening closed the key early", refusal)
+		}
+	}
+	if closure, closed := guard.record(key, 10*time.Minute, now); !closed || closure != maxSharedLimitCooldown {
+		t.Fatalf("a 10-minute cooldown closed %v for %v, want %v", closed, closure, maxSharedLimitCooldown)
+	}
+
+	if _, closed := guard.record("", time.Second, now); closed || guard.retryAfter("", now) != 0 {
+		t.Fatal("a request without a key was tracked")
+	}
+}
+
+func TestSharedLimitGuardForgetsTheOldestKeys(t *testing.T) {
+	guard := newSharedLimitGuard()
+	now := time.Now()
+	for key := range maxSharedLimitKeys + 10 {
+		guard.record(strconv.Itoa(key), time.Second, now)
+	}
+	if len(guard.entries) != maxSharedLimitKeys || guard.order.Len() != maxSharedLimitKeys {
+		t.Fatalf("guard holds %d keys and %d list entries, want %d", len(guard.entries), guard.order.Len(), maxSharedLimitKeys)
+	}
+	if _, ok := guard.entries["0"]; ok {
+		t.Fatal("the oldest key survived eviction")
 	}
 }
 

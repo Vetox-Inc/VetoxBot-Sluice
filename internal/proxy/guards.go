@@ -23,8 +23,25 @@ const (
 	invalidWebhookTokenCode = 50027
 
 	defaultCloudflarePause = time.Minute
-	maxCloudflarePause     = time.Hour
-	edgeProbeInterval      = 30 * time.Second
+	// maxCloudflarePause bounds a pause only so a malformed Retry-After cannot stop traffic for
+	// good. Discord's edge can block an IP for a day, and a shorter bound would resume traffic
+	// into a block still in force.
+	maxCloudflarePause = 25 * time.Hour
+	// maxEdgeRouteBackoff bounds how long one refused route backs off. A block of the whole IP
+	// pauses everything for its own Retry-After instead, so a route need not wait as long.
+	maxEdgeRouteBackoff = time.Hour
+	edgeProbeInterval   = 30 * time.Second
+
+	// sharedLimitThreshold shared-scope 429s for one resource within sharedLimitWindow close it
+	// for at least minSharedLimitCooldown.
+	sharedLimitThreshold   = 20
+	sharedLimitWindow      = 10 * time.Second
+	minSharedLimitCooldown = 10 * time.Second
+	// maxSharedLimitCooldown bounds a closure however long Discord's cooldown is, because a key
+	// can cover more than the resource Discord limits: every follow-up of an application shares
+	// one, as its path names no channel.
+	maxSharedLimitCooldown = time.Minute
+	maxSharedLimitKeys     = 4096
 )
 
 // webhookGuard remembers webhooks Discord reported as deleted (10015) or whose token it
@@ -158,6 +175,97 @@ func (f webhookFailure) response(request *http.Request) *http.Response {
 	return syntheticResponse(request, f.status, `{"message": "`+message+`", "code": `+strconv.Itoa(f.code)+`}`)
 }
 
+// sharedLimitGuard closes a resource after Discord refuses it with sharedLimitThreshold
+// shared-scope 429s inside sharedLimitWindow, and answers its requests locally until the cooldown
+// ends. Discord does not count shared 429s as invalid requests, but its edge still sees each one,
+// and many requests for one hot resource, from one client or several, can collect them faster than
+// any one client's backoff slows them. Keys come from sharedResourceKey; the oldest key is
+// forgotten once maxSharedLimitKeys are tracked.
+type sharedLimitGuard struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element
+	order   list.List
+}
+
+type sharedLimitEntry struct {
+	key string
+	// refusals is a ring of the latest shared 429s; next is the slot the next one takes, which
+	// once count reaches sharedLimitThreshold also holds the oldest.
+	refusals  [sharedLimitThreshold]time.Time
+	next      int
+	count     int
+	openUntil time.Time
+}
+
+func newSharedLimitGuard() *sharedLimitGuard {
+	return &sharedLimitGuard{entries: make(map[string]*list.Element)}
+}
+
+// retryAfter returns how long key stays closed, or 0 while it is open.
+func (g *sharedLimitGuard) retryAfter(key string, now time.Time) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	element, ok := g.entries[key]
+	if !ok {
+		return 0
+	}
+	if openUntil := element.Value.(*sharedLimitEntry).openUntil; openUntil.After(now) {
+		return openUntil.Sub(now)
+	}
+	return 0
+}
+
+// record notes a shared-scope 429 for key with Discord's cooldown, and returns how long key now
+// stays closed when this 429 closed it.
+func (g *sharedLimitGuard) record(key string, cooldown time.Duration, now time.Time) (time.Duration, bool) {
+	if key == "" {
+		return 0, false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var entry *sharedLimitEntry
+	if element, ok := g.entries[key]; ok {
+		entry = element.Value.(*sharedLimitEntry)
+		g.order.MoveToFront(element)
+	} else {
+		entry = &sharedLimitEntry{key: key}
+		g.entries[key] = g.order.PushFront(entry)
+		for g.order.Len() > maxSharedLimitKeys {
+			oldest := g.order.Back()
+			g.order.Remove(oldest)
+			delete(g.entries, oldest.Value.(*sharedLimitEntry).key)
+		}
+	}
+	// A refusal of a request that was already in flight when key closed proves nothing new.
+	if entry.openUntil.After(now) {
+		return 0, false
+	}
+	entry.refusals[entry.next] = now
+	entry.next = (entry.next + 1) % sharedLimitThreshold
+	entry.count = min(entry.count+1, sharedLimitThreshold)
+	if entry.count < sharedLimitThreshold || now.Sub(entry.refusals[entry.next]) > sharedLimitWindow {
+		return 0, false
+	}
+	closure := min(max(cooldown, minSharedLimitCooldown), maxSharedLimitCooldown)
+	entry.openUntil = now.Add(closure)
+	entry.count = 0
+	return closure, true
+}
+
+// sharedLimitResponse answers a request for a closed resource as Discord answers a shared-scope
+// 429: Retry-After without an exhausted bucket, so clients hold back that request alone. It never
+// reached Discord, so a client may retry it safely.
+func sharedLimitResponse(request *http.Request, delay time.Duration) *http.Response {
+	delay = max(delay, minimumRetryDelay)
+	seconds := int64((delay + time.Second - 1) / time.Second)
+	exact := strconv.FormatFloat(delay.Seconds(), 'f', 3, 64)
+	response := syntheticResponse(request, http.StatusTooManyRequests,
+		`{"message": "The resource is being rate limited.", "retry_after": `+exact+`, "global": false}`)
+	response.Header.Set("Retry-After", strconv.FormatInt(seconds, 10))
+	response.Header.Set("X-RateLimit-Scope", "shared")
+	return response
+}
+
 // cloudflareGuard pauses outbound traffic while Discord's edge blocks this IP. Discord's own
 // responses carry Via: 1.1 google, so a 429 or 403 without Via never reached Discord, and
 // every further request only prolongs the block. The edge also refuses single requests, such
@@ -193,8 +301,22 @@ const (
 	edgeBlocked
 )
 
-// settle records a probe's verdict. A block pauses traffic for pause, a clear probe holds off the
-// next one, and an inconclusive one lets the next refusal probe again.
+// beginPausedProbe reports whether a probe should check the pause in force, and marks it
+// running. As with a suspected block, one probe runs at a time.
+func (g *cloudflareGuard) beginPausedProbe(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.probing || !g.blockedUntil.After(now) {
+		return false
+	}
+	g.probing = true
+	return true
+}
+
+// settle records a probe's verdict. A block pauses traffic for pause, or longer if a pause in
+// force already runs past it, so a refusal without Retry-After cannot cut a pause short. A clear
+// probe ends any pause, as the block lifted early, and holds off the next probe; an inconclusive
+// one changes nothing, so the next refusal probes again.
 func (g *cloudflareGuard) settle(now time.Time, verdict edgeVerdict, pause time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -202,9 +324,15 @@ func (g *cloudflareGuard) settle(now time.Time, verdict edgeVerdict, pause time.
 	switch verdict {
 	case edgeClear:
 		g.clearedAt = now
+		if g.blockedUntil.After(now) {
+			g.blockedUntil = time.Time{}
+			g.revision.Add(1)
+		}
 	case edgeBlocked:
-		g.blockedUntil = now.Add(pause)
-		g.revision.Add(1)
+		if until := now.Add(pause); until.After(g.blockedUntil) {
+			g.blockedUntil = until
+			g.revision.Add(1)
+		}
 	}
 }
 
@@ -289,6 +417,42 @@ func (p *Proxy) suspectEdgeBlock(refusal *http.Response, route string) {
 	})
 	if !started {
 		p.cloudflare.settle(time.Now(), edgeInconclusive, 0)
+	}
+}
+
+// watchEdge probes Discord's edge every interval while a block pauses outbound traffic, so a block
+// that lifts early, or outlasts the pause taken from its Retry-After, is noticed without any
+// client request reaching the edge.
+func (p *Proxy) watchEdge(interval time.Duration) {
+	defer p.wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.probePausedEdge()
+		case <-p.ctx.Done():
+			return
+		}
+	}
+}
+
+// probePausedEdge checks the pause in force, if any: a clear edge ends it, a refusal re-arms it
+// from that refusal's Retry-After, and a probe that gets no answer leaves it as it is.
+func (p *Proxy) probePausedEdge() {
+	if !p.cloudflare.beginPausedProbe(time.Now()) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, p.config.UpstreamTimeout)
+	defer cancel()
+	verdict, pause := p.probeEdge(ctx)
+	now := time.Now()
+	p.cloudflare.settle(now, verdict, pause)
+	switch verdict {
+	case edgeClear:
+		logger.Warn("Discord's edge no longer blocks this IP; resuming outbound requests")
+	case edgeBlocked:
+		logger.Warn("Discord's edge still blocks this IP; outbound requests stay paused", "pause", p.cloudflare.retryAfter(now).Round(time.Second).String())
 	}
 }
 
