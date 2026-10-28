@@ -120,9 +120,10 @@ handle 429s.
   application's follow-ups. Closures are not kept across restarts.
 - **Cloudflare blocks.** Discord's own responses carry `Via: 1.1 google`, so a 429 or 403 without it came from Discord's
   edge. Sluice returns it without a retry, backs that route off, and checks with a request of its own whether the edge
-  blocks this IP or only that client. For a block, Sluice pauses all outbound traffic for the response's `Retry-After`
-  and answers `429` meanwhile. Set `CLOUDFLARE_BAN_DETECTION=false` if something between Sluice and Discord strips
-  `Via`.
+  blocks this IP or only that client. For a block, Sluice pauses all outbound traffic for the response's `Retry-After`,
+  up to 25 hours, and answers `429` meanwhile. Every 15 minutes, `CLOUDFLARE_PROBE_INTERVAL`, it checks the edge
+  again: a block that lifts early ends the pause, and one that still holds re-arms it. Set
+  `CLOUDFLARE_BAN_DETECTION=false` if something between Sluice and Discord strips `Via`.
 - **Restarts.** The invalid-request history, a Cloudflare block and the deleted webhooks survive a restart in
   `STATE_FILE`, which defaults to a file in the user cache directory.
 
