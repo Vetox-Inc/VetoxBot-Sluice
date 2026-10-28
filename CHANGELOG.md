@@ -6,6 +6,17 @@ and [Semantic Versioning](https://semver.org/). Earlier history is in nirn-proxy
 
 ## Unreleased
 
+### Changed
+
+- A shared-scope 429 reaches its client at once instead of being retried by Sluice, so the client's own backoff decides
+  when the resource is asked again.
+
+### Added
+
+- Shared-limit storm protection: after 20 shared-scope 429s for one resource within 10 seconds, Sluice answers that
+  resource's requests with a shared-scope 429 itself for Discord's cooldown, at least 10 seconds and at most a minute.
+  `sluice_failures_total` counts both with the reasons `shared_rate_limit` and `shared_rate_limit_breaker`.
+
 ## 1.0.0 - 2026-10-03
 
 The first release as Sluice, continuing nirn-proxy 1.3.3 on Melonly-Moderation's engine rewrite.

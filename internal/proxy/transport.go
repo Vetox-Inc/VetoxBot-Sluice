@@ -154,17 +154,6 @@ func watchUpload(body io.ReadCloser, ctx context.Context, stall *stallTimer) io.
 	}}
 }
 
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 type scheduledTransport struct {
 	base  http.RoundTripper
 	proxy *Proxy
@@ -191,11 +180,24 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		return failure.response(request)
 	}
+	// Checked again before every attempt too, so requests already queued when their resource
+	// closed never reach Discord.
+	closedSharedLimit := func(now time.Time) *http.Response {
+		delay := t.proxy.sharedLimits.retryAfter(metadata.sharedLimitKey, now)
+		if delay <= 0 {
+			return nil
+		}
+		ProxyFailures.WithLabelValues("shared_rate_limit_breaker").Inc()
+		return sharedLimitResponse(request, delay)
+	}
 	if response := shortCircuitWebhook(queuedAt); response != nil {
 		return response, nil
 	}
 	if pause := t.proxy.cloudflare.retryAfter(queuedAt); pause > 0 {
 		return cloudflarePauseResponse(request, pause), nil
+	}
+	if response := closedSharedLimit(queuedAt); response != nil {
+		return response, nil
 	}
 	// Check before joining any rate-limit queue; reserve again immediately before
 	// the outbound attempt to close races with concurrent invalid responses.
@@ -317,6 +319,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		if pause := t.proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
 			return cloudflarePauseResponse(request, pause), nil
 		}
+		if response := closedSharedLimit(time.Now()); response != nil {
+			return response, nil
+		}
 		body, err := replay.body(attempt)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errRetryPreparation, err)
@@ -421,7 +426,18 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 			RequestHistogram.WithLabelValues(metadata.metricsMethod, status, metadata.metricsPath, metadata.state.metricsLabel()).Observe(time.Since(started).Seconds())
 		}
-		if response.StatusCode != http.StatusTooManyRequests || edgeRefused {
+		// A shared-scope 429 limits a resource every client of it competes for, so a retry from here
+		// would only add to the refusals Discord's edge sees. The client gets it at once and waits
+		// out its Retry-After, and enough of them close the resource for a while.
+		sharedRefusal := response.StatusCode == http.StatusTooManyRequests && !edgeRefused && info.shared()
+		if sharedRefusal {
+			ProxyFailures.WithLabelValues("shared_rate_limit").Inc()
+			if closure, closed := t.proxy.sharedLimits.record(metadata.sharedLimitKey, info.retryAfter, time.Now()); closed {
+				logger.Warn("Discord keeps refusing one resource with shared rate limits; answering its requests locally",
+					"method", metadata.metricsMethod, "route", metadata.metricsPath, "cooldown", closure.String())
+			}
+		}
+		if response.StatusCode != http.StatusTooManyRequests || edgeRefused || sharedRefusal {
 			releaseBucket()
 			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
 				endAttempt()
@@ -436,14 +452,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			_ = response.Body.Close()
 			return nil, fmt.Errorf("%w: %v", errRetryPreparation, prepareErr)
 		}
-		// A shared-scope 429 limits one resource, not its bucket, so only this request waits.
-		var resourceDelay time.Duration
-		if info.shared() {
-			resourceDelay = max(info.retryAfter, minimumRetryDelay)
-		}
 		if retryable {
 			delay, _ := knownRateLimit(observedBucket)
-			if retryWouldExceedDeadline(queueContext, max(delay, resourceDelay)) {
+			if retryWouldExceedDeadline(queueContext, delay) {
 				ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
 				retryable = false
 			}
@@ -463,11 +474,6 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		_ = response.Body.Close()
 
 		releaseBucket()
-		if resourceDelay > 0 {
-			if err := sleepContext(queueContext, resourceDelay); err != nil {
-				return missedTurn(err, nil, false)
-			}
-		}
 		bucket, err = metadata.state.acquireBucket(queueContext, metadata.routeHash)
 		if err != nil {
 			return missedTurn(err, nil, false)

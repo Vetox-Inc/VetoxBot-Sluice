@@ -25,6 +25,17 @@ const (
 	defaultCloudflarePause = time.Minute
 	maxCloudflarePause     = time.Hour
 	edgeProbeInterval      = 30 * time.Second
+
+	// sharedLimitThreshold shared-scope 429s for one resource within sharedLimitWindow close it
+	// for at least minSharedLimitCooldown.
+	sharedLimitThreshold   = 20
+	sharedLimitWindow      = 10 * time.Second
+	minSharedLimitCooldown = 10 * time.Second
+	// maxSharedLimitCooldown bounds a closure however long Discord's cooldown is, because a key
+	// can cover more than the resource Discord limits: every follow-up of an application shares
+	// one, as its path names no channel.
+	maxSharedLimitCooldown = time.Minute
+	maxSharedLimitKeys     = 4096
 )
 
 // webhookGuard remembers webhooks Discord reported as deleted (10015) or whose token it
@@ -156,6 +167,97 @@ func (f webhookFailure) response(request *http.Request) *http.Response {
 		message = "Invalid Webhook Token"
 	}
 	return syntheticResponse(request, f.status, `{"message": "`+message+`", "code": `+strconv.Itoa(f.code)+`}`)
+}
+
+// sharedLimitGuard closes a resource after Discord refuses it with sharedLimitThreshold
+// shared-scope 429s inside sharedLimitWindow, and answers its requests locally until the cooldown
+// ends. Discord does not count shared 429s as invalid requests, but its edge still sees each one,
+// and many requests for one hot resource, from one client or several, can collect them faster than
+// any one client's backoff slows them. Keys come from sharedResourceKey; the oldest key is
+// forgotten once maxSharedLimitKeys are tracked.
+type sharedLimitGuard struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element
+	order   list.List
+}
+
+type sharedLimitEntry struct {
+	key string
+	// refusals is a ring of the latest shared 429s; next is the slot the next one takes, which
+	// once count reaches sharedLimitThreshold also holds the oldest.
+	refusals  [sharedLimitThreshold]time.Time
+	next      int
+	count     int
+	openUntil time.Time
+}
+
+func newSharedLimitGuard() *sharedLimitGuard {
+	return &sharedLimitGuard{entries: make(map[string]*list.Element)}
+}
+
+// retryAfter returns how long key stays closed, or 0 while it is open.
+func (g *sharedLimitGuard) retryAfter(key string, now time.Time) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	element, ok := g.entries[key]
+	if !ok {
+		return 0
+	}
+	if openUntil := element.Value.(*sharedLimitEntry).openUntil; openUntil.After(now) {
+		return openUntil.Sub(now)
+	}
+	return 0
+}
+
+// record notes a shared-scope 429 for key with Discord's cooldown, and returns how long key now
+// stays closed when this 429 closed it.
+func (g *sharedLimitGuard) record(key string, cooldown time.Duration, now time.Time) (time.Duration, bool) {
+	if key == "" {
+		return 0, false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var entry *sharedLimitEntry
+	if element, ok := g.entries[key]; ok {
+		entry = element.Value.(*sharedLimitEntry)
+		g.order.MoveToFront(element)
+	} else {
+		entry = &sharedLimitEntry{key: key}
+		g.entries[key] = g.order.PushFront(entry)
+		for g.order.Len() > maxSharedLimitKeys {
+			oldest := g.order.Back()
+			g.order.Remove(oldest)
+			delete(g.entries, oldest.Value.(*sharedLimitEntry).key)
+		}
+	}
+	// A refusal of a request that was already in flight when key closed proves nothing new.
+	if entry.openUntil.After(now) {
+		return 0, false
+	}
+	entry.refusals[entry.next] = now
+	entry.next = (entry.next + 1) % sharedLimitThreshold
+	entry.count = min(entry.count+1, sharedLimitThreshold)
+	if entry.count < sharedLimitThreshold || now.Sub(entry.refusals[entry.next]) > sharedLimitWindow {
+		return 0, false
+	}
+	closure := min(max(cooldown, minSharedLimitCooldown), maxSharedLimitCooldown)
+	entry.openUntil = now.Add(closure)
+	entry.count = 0
+	return closure, true
+}
+
+// sharedLimitResponse answers a request for a closed resource as Discord answers a shared-scope
+// 429: Retry-After without an exhausted bucket, so clients hold back that request alone. It never
+// reached Discord, so a client may retry it safely.
+func sharedLimitResponse(request *http.Request, delay time.Duration) *http.Response {
+	delay = max(delay, minimumRetryDelay)
+	seconds := int64((delay + time.Second - 1) / time.Second)
+	exact := strconv.FormatFloat(delay.Seconds(), 'f', 3, 64)
+	response := syntheticResponse(request, http.StatusTooManyRequests,
+		`{"message": "The resource is being rate limited.", "retry_after": `+exact+`, "global": false}`)
+	response.Header.Set("Retry-After", strconv.FormatInt(seconds, 10))
+	response.Header.Set("X-RateLimit-Scope", "shared")
+	return response
 }
 
 // cloudflareGuard pauses outbound traffic while Discord's edge blocks this IP. Discord's own
