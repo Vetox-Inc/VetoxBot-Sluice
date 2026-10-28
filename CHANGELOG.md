@@ -5,6 +5,17 @@ and [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Changed
+
+- A shared-scope 429 reaches its client at once instead of being retried by Sluice, so the client's own backoff decides
+  when the resource is asked again.
+
+### Added
+
+- Shared-limit storm protection: after 20 shared-scope 429s for one resource within 10 seconds, Sluice answers that
+  resource's requests with a shared-scope 429 itself for Discord's cooldown, at least 10 seconds and at most a minute.
+  `sluice_failures_total` counts both with the reasons `shared_rate_limit` and `shared_rate_limit_breaker`.
+
 ## 1.1.0 - 2026-10-04
 
 A request Discord answers is handled as in 1.0.1. This release is about the ones Sluice refuses: each is counted by

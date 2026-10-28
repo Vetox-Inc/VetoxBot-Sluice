@@ -143,3 +143,34 @@ func TestHashCRC64Compatibility(t *testing.T) {
 		t.Fatalf("HashCRC64() = %d, want %d", got, want)
 	}
 }
+
+func TestSharedResourceKeyLeavesTokensOut(t *testing.T) {
+	key := func(method, path string) string {
+		return sharedResourceKey(method, MetricsPathFromBucket(GetOptimisticBucketPath(path, method)), path)
+	}
+	const application = "203039963636301824"
+	first := key(http.MethodPost, followUpPath(application, 1))
+	if second := key(http.MethodPost, followUpPath(application, 2)); second != first {
+		t.Fatalf("two follow-ups of one application have keys %q and %q; a storm of them would never close", first, second)
+	}
+	if strings.Contains(first, interactionTokenPrefix) {
+		t.Fatalf("key %q carries the interaction token", first)
+	}
+	for _, test := range []struct{ name, a, b string }{
+		{"applications", followUpPath(application, 1), followUpPath("303039963636301824", 1)},
+		{"webhooks", "/api/v10/webhooks/123456789012345678/token", "/api/v10/webhooks/223456789012345678/token"},
+		{"channels", "/api/v10/channels/123456789012345678/messages", "/api/v10/channels/223456789012345678/messages"},
+		{"routes", "/api/v10/channels/123456789012345678/messages", "/api/v10/channels/123456789012345678/typing"},
+	} {
+		if key(http.MethodPost, test.a) == key(http.MethodPost, test.b) {
+			t.Errorf("%s share key %q", test.name, key(http.MethodPost, test.a))
+		}
+	}
+	if a, b := key(http.MethodPost, "/api/v10/webhooks/123456789012345678/first-token"), key(http.MethodPost, "/api/v10/webhooks/123456789012345678/second-token"); a != b ||
+		strings.Contains(a, "token") {
+		t.Errorf("one webhook has keys %q and %q; its token must not be part of them", a, b)
+	}
+	if key(http.MethodPost, "/api/v10/channels/1/messages") == key(http.MethodGet, "/api/v10/channels/1/messages") {
+		t.Error("methods share a key")
+	}
+}

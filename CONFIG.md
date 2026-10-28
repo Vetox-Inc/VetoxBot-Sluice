@@ -383,6 +383,8 @@ These are answers a client retries or expects, and are only counted:
 | `queue_timeout` | `429` | A request did not get its turn within `QUEUE_TIMEOUT` |
 | `queue_full` | `429` | A queue already held `MAX_QUEUE_DEPTH` requests |
 | `rate_limit_deadline` | `429` | A cooldown outlasts the request's deadline, so it is told at once |
+| `shared_rate_limit` | `429` | Discord answered with a shared-scope 429, which goes to the client at once rather than being retried |
+| `shared_rate_limit_breaker` | `429` | One resource collected 20 shared-scope 429s within 10 seconds, so Sluice answers for it until its cooldown ends |
 | `cloudflare_pause` | `429` | A Cloudflare block has paused traffic |
 | `unsupported_authorization` | `401` | The `Authorization` scheme is one Discord never accepts |
 | `client_auth` | `403` | The request did not carry `CLIENT_AUTH_SECRET` |

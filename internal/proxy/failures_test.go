@@ -196,6 +196,16 @@ func TestEveryAnswerOfSluicesOwnIsCounted(t *testing.T) {
 			proxy.cloudflare.settle(time.Now(), edgeBlocked, time.Minute)
 			return serve(proxy, http.MethodGet, "/api/v10/gateway", "", nil)
 		}},
+		{"shared_rate_limit_breaker", http.StatusTooManyRequests, func(t *testing.T) *httptest.ResponseRecorder {
+			proxy := newTestProxy(t, testConfig(okay))
+			path := "/api/v10/channels/1/messages"
+			key := sharedResourceKey(http.MethodPost, MetricsPathFromBucket(GetOptimisticBucketPath(path, http.MethodPost)), path)
+			now := time.Now()
+			for range sharedLimitThreshold {
+				proxy.sharedLimits.record(key, time.Second, now)
+			}
+			return serve(proxy, http.MethodPost, path, "", nil)
+		}},
 		{"upstream_error", http.StatusBadGateway, func(t *testing.T) *httptest.ResponseRecorder {
 			return serve(newTestProxy(t, testConfig(roundTripFunc(func(*http.Request) (*http.Response, error) {
 				return nil, errors.New("connection refused")
