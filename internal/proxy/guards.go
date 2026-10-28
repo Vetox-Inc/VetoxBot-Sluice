@@ -24,8 +24,14 @@ const (
 	invalidWebhookTokenCode = 50027
 
 	defaultCloudflarePause = time.Minute
-	maxCloudflarePause     = time.Hour
-	edgeProbeInterval      = 30 * time.Second
+	// maxCloudflarePause bounds a pause only so a malformed Retry-After cannot stop traffic for
+	// good. Discord's edge can block an IP for a day, and a shorter bound would resume traffic
+	// into a block still in force.
+	maxCloudflarePause = 25 * time.Hour
+	// maxEdgeRouteBackoff bounds how long one refused route backs off. A block of the whole IP
+	// pauses everything for its own Retry-After instead, so a route need not wait as long.
+	maxEdgeRouteBackoff = time.Hour
+	edgeProbeInterval   = 30 * time.Second
 
 	// sharedLimitThreshold shared-scope 429s for one resource within sharedLimitWindow close it
 	// for at least minSharedLimitCooldown.
@@ -296,8 +302,22 @@ const (
 	edgeBlocked
 )
 
-// settle records a probe's verdict. A block pauses traffic for pause, a clear probe holds off the
-// next one, and an inconclusive one lets the next refusal probe again.
+// beginPausedProbe reports whether a probe should check the pause in force, and marks it
+// running. As with a suspected block, one probe runs at a time.
+func (g *cloudflareGuard) beginPausedProbe(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.probing || !g.blockedUntil.After(now) {
+		return false
+	}
+	g.probing = true
+	return true
+}
+
+// settle records a probe's verdict. A block pauses traffic for pause, or longer if a pause in
+// force already runs past it, so a refusal without Retry-After cannot cut a pause short. A clear
+// probe ends any pause, as the block lifted early, and holds off the next probe; an inconclusive
+// one changes nothing, so the next refusal probes again.
 func (g *cloudflareGuard) settle(now time.Time, verdict edgeVerdict, pause time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -305,9 +325,15 @@ func (g *cloudflareGuard) settle(now time.Time, verdict edgeVerdict, pause time.
 	switch verdict {
 	case edgeClear:
 		g.clearedAt = now
+		if g.blockedUntil.After(now) {
+			g.blockedUntil = time.Time{}
+			g.revision.Add(1)
+		}
 	case edgeBlocked:
-		g.blockedUntil = now.Add(pause)
-		g.revision.Add(1)
+		if until := now.Add(pause); until.After(g.blockedUntil) {
+			g.blockedUntil = until
+			g.revision.Add(1)
+		}
 	}
 }
 
@@ -396,6 +422,42 @@ func (p *Proxy) suspectEdgeBlock(refusal *http.Response, route string) {
 	})
 	if !started {
 		p.cloudflare.settle(time.Now(), edgeInconclusive, 0)
+	}
+}
+
+// watchEdge probes Discord's edge every interval while a block pauses outbound traffic, so a block
+// that lifts early, or outlasts the pause taken from its Retry-After, is noticed without any
+// client request reaching the edge.
+func (p *Proxy) watchEdge(interval time.Duration) {
+	defer p.wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.probePausedEdge()
+		case <-p.ctx.Done():
+			return
+		}
+	}
+}
+
+// probePausedEdge checks the pause in force, if any: a clear edge ends it, a refusal re-arms it
+// from that refusal's Retry-After, and a probe that gets no answer leaves it as it is.
+func (p *Proxy) probePausedEdge() {
+	if !p.cloudflare.beginPausedProbe(time.Now()) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, p.config.UpstreamTimeout)
+	defer cancel()
+	verdict, pause, _ := p.probeEdge(ctx)
+	now := time.Now()
+	p.cloudflare.settle(now, verdict, pause)
+	switch verdict {
+	case edgeClear:
+		logger.Warn("Discord's edge no longer blocks this IP; resuming outbound requests")
+	case edgeBlocked:
+		logger.Warn("Discord's edge still blocks this IP; outbound requests stay paused", "pause", p.cloudflare.retryAfter(now).Round(time.Second).String())
 	}
 }
 

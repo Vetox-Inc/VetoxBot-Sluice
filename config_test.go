@@ -380,3 +380,32 @@ func writeClusterTestCertificate(t *testing.T) (string, string, string) {
 	}
 	return caFile, certFile, keyFile
 }
+
+func TestCloudflareProbeIntervalDefaultsAndBounds(t *testing.T) {
+	clearClusterEnvironment(t)
+	for _, test := range []struct {
+		value string
+		want  time.Duration
+		valid bool
+	}{
+		{"", proxy.DefaultCloudflareProbeInterval, true},
+		{"0", 0, true},
+		{"1000", time.Second, true},
+		{"86400000", 24 * time.Hour, true},
+		{"999", 0, false},
+		{"-1", 0, false},
+		{"86400001", 0, false},
+	} {
+		t.Setenv("CLOUDFLARE_PROBE_INTERVAL", test.value)
+		config, err := loadConfig()
+		if !test.valid {
+			if err == nil || !strings.Contains(err.Error(), "CLOUDFLARE_PROBE_INTERVAL") {
+				t.Errorf("CLOUDFLARE_PROBE_INTERVAL=%q: error = %v, want a CLOUDFLARE_PROBE_INTERVAL error", test.value, err)
+			}
+			continue
+		}
+		if err != nil || config.proxy.CloudflareProbeInterval != test.want {
+			t.Errorf("CLOUDFLARE_PROBE_INTERVAL=%q: interval = %v, err = %v, want %v", test.value, config.proxy.CloudflareProbeInterval, err, test.want)
+		}
+	}
+}

@@ -399,7 +399,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			if t.proxy.config.EnableMetrics {
 				EdgeRefusals.Inc()
 			}
-			bucket.blockUntil(time.Now().Add(cloudflarePause(response.Header)))
+			bucket.blockUntil(time.Now().Add(min(cloudflarePause(response.Header), maxEdgeRouteBackoff)))
 			t.proxy.suspectEdgeBlock(response, metadata.metricsPath)
 		} else {
 			if metadata.webhookKey != "" {

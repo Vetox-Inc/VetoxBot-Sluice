@@ -35,7 +35,7 @@ var settingGroups = []struct {
 	{"Reaching Discord", []string{"DISCORD_API_URL", "OUTBOUND_IP", "DISABLE_HTTP_2", "REQUEST_TIMEOUT"}},
 	{"Queues and limits", []string{"QUEUE_TIMEOUT", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "BOT_RATELIMIT_OVERRIDES", "BOT_WIDE_ROUTES"}},
 	{"Retries", []string{"MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES"}},
-	{"Protecting your IP", []string{"DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION", "STATE_FILE"}},
+	{"Protecting your IP", []string{"DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION", "CLOUDFLARE_PROBE_INTERVAL", "STATE_FILE"}},
 	{"Memory bounds", []string{"MAX_CLIENT_STATES", "MAX_BEARER_COUNT", "MAX_BUCKET_STATES"}},
 	{"Logs, metrics and profiling", []string{"LOG_LEVEL", "LOG_FORMAT", "ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
 	{"Cluster", []string{"CLUSTER_MEMBERS", "CLUSTER_DNS", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_ADVERTISE_ADDR", "CLUSTER_MAX_NODES", "NODE_NAME"}},
@@ -156,6 +156,14 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
+	// 0 turns the probe off; anything shorter than a second would only hammer the edge.
+	cloudflareProbeInterval, err := envInt64("CLOUDFLARE_PROBE_INTERVAL", proxy.DefaultCloudflareProbeInterval.Milliseconds(), 0, maxConfiguredTimeout.Milliseconds())
+	if err == nil && cloudflareProbeInterval > 0 && cloudflareProbeInterval < time.Second.Milliseconds() {
+		err = fmt.Errorf("CLOUDFLARE_PROBE_INTERVAL must be 0 or between %d and %d", time.Second.Milliseconds(), maxConfiguredTimeout.Milliseconds())
+	}
+	if err != nil {
+		return appConfig{}, err
+	}
 	discordURL := envString("DISCORD_API_URL", proxy.DefaultDiscordURL)
 	if _, err := proxy.ParseDiscordURL(discordURL); err != nil {
 		return appConfig{}, fmt.Errorf("DISCORD_API_URL: %w", err)
@@ -232,26 +240,27 @@ func loadConfig() (appConfig, error) {
 		clusterServerTLS:     clusterServerTLS,
 		clusterClientTLS:     clusterClientTLS,
 		proxy: proxy.Config{
-			OutboundIP:             strings.TrimSpace(os.Getenv("OUTBOUND_IP")),
-			UpstreamTimeout:        requestTimeout,
-			QueueTimeout:           queueTimeout,
-			DisableHTTP2:           disableHTTP2,
-			Disable401Lock:         disable401Lock,
-			EnableMetrics:          enableMetrics,
-			GlobalOverrides:        strings.TrimSpace(os.Getenv("BOT_RATELIMIT_OVERRIDES")),
-			BotWideRoutes:          strings.TrimSpace(os.Getenv("BOT_WIDE_ROUTES")),
-			MaxBearerClients:       maxBearerClients,
-			MaxClientStates:        maxClientStates,
-			MaxInFlightRequests:    maxInFlightRequests,
-			MaxBucketStates:        maxBucketStates,
-			MaxQueueDepth:          maxQueueDepth,
-			MaxRetryBodyBytes:      maxRetryBodyBytes,
-			MaxRetryCaptureBytes:   maxRetryCaptureBytes,
-			InvalidRequestLimit:    invalidRequestLimit,
-			DiscordURL:             discordURL,
-			CloudflareBanDetection: cloudflareBanDetection,
-			ClientAuthSecret:       clientAuthSecret,
-			StateFile:              stateFile,
+			OutboundIP:              strings.TrimSpace(os.Getenv("OUTBOUND_IP")),
+			UpstreamTimeout:         requestTimeout,
+			QueueTimeout:            queueTimeout,
+			DisableHTTP2:            disableHTTP2,
+			Disable401Lock:          disable401Lock,
+			EnableMetrics:           enableMetrics,
+			GlobalOverrides:         strings.TrimSpace(os.Getenv("BOT_RATELIMIT_OVERRIDES")),
+			BotWideRoutes:           strings.TrimSpace(os.Getenv("BOT_WIDE_ROUTES")),
+			MaxBearerClients:        maxBearerClients,
+			MaxClientStates:         maxClientStates,
+			MaxInFlightRequests:     maxInFlightRequests,
+			MaxBucketStates:         maxBucketStates,
+			MaxQueueDepth:           maxQueueDepth,
+			MaxRetryBodyBytes:       maxRetryBodyBytes,
+			MaxRetryCaptureBytes:    maxRetryCaptureBytes,
+			InvalidRequestLimit:     invalidRequestLimit,
+			DiscordURL:              discordURL,
+			CloudflareBanDetection:  cloudflareBanDetection,
+			CloudflareProbeInterval: time.Duration(cloudflareProbeInterval) * time.Millisecond,
+			ClientAuthSecret:        clientAuthSecret,
+			StateFile:               stateFile,
 		},
 	}, nil
 }

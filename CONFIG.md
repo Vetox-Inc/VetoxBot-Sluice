@@ -205,10 +205,11 @@ before it reaches Discord. A request of unknown length is forwarded without a co
 | --- | --- | --- |
 | `DISABLE_401_LOCK` | `false` | `true` or `false` |
 | `CLOUDFLARE_BAN_DETECTION` | `true` | `true` or `false` |
+| `CLOUDFLARE_PROBE_INTERVAL` | `900000` | `0`, or 1,000 to 86,400,000 ms |
 | `STATE_FILE` | a file in the user cache directory | A path, or empty |
 
 Discord temporarily blocks an IP at its edge once that IP has received 10,000 responses with status 401, 403 or 429
-inside 10 minutes. A 429 whose scope is `shared` is the one exception. Three of Sluice's protections have no setting:
+inside 10 minutes. A 429 whose scope is `shared` is the one exception. Four of Sluice's protections have no setting:
 
 - **The invalid-request budget.** Sluice counts those responses over a rolling 10 minutes and stops sending at 9,500,
   short of Discord's threshold. Until old responses age out, requests get `503`. In a cluster the budget is divided
@@ -218,6 +219,11 @@ inside 10 minutes. A 429 whose scope is `shared` is the one exception. Three of 
 - **Deleted webhooks.** When Discord reports a webhook as unknown (code 10015) or its token as invalid (code 50027),
   Sluice answers calls to that webhook itself for the next hour, because Discord penalises an IP that keeps calling
   one. No other 404 is remembered.
+- **Shared-limit storms.** A shared-scope 429 goes to its client at once, never retried by Sluice. Once one resource
+  has collected 20 of them within 10 seconds, Sluice answers that resource's requests itself, with a shared-scope `429`,
+  for Discord's cooldown, at least 10 seconds and at most a minute: Discord does not count these 429s, but its edge
+  sees every one. A resource is a route on one channel, guild or webhook. An interaction follow-up's path names only
+  its application, so a closure covers all of that application's follow-ups. Closures are not kept across a restart.
 - **Authorization schemes Discord rejects.** A request whose `Authorization` scheme is not `Bot`, `Bearer` or `Basic`
   gets its `401` from Sluice, on routes where the token is what authenticates, instead of collecting one from Discord.
 
@@ -252,14 +258,25 @@ that route for the response's `Retry-After`, or for 60 seconds when there is non
 Then it finds out what was refused by requesting `/api/v10/gateway` itself, with its own `User-Agent` and no token,
 while other traffic carries on:
 
-- **The edge refuses that request too.** The IP is blocked. Sluice sends nothing for the `Retry-After`, answers every
-  request in the meantime with a 429 that has no `Via`, so that clients react as they would to the block itself, and
-  reports `503` on `/sluice/health/upstream`.
+- **The edge refuses that request too.** The IP is blocked. Sluice sends nothing for the `Retry-After`, up to 25
+  hours, since the edge can block an IP for a day. It answers every request in the meantime with a 429 that has no
+  `Via`, so that clients react as they would to the block itself, and reports `503` on `/sluice/health/upstream`.
+  While the block lasts, it asks the edge again every `CLOUDFLARE_PROBE_INTERVAL`.
 - **Discord answers it.** Only that client's requests were refused, for instance because of their `User-Agent`.
   Nothing else stops, and Sluice does not check again for 30 seconds.
 - **No answer arrives.** That settles nothing. The route stays backed off, and the next refusal triggers a new check.
 
 Set it to `false` when something between Sluice and Discord removes `Via`, such as an outbound proxy.
+
+### `CLOUDFLARE_PROBE_INTERVAL`
+
+How often, while a Cloudflare block pauses traffic, Sluice asks the edge whether the block still holds, with the same
+request it confirmed the block with. An answer from Discord ends the pause there and then, so a block that lifts
+early costs at most one interval. A refusal re-arms the pause from its own `Retry-After` and never shortens it. No
+answer at all leaves the pause as it is. One check runs at a time, and client requests stay paused throughout.
+
+`0` turns the checks off, and a pause then lasts its whole `Retry-After`. A value under 1,000 milliseconds is refused,
+as it would only hammer the edge.
 
 ### `STATE_FILE`
 

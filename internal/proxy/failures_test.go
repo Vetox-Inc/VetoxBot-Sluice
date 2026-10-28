@@ -715,7 +715,9 @@ func TestHugeCloudflarePauseIsCappedBeforeDurationConversion(t *testing.T) {
 	for value, want := range map[string]time.Duration{
 		"1e300": maxCloudflarePause,
 		"9e9":   maxCloudflarePause,
-		"7200":  maxCloudflarePause,
+		"90000": maxCloudflarePause,
+		"81151": 81151 * time.Second,
+		"7200":  2 * time.Hour,
 		"30":    30 * time.Second,
 		"0.2":   time.Second,
 		"-5":    defaultCloudflarePause,
