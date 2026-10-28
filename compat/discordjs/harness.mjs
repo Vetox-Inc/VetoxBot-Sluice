@@ -76,6 +76,9 @@ async function handle(req, res) {
       return respond(res, 429, { message: 'The resource is being rate limited.', retry_after: 60, global: false }, { 'Retry-After': '60', 'X-RateLimit-Limit': '10', 'X-RateLimit-Remaining': '8', 'X-RateLimit-Reset-After': '60', 'X-RateLimit-Bucket': 'r-3', 'X-RateLimit-Scope': 'shared' });
     case /\/channels\/100000000000000003\/messages\/\d+\/reactions\//.test(path):
       return respond(res, 204);
+    // A resource whose shared limit never lifts.
+    case path === '/api/v10/channels/100000000000000011/messages':
+      return respond(res, 429, { message: 'The resource is being rate limited.', retry_after: 0.5, global: false }, { 'Retry-After': '1', 'X-RateLimit-Limit': '5', 'X-RateLimit-Remaining': '4', 'X-RateLimit-Reset-After': '5', 'X-RateLimit-Bucket': 'm-11', 'X-RateLimit-Scope': 'shared' });
     // Discord slower than REQUEST_TIMEOUT.
     case path === '/api/v10/channels/100000000000000004/messages':
       await sleep(7000);
@@ -250,6 +253,19 @@ await scenario('Shared-scope 429: one reaction waits, the bucket stays open', as
   await rest().put(route('200000000000000004'));
   assert(Date.now() - afterStarted < 1200, 'a long shared limit closed the bucket');
   return `limited reaction ${waited}ms, other ${other}ms, long limit surfaced as RateLimitError(scope=shared)`;
+});
+
+await scenario("Shared-limit storm: Sluice answers the resource itself, as a shared-scope 429", async () => {
+  const route = Routes.channelMessages('100000000000000011');
+  const client = rest({ rejectOnRateLimit: () => true });
+  for (let index = 0; index < 20; index++) {
+    const error = await thrown(client.post(route, { body: { content: 'x' } }));
+    assert(error instanceof RateLimitError && error.scope === 'shared', `request ${index + 1}: ${error}`);
+  }
+  const closed = await thrown(client.post(route, { body: { content: 'x' } }));
+  assert(closed instanceof RateLimitError && closed.scope === 'shared' && closed.retryAfter >= 9000, `after the storm: ${closed} (retryAfter ${closed.retryAfter})`);
+  assert(count('POST /api/v10/channels/100000000000000011/messages') === 20, `Discord saw ${count('POST /api/v10/channels/100000000000000011/messages')} requests`);
+  return `20 shared 429s from Discord, then Sluice's own with retryAfter ${closed.retryAfter}ms; Discord called 20 times`;
 });
 
 await scenario("Sluice's errors are readable DiscordAPIErrors", async () => {
