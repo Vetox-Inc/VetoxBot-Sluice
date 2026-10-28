@@ -92,9 +92,10 @@ with `Retry-After`. A body it cannot send again gets Discord's original 429, nev
 status is retried.
 
 A shared-scope 429 limits one resource, such as one message's reactions, while its bucket keeps capacity. Sluice keeps
-the bucket open for everything else and makes only that request wait, or returns the 429 at once when the wait is too
-long. Cooldowns are timed by the `retry_after` in Discord's body, which is more precise than the whole seconds of
-`Retry-After`.
+the bucket open for everything else and returns that 429 to its client at once, unretried: every client of the resource
+competes for it, so a retry from Sluice would only add to the refusals Discord's edge sees. The client waits out
+`Retry-After` itself. Cooldowns are timed by the `retry_after` in Discord's body, which is more precise than the whole
+seconds of `Retry-After`.
 
 Sluice prevents avoidable 429s and absorbs the ones it can, but it cannot promise zero. Discord can change limits
 and omit headers, and requests made outside Sluice with the same token are invisible to it. Some routes are limited
@@ -112,6 +113,11 @@ handle 429s.
   `Authorization` scheme Discord never accepts, anything but `Bot`, `Bearer` and `Basic`, gets a 401 from Sluice.
 - **Deleted webhooks.** Once Discord reports a webhook as unknown (code 10015) or its token as invalid (code 50027),
   Sluice answers further calls to that webhook itself for an hour. Other 404s pass through.
+- **Shared-limit storms.** Discord does not count shared-scope 429s as invalid requests, but its edge still sees each
+  one. Once one resource collects 20 within 10 seconds, Sluice closes it and answers its requests with a shared-scope
+  `429` itself for Discord's cooldown, at least 10 seconds and at most a minute. A resource is a route on one channel,
+  guild or webhook; an interaction follow-up's path names only its application, so a closure covers all of that
+  application's follow-ups. Closures are not kept across restarts.
 - **Cloudflare blocks.** Discord's own responses carry `Via: 1.1 google`, so a 429 or 403 without it came from Discord's
   edge. Sluice returns it without a retry, backs that route off, and checks with a request of its own whether the edge
   blocks this IP or only that client. For a block, Sluice pauses all outbound traffic for the response's `Retry-After`
@@ -130,7 +136,7 @@ omits `Via` so clients treat it like the block it reports. Sluice's own errors (
 
 | Status | When |
 | --- | --- |
-| `429` | The request could not get its turn within `QUEUE_TIMEOUT` or found its queue full, a cooldown outlasts that deadline, or a Cloudflare block has paused traffic. Carries `Retry-After` and Discord's rate-limit headers. |
+| `429` | The request could not get its turn within `QUEUE_TIMEOUT` or found its queue full, a cooldown outlasts that deadline, its resource is closed after a storm of shared-scope 429s, or a Cloudflare block has paused traffic. Carries `Retry-After` and Discord's rate-limit headers. |
 | `401` | Discord already rejected the token (see `DISABLE_401_LOCK`), a webhook's token is known to be invalid, or the `Authorization` scheme is one Discord never accepts. |
 | `403` | `CLIENT_AUTH_SECRET` is set and the request did not carry it. |
 | `404` | The webhook is known to be deleted, or the path is under the reserved `/sluice/` prefix. |

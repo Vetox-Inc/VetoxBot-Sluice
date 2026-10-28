@@ -90,6 +90,8 @@ type requestMetadata struct {
 	// by a webhook or interaction token in the path.
 	credentialScoped bool
 	webhookKey       string
+	// sharedLimitKey names the resource for sharedLimitGuard; see sharedResourceKey.
+	sharedLimitKey string
 }
 
 type peerTarget struct {
@@ -114,6 +116,7 @@ type Proxy struct {
 	invalidRequests *invalidRequestGuard
 	webhooks        *webhookGuard
 	cloudflare      *cloudflareGuard
+	sharedLimits    *sharedLimitGuard
 	applications    *applicationSet
 	bucketSlots     *resourceBudget
 	inFlight        *resourceBudget
@@ -287,6 +290,7 @@ func New(config Config) (*Proxy, error) {
 		invalidRequests: newInvalidRequestGuard(ready.invalidLimit, invalidRequestWindow),
 		webhooks:        newWebhookGuard(),
 		cloudflare:      &cloudflareGuard{},
+		sharedLimits:    newSharedLimitGuard(),
 		applications:    newApplicationSet(),
 		bucketSlots:     newResourceBudget(int64(config.MaxBucketStates)),
 		inFlight:        newResourceBudget(int64(config.MaxInFlightRequests)),
@@ -465,6 +469,8 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if botWide {
 		bucketPath = metricsPath
 	}
+	// Taken before metricsPath is capped for labels, so unrelated routes never share a key.
+	sharedLimitKey := sharedResourceKey(request.Method, metricsPath, request.URL.Path)
 	if p.config.EnableMetrics {
 		metricsPath = metricsRouteLabel(metricsPath)
 	} else if len(metricsPath) > maxMetricsRouteLabelBytes {
@@ -539,6 +545,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		interaction:      interaction,
 		credentialScoped: credentialScoped,
 		webhookKey:       webhookKey,
+		sharedLimitKey:   sharedLimitKey,
 	}
 	ctx := context.WithValue(request.Context(), requestMetadataContextKey, metadata)
 	p.discordProxy.ServeHTTP(writer, request.WithContext(ctx))
