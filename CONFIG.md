@@ -497,7 +497,9 @@ The proxy port answers two health checks, which do not count against `MAX_IN_FLI
 - **`/sluice/healthz`** says whether this node should receive traffic. It answers `200`, and `503` while Sluice is
   draining or stopping, or while its cluster has more members than `CLUSTER_MAX_NODES`.
 - **`/sluice/health/upstream`** says whether Discord is accepting this IP. It answers `503` during a Cloudflare block
-  and once 80% of the invalid-request budget is used. Alert on it. Do not restart on it: a restart cures neither.
+  and once 80% of the invalid-request budget is used. Alert on it. Do not restart on it: a restart cures neither. Its
+  `200` carries `Sluice-Edge-Clear-For`, the whole seconds since the last edge pause ended or, if none has since,
+  since the node started.
 
 On `SIGTERM` or `SIGINT` Sluice drains, and on `SIGHUP` too unless it was started to ignore that signal, as `nohup`
 does. The npm launcher passes a hangup on either way, so `nohup` does not keep Sluice running there.

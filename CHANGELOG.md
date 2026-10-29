@@ -26,6 +26,9 @@ and [Semantic Versioning](https://semver.org/).
   metrics: `sluice_upstream_refusals`, `sluice_refusal_guard_blocked`, `sluice_refusal_guard_trips_total`,
   `sluice_edge_provisional_pauses_total` and `sluice_interaction_short_circuits_total`, and the `sluice_failures_total`
   reasons `refusal_rate`, `upstream_rate_limit` and `shared_rate_limit_reclosed`.
+- A `200` from `/sluice/health/upstream` carries `Sluice-Edge-Clear-For`: the whole seconds since the last edge pause
+  ended, or since the node started. A client waiting out a ban can tell a lift that holds from a leak without probing
+  Discord, and need not wait out its own calm period after every restart.
 
 ### Fixed
 

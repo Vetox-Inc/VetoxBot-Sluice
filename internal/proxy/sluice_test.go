@@ -956,3 +956,54 @@ func TestPausedProbeCadenceShortensOnlyToConfirm(t *testing.T) {
 		t.Fatalf("a probe interval shorter than the confirmation delay was lengthened to %v", next)
 	}
 }
+
+func TestCloudflareGuardClearFor(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	guard := &cloudflareGuard{clearSince: start}
+	at := func(offset time.Duration) time.Time { return start.Add(offset) }
+	expect := func(now time.Time, want time.Duration, wantOK bool) {
+		t.Helper()
+		if got, ok := guard.clearFor(now); got != want || ok != wantOK {
+			t.Fatalf("clearFor(+%v) = %v, %v; want %v, %v", now.Sub(start), got, ok, want, wantOK)
+		}
+	}
+	expect(at(time.Minute), time.Minute, true)
+
+	guard.mu.Lock()
+	guard.pauseLocked(at(2*time.Minute), 10*time.Minute)
+	guard.mu.Unlock()
+	expect(at(5*time.Minute), 0, false)
+	// A pause that runs its course counts from its end, not from the start of the node.
+	expect(at(15*time.Minute), 3*time.Minute, true)
+
+	guard.mu.Lock()
+	guard.pauseLocked(at(20*time.Minute), time.Hour)
+	guard.mu.Unlock()
+	guard.settle(at(21*time.Minute), edgeClear, 0)
+	expect(at(21*time.Minute+30*time.Second), 0, false)
+	// The confirming probe lifts the pause early: the count starts there.
+	guard.settle(at(22*time.Minute), edgeClear, 0)
+	expect(at(25*time.Minute), 3*time.Minute, true)
+}
+
+func TestUpstreamHealthReportsEdgeClearTime(t *testing.T) {
+	proxy := newTestProxy(t, testConfig(nil))
+	proxy.cloudflare.mu.Lock()
+	proxy.cloudflare.clearSince = time.Now().Add(-7 * time.Minute)
+	proxy.cloudflare.mu.Unlock()
+	health := serve(proxy, http.MethodGet, "/sluice/health/upstream", "", nil)
+	if health.Code != http.StatusOK {
+		t.Fatalf("upstream health = %d, want 200", health.Code)
+	}
+	if got := health.Header().Get(edgeClearForHeader); got != "420" && got != "421" {
+		t.Fatalf("%s = %q, want 420", edgeClearForHeader, got)
+	}
+
+	proxy.cloudflare.mu.Lock()
+	proxy.cloudflare.pauseLocked(time.Now(), time.Hour)
+	proxy.cloudflare.mu.Unlock()
+	health = serve(proxy, http.MethodGet, "/sluice/health/upstream", "", nil)
+	if health.Code != http.StatusServiceUnavailable || health.Header().Get(edgeClearForHeader) != "" {
+		t.Fatalf("upstream health during a pause = %d with %s %q", health.Code, edgeClearForHeader, health.Header().Get(edgeClearForHeader))
+	}
+}

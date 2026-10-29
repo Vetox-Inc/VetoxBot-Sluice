@@ -318,7 +318,7 @@ func New(config Config) (*Proxy, error) {
 		refusals:          newRefusalGuard(ready.refusalLimit),
 		webhooks:          newWebhookGuard(),
 		interactionTokens: newInteractionTokenGuard(),
-		cloudflare:        &cloudflareGuard{},
+		cloudflare:        &cloudflareGuard{clearSince: time.Now()},
 		sharedLimits:      newSharedLimitGuard(),
 		applications:      newApplicationSet(),
 		bucketSlots:       newResourceBudget(int64(config.MaxBucketStates)),
@@ -411,6 +411,10 @@ func (p *Proxy) PublicHandler() http.Handler {
 	})
 }
 
+// edgeClearForHeader, on a 200 from /sluice/health/upstream, is the whole seconds since the last
+// edge pause ended, or since this node started if none has since.
+const edgeClearForHeader = "Sluice-Edge-Clear-For"
+
 func isHealthPath(path string) bool {
 	return path == "/sluice/healthz" || path == "/nirn/healthz" || path == "/sluice/health/upstream"
 }
@@ -444,10 +448,14 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		return
 	case "/sluice/health/upstream":
-		if problem := p.upstreamProblem(time.Now()); problem != "" {
+		now := time.Now()
+		if problem := p.upstreamProblem(now); problem != "" {
 			writeUnavailable(writer, problem)
 		} else {
 			markGenerated(writer.Header())
+			if clear, ok := p.cloudflare.clearFor(now); ok {
+				writer.Header().Set(edgeClearForHeader, strconv.FormatInt(int64(clear/time.Second), 10))
+			}
 			writer.WriteHeader(http.StatusOK)
 		}
 		return
