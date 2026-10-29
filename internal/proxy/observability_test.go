@@ -72,10 +72,11 @@ func TestErrorLogsIncrementErrorCounter(t *testing.T) {
 
 // metricSuffixes names every metric of Sluice's own, without its namespace.
 var metricSuffixes = []string{
-	"build_info", "cloudflare_blocked", "cloudflare_blocks_total", "deprecated_api_requests_total", "edge_refusals_total",
-	"error", "failures_total", "global_limit", "invalid_requests", "invalid_requests_limit", "open_connections", "queue_wait_seconds",
-	"requests",
-	"requests_routed_error", "requests_routed_received", "requests_routed_sent", "resource_limit", "resource_usage",
+	"build_info", "cloudflare_blocked", "cloudflare_blocks_total", "deprecated_api_requests_total",
+	"edge_provisional_pauses_total", "edge_refusals_total", "error", "failures_total", "global_limit",
+	"interaction_short_circuits_total", "invalid_requests", "invalid_requests_limit", "open_connections",
+	"queue_wait_seconds", "refusal_guard_blocked", "refusal_guard_trips_total", "requests", "requests_routed_error",
+	"requests_routed_received", "requests_routed_sent", "resource_limit", "resource_usage", "upstream_refusals",
 	"warnings_total", "webhook_short_circuits_total",
 }
 

@@ -19,6 +19,13 @@ and [Semantic Versioning](https://semver.org/).
   `sluice_failures_total` counts both with the reasons `shared_rate_limit` and `shared_rate_limit_breaker`.
 - `CLOUDFLARE_PROBE_INTERVAL`: while a block pauses traffic, Sluice probes the edge every 15 minutes by default,
   ending the pause early once Discord answers and re-arming it while the edge still refuses.
+- `MAX_REFUSALS_PER_SECOND`, 20 by default: a ceiling on the 401, 403 and 429 responses, shared-scope ones included,
+  this IP collects per second. Past half of it, requests go out only while refusals plus requests in flight stay below
+  it; at it, Sluice answers every request with a `429` itself for 2 seconds. The invalid-request budget bounded only
+  the 10-minute total, which a flood could spend in a second. New metrics: `sluice_upstream_refusals`,
+  `sluice_refusal_guard_blocked`, `sluice_refusal_guard_trips_total`, `sluice_edge_provisional_pauses_total` and
+  `sluice_interaction_short_circuits_total`, and the `sluice_failures_total` reasons `refusal_rate`,
+  `upstream_rate_limit` and `shared_rate_limit_reclosed`.
 
 ### Fixed
 
@@ -26,6 +33,22 @@ and [Semantic Versioning](https://semver.org/).
   first: during a ban the edge lets the odd request through, and one such probe resumed every client. After an early
   end, the next refusal can re-arm the pause at once. An answer that is not a refusal but not Discord's success
   either, such as a 5xx or an error page without `Via`, no longer counts as the block lifting.
+- Sluice no longer retries a 429 on an interaction or webhook-token route, and retries any other 429 at most once,
+  only after a `Retry-After` of at most 5 seconds. Retries of 429s on interaction routes, which skip the global limit,
+  multiplied a client's follow-ups into hundreds of refusals a second.
+- A probe that cannot tell whether the edge blocks this IP, by a 5xx, an error page or no answer, pauses traffic
+  provisionally for a minute instead of letting every refusal start another probe. Probes on suspicion run at most once
+  every 30 seconds whatever they find, and ten edge refusals within those 30 seconds pause traffic provisionally even
+  after a clear probe, since the edge lets the odd request through during a ban.
+- When a shared-limit closure ends, one trial request goes first: a shared-scope 429 closes the resource again, and
+  only another answer reopens it. Every request waiting on the resource went through at once.
+- A credential's 401 lock is checked before every attempt, so requests already queued when the first 401 arrived no
+  longer reach Discord.
+- An interaction token Discord answered 401, such as an expired one, is answered by Sluice for 15 minutes instead of
+  reaching Discord on every follow-up.
+- `STATE_FILE` is saved at once when a Cloudflare pause starts or changes, after every 100th invalid response and when
+  the refusal guard trips, besides every 5 seconds: a crash during a flood could forget seconds of invalid responses.
+  Its format stays readable by 1.0.0.
 
 ## 1.1.0 - 2026-10-04
 

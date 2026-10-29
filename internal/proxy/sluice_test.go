@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -178,7 +179,7 @@ func TestEdgeRefusalOfOneClientDoesNotPauseTheIP(t *testing.T) {
 	}
 }
 
-func TestFailedEdgeProbeProvesNothing(t *testing.T) {
+func TestFailedEdgeProbePausesOnlyProvisionally(t *testing.T) {
 	var probes atomic.Int64
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Path == "/api/v10/gateway" {
@@ -192,21 +193,25 @@ func TestFailedEdgeProbeProvesNothing(t *testing.T) {
 	config.StateFile = filepath.Join(t.TempDir(), "state.json")
 	proxy := newTestProxy(t, config)
 
-	for index, path := range []string{"/api/v10/channels/1/messages", "/api/v10/channels/2/messages"} {
+	for _, path := range []string{"/api/v10/channels/1/messages", "/api/v10/channels/2/messages"} {
 		serve(proxy, http.MethodGet, path, "", nil)
 		waitForEdgeProbe(t, proxy)
-		if pause := proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
-			t.Fatalf("a probe that failed paused every request for %v", pause)
-		}
-		if got := probes.Load(); got != int64(index+1) {
-			t.Fatalf("after refusal %d, %d probes ran; a failed probe must let the next refusal probe again", index+1, got)
-		}
+	}
+	// A probe that failed proves no block, but leaves the refusal unexplained: traffic pauses for
+	// provisionalEdgePause, not for a block's Retry-After, and no further probe runs meanwhile.
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause <= 0 || pause > provisionalEdgePause {
+		t.Fatalf("a probe that failed paused traffic for %v, want up to %v", pause, provisionalEdgePause)
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("%d probes ran; a failed probe must hold off the next", got)
 	}
 	if err := proxy.saveState(); err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := os.ReadFile(config.StateFile); err != nil || strings.Contains(string(saved), "edgeBlockedUntil") {
-		t.Fatalf("state file after failed probes = %s (%v), want no Cloudflare block", saved, err)
+	saved, err := os.ReadFile(config.StateFile)
+	var state savedState
+	if err != nil || json.Unmarshal(saved, &state) != nil || state.EdgeBlockedUntil > time.Now().Add(provisionalEdgePause).UnixMilli() {
+		t.Fatalf("state file after a failed probe = %s (%v), want at most the provisional pause", saved, err)
 	}
 }
 
@@ -894,7 +899,7 @@ func TestTwoClearProbesLiftAPauseWithoutHoldingOffDetection(t *testing.T) {
 	}
 	// The edge let two probes through, not the IP's whole traffic: the next refusal must be
 	// able to re-arm the pause at once.
-	if !proxy.cloudflare.suspect(time.Now()) {
+	if proxy.cloudflare.suspect(time.Now()) != suspicionProbe {
 		t.Fatal("after an early lift the next refusal cannot probe for edgeProbeInterval")
 	}
 	logs := output.String()

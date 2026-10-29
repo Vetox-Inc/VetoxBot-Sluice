@@ -102,7 +102,7 @@ func TestSharedRateLimitStormClosesItsResource(t *testing.T) {
 	output := captureLog(t)
 	const application, otherApplication = "203039963636301824", "303039963636301824"
 	var calls, otherCalls, channelCalls atomic.Int64
-	proxy := newTestProxy(t, testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		switch {
 		case strings.Contains(request.URL.Path, "/webhooks/"+application+"/"):
 			calls.Add(1)
@@ -113,7 +113,10 @@ func TestSharedRateLimitStormClosesItsResource(t *testing.T) {
 			channelCalls.Add(1)
 		}
 		return testResponse(request, http.StatusNoContent, discordVia.Clone(), nil), nil
-	})))
+	}))
+	// The storm is faster than the refusal guard allows; this test is about the resource alone.
+	config.MaxRefusalsPerSecond = 1000
+	proxy := newTestProxy(t, config)
 	revision := proxy.stateRevision()
 
 	for interaction := range sharedLimitThreshold {
@@ -214,8 +217,25 @@ func TestSharedLimitGuardClosesOnlyForABurst(t *testing.T) {
 		t.Fatalf("the key was still closed for %v after its cooldown", delay)
 	}
 
-	// Reopened, the key needs a whole new burst, and a long cooldown is capped.
+	// Its closure over, the key lets one trial through, and refusals of other requests prove
+	// nothing until the trial does.
 	now = now.Add(minSharedLimitCooldown)
+	if delay, trial := guard.admit(key, now); delay != 0 || !trial {
+		t.Fatalf("the first request after the closure got %v, trial %v; want the trial", delay, trial)
+	}
+	if delay, trial := guard.admit(key, now); delay != sharedTrialRetryDelay || trial {
+		t.Fatalf("a second request during the trial got %v, trial %v; want %v", delay, trial, sharedTrialRetryDelay)
+	}
+	for refusal := range 2 * sharedLimitThreshold {
+		if _, closed := guard.record(key, time.Second, now); closed {
+			t.Fatalf("refusal %d during the trial closed the key", refusal)
+		}
+	}
+	if _, closed := guard.settleTrial(key, now, &http.Response{StatusCode: http.StatusNoContent}, rateLimitInfo{}); closed || guard.retryAfter(key, now) != 0 {
+		t.Fatal("a successful trial did not open the key")
+	}
+
+	// Reopened, the key needs a whole new burst, and a long cooldown is capped.
 	for refusal := 1; refusal < sharedLimitThreshold; refusal++ {
 		if _, closed := guard.record(key, 10*time.Minute, now); closed {
 			t.Fatalf("refusal %d after reopening closed the key early", refusal)

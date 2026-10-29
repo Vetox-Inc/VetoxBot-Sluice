@@ -239,7 +239,8 @@ func TestInteractionUnauthorizedDoesNotLockCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = first.Body.Close()
-	second, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), state, http.MethodPost, path, nil, true))
+	// Another interaction: the first one's token is answered locally now.
+	second, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), state, http.MethodPost, "/api/v10/interactions/124/token2/callback", nil, true))
 	if err != nil {
 		t.Fatal(err)
 	}

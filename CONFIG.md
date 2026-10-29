@@ -204,12 +204,13 @@ before it reaches Discord. A request of unknown length is forwarded without a co
 | Setting | Default | Accepts |
 | --- | --- | --- |
 | `DISABLE_401_LOCK` | `false` | `true` or `false` |
+| `MAX_REFUSALS_PER_SECOND` | `20` | 1 to 1,000 |
 | `CLOUDFLARE_BAN_DETECTION` | `true` | `true` or `false` |
 | `CLOUDFLARE_PROBE_INTERVAL` | `900000` | `0`, or 1,000 to 86,400,000 ms |
 | `STATE_FILE` | a file in the user cache directory | A path, or empty |
 
 Discord temporarily blocks an IP at its edge once that IP has received 10,000 responses with status 401, 403 or 429
-inside 10 minutes. A 429 whose scope is `shared` is the one exception. Four of Sluice's protections have no setting:
+inside 10 minutes. A 429 whose scope is `shared` is the one exception. Five of Sluice's protections have no setting:
 
 - **The invalid-request budget.** Sluice counts those responses over a rolling 10 minutes and stops sending at 9,500,
   short of Discord's threshold. Until old responses age out, requests get `503`. In a cluster the budget is divided
@@ -219,10 +220,14 @@ inside 10 minutes. A 429 whose scope is `shared` is the one exception. Four of S
 - **Deleted webhooks.** When Discord reports a webhook as unknown (code 10015) or its token as invalid (code 50027),
   Sluice answers calls to that webhook itself for the next hour, because Discord penalises an IP that keeps calling
   one. No other 404 is remembered.
+- **Expired interaction tokens.** Once Discord answers an interaction token with a `401`, as it does after the token's
+  15 minutes, Sluice answers that token's later calls itself for 15 minutes, and counts them in
+  `sluice_interaction_short_circuits_total`.
 - **Shared-limit storms.** A shared-scope 429 goes to its client at once, never retried by Sluice. Once one resource
   has collected 20 of them within 10 seconds, Sluice answers that resource's requests itself, with a shared-scope `429`,
   for Discord's cooldown, at least 10 seconds and at most a minute: Discord does not count these 429s, but its edge
-  sees every one. A resource is a route on one channel, guild or webhook. An interaction follow-up's path names only
+  sees every one. When the cooldown ends, a single request tries the resource first: another shared-scope 429 closes
+  it again, and any other answer opens it to everyone. A resource is a route on one channel, guild or webhook. An interaction follow-up's path names only
   its application, so a closure covers all of that application's follow-ups. Closures are not kept across a restart.
 - **Authorization schemes Discord rejects.** A request whose `Authorization` scheme is not `Bot`, `Bearer` or `Basic`
   gets its `401` from Sluice, on routes where the token is what authenticates, instead of collecting one from Discord.
@@ -239,6 +244,9 @@ every later request with that token itself, with a `401` in Discord's shape. Cal
 an interaction token in their path are left out in both directions: a `401` there says nothing about the bot's token,
 and a bot token already marked invalid does not block them.
 
+The lock is checked again just before each request is sent, so requests already waiting in a queue when the first
+`401` arrives are answered by Sluice too.
+
 Turn the lock off, with `true`, only when a token Discord has rejected can start working again as it is. Sluice
 forgets what it knew about a token once the token has been idle, with no cooldown in force, for more than 10 minutes.
 A request Sluice answers itself counts as use, so a bot that keeps calling with a rejected token stays locked until it
@@ -249,6 +257,23 @@ With the lock off, a `401` leaves the token unjudged: it proves nothing either w
 requests, Sluice sends that token's requests one at a time, as it does for a token it has not seen before, so a token
 Discord keeps rejecting cannot spend the invalid-request budget in bursts. The requests that wait behind may get a
 `429` once `QUEUE_TIMEOUT` has passed.
+
+### `MAX_REFUSALS_PER_SECOND`
+
+How many refusals this node may collect per second: every 401, 403 and 429 from upstream, shared-scope 429s and
+refusals by Discord's edge included, 404s not. The invalid-request budget bounds the 10-minute total, but a flood could
+spend it in a second, and shared-scope 429s are outside it although the edge sees each one.
+
+Once the last second holds half the ceiling in refusals, Sluice sends a request only while those refusals plus the
+requests in flight stay below the ceiling, and the others wait for a slot within `QUEUE_TIMEOUT`, then get a `429` they
+can retry. It keeps this up for 30 seconds past the last such second. When refusals reach the ceiling, Sluice answers
+every request itself for 2 seconds, with a global `429` carrying `Retry-After`, warns in its log, and counts the trip
+in `sluice_refusal_guard_trips_total` and each answer as `refusal_rate` in `sluice_failures_total`. Only requests
+already in flight when refusals start can pass the ceiling, and only once. A trip is kept in `STATE_FILE`, so a
+restart resumes the 30 seconds of caution.
+
+In a cluster, each node gets the ceiling divided by `CLUSTER_MAX_NODES`, rounded down and never less than 1, as with
+the invalid-request budget.
 
 ### `CLOUDFLARE_BAN_DETECTION`
 
@@ -263,8 +288,15 @@ while other traffic carries on:
   `Via`, so that clients react as they would to the block itself, and reports `503` on `/sluice/health/upstream`.
   While the block lasts, it asks the edge again every `CLOUDFLARE_PROBE_INTERVAL`.
 - **Discord answers it.** Only that client's requests were refused, for instance because of their `User-Agent`.
-  Nothing else stops, and Sluice does not check again for 30 seconds.
-- **No answer arrives.** That settles nothing. The route stays backed off, and the next refusal triggers a new check.
+  Nothing else stops.
+- **No answer arrives, or one that is neither a refusal nor Discord's success.** The refusal stays unexplained, so
+  Sluice sends nothing for a minute, provisionally.
+
+After a check, whatever it found, refusals do not trigger another for 30 seconds. They keep counting meanwhile: the
+tenth within those 30 seconds stops all sending for a minute, provisionally, even when the check found the edge clear
+or has not answered yet, since during a block the edge lets the odd request through. Each provisional pause is logged
+and counted in `sluice_edge_provisional_pauses_total`. Refusals therefore cause at most one check every 30 seconds, and
+a pause at most one every `CLOUDFLARE_PROBE_INTERVAL`, besides the confirming one.
 
 Set it to `false` when something between Sluice and Discord removes `Via`, such as an outbound proxy.
 
@@ -283,11 +315,14 @@ as it would only hammer the edge.
 ### `STATE_FILE`
 
 Where Sluice keeps what protects your IP across a restart: the invalid responses of the last 10 minutes, a Cloudflare
-block still in force, and the webhooks found deleted or invalid in the last hour. Discord goes on counting all three
-while Sluice is down, so a restart without this file starts from a count that is too low.
+pause still in force, the webhooks found deleted or invalid in the last hour, and the caution that follows a trip of
+`MAX_REFUSALS_PER_SECOND`. Discord goes on counting while Sluice is down, so a restart without this file starts from a
+count that is too low.
 
 Sluice reads the file when it starts, replaces it atomically every 5 seconds while its contents change, and writes it
-once more when it stops. The file holds no token, and webhooks appear only as hashes. A file Sluice cannot read is
+once more when it stops. It also writes it at once when a Cloudflare pause starts or changes, after every 100th invalid
+response and when the refusal ceiling trips, so even a `kill -9` in a flood loses little. Fields added since 1.0.0 are
+optional, and 1.0.0 still reads a file this version writes. The file holds no token, and webhooks appear only as hashes. A file Sluice cannot read is
 renamed with `.invalid` at the end rather than overwritten. A saved block is not restored while
 `CLOUDFLARE_BAN_DETECTION` is `false`.
 
@@ -374,8 +409,9 @@ not a count of the requests clients sent.
 
 `sluice_failures_total` counts, by `reason`, every request Sluice answered with an error of its own and every one
 whose client left before its answer was complete. Every reason is exported from the start, at 0, so that its first
-failure already shows as an increase. Two answers of Sluice's own are left out: a health check's, and the repeat of
-Discord's answer for a webhook that is gone, which `sluice_webhook_short_circuits_total` counts.
+failure already shows as an increase. Three answers of Sluice's own are left out: a health check's, the repeat of
+Discord's answer for a webhook that is gone, which `sluice_webhook_short_circuits_total` counts, and the repeat of its
+`401` for an interaction token, which `sluice_interaction_short_circuits_total` counts.
 
 These are faults and exhausted limits, the ones to alert on. Sluice also logs a warning for each, with the route and
 the cause, at most once every 30 seconds for a reason; a warning then says how many it left out.
@@ -403,7 +439,10 @@ These are answers a client retries or expects, and are only counted:
 | `queue_full` | `429` | A queue already held `MAX_QUEUE_DEPTH` requests |
 | `rate_limit_deadline` | `429` | A cooldown outlasts the request's deadline, so it is told at once |
 | `shared_rate_limit` | `429` | Discord answered with a shared-scope 429, which goes to the client at once rather than being retried |
-| `shared_rate_limit_breaker` | `429` | One resource collected 20 shared-scope 429s within 10 seconds, so Sluice answers for it until its cooldown ends |
+| `shared_rate_limit_breaker` | `429` | One resource collected 20 shared-scope 429s within 10 seconds, so Sluice answers for it until its cooldown ends, and while the one request that tries it afterwards is out |
+| `shared_rate_limit_reclosed` | `429` | The request that tried a resource after its cooldown got another shared-scope 429, so the resource closes again |
+| `upstream_rate_limit` | `429` | Discord answered with a 429 that Sluice passes on unretried: on an interaction or webhook-token route, after one retry, or without a `Retry-After` of at most 5 seconds |
+| `refusal_rate` | `429` | Refusals reached `MAX_REFUSALS_PER_SECOND`, so Sluice answers every request for 2 seconds |
 | `cloudflare_pause` | `429` | A Cloudflare block has paused traffic |
 | `unsupported_authorization` | `401` | The `Authorization` scheme is one Discord never accepts |
 | `client_auth` | `403` | The request did not carry `CLIENT_AUTH_SECRET` |
