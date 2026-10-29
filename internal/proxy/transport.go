@@ -329,6 +329,8 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 				t.proxy.refusals.complete(time.Now(), refused)
 			}
 		}
+		// Deferred as well, so a panic below cannot keep the slot forever.
+		defer endRefusalSlot(false)
 		// The refusal guard may have kept the request waiting for a slot.
 		if response := answerLocally(time.Now()); response != nil {
 			endRefusalSlot(false)
@@ -350,6 +352,8 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 				ProxyFailures.WithLabelValues("shared_rate_limit_reclosed").Inc()
 			}
 		}
+		// A trial that never settles would keep its resource answering locally for good.
+		defer settleTrial(nil, rateLimitInfo{})
 		body, err := replay.body(attempt)
 		if err != nil {
 			endRefusalSlot(false)
@@ -370,6 +374,15 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			settleTrial(nil, rateLimitInfo{})
 			return nil, errInvalidRequestBudget
 		}
+		invalidReserved := true
+		completeInvalid := func(invalid bool) bool {
+			if !invalidReserved {
+				return false
+			}
+			invalidReserved = false
+			return t.proxy.invalidRequests.complete(time.Now(), invalid)
+		}
+		defer completeInvalid(false)
 		var started time.Time
 		if t.proxy.config.EnableMetrics {
 			started = time.Now()
@@ -379,7 +392,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		response, err := t.base.RoundTrip(outbound)
 		if err != nil {
-			t.proxy.invalidRequests.complete(time.Now(), false)
+			completeInvalid(false)
 			endRefusalSlot(false)
 			settleTrial(nil, rateLimitInfo{})
 			resultErr := contextCauseOrError(attemptContext, err)
@@ -390,7 +403,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			return nil, resultErr
 		}
 		if response == nil {
-			t.proxy.invalidRequests.complete(time.Now(), false)
+			completeInvalid(false)
 			endRefusalSlot(false)
 			settleTrial(nil, rateLimitInfo{})
 			endAttempt()
@@ -400,7 +413,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		if response.Body == nil {
 			response.Body = http.NoBody
 		}
-		if t.proxy.invalidRequests.complete(time.Now(), invalidDiscordResponse(response)) {
+		if completeInvalid(invalidDiscordResponse(response)) {
 			t.proxy.saveStateSoon()
 		}
 		endRefusalSlot(isRefusal(response))

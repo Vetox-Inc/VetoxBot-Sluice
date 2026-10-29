@@ -135,7 +135,8 @@ type Proxy struct {
 	inFlight          *resourceBudget
 	retryCapture      *resourceBudget
 	// saveRequests asks stateLoop to save STATE_FILE at once.
-	saveRequests chan struct{}
+	saveRequests        chan struct{}
+	directorySyncWarned atomic.Bool
 
 	// backgroundMu orders goroutines started for requests before Close waits for them.
 	backgroundMu    sync.Mutex

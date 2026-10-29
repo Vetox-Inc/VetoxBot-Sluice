@@ -5,6 +5,8 @@ import (
 	"container/list"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -585,7 +587,7 @@ func (p *Proxy) suspectEdgeBlock(refusal *http.Response, route string) {
 	started := p.goBackground(func() {
 		ctx, cancel := context.WithTimeout(p.ctx, p.config.UpstreamTimeout)
 		defer cancel()
-		verdict, probePause := p.probeEdge(ctx)
+		verdict, probePause, probeErr := p.probeEdge(ctx)
 		pause = max(pause, probePause)
 		if p.cloudflare.settle(time.Now(), verdict, pause) {
 			p.saveStateSoon()
@@ -600,7 +602,7 @@ func (p *Proxy) suspectEdgeBlock(refusal *http.Response, route string) {
 			logger.Warn("Discord's edge refused a request, but this IP is not blocked; only that route backs off", "status", status, "route", route)
 		default:
 			logger.Warn("Could not check whether Discord's edge blocks this IP; pausing outbound requests provisionally",
-				"status", status, "route", route, "pause", provisionalEdgePause.String())
+				"status", status, "route", route, "pause", provisionalEdgePause.String(), "error", probeErr)
 			if p.config.EnableMetrics {
 				EdgeProvisionalPauses.Inc()
 			}
@@ -637,7 +639,7 @@ func (p *Proxy) probePausedEdge() {
 	}
 	ctx, cancel := context.WithTimeout(p.ctx, p.config.UpstreamTimeout)
 	defer cancel()
-	verdict, pause := p.probeEdge(ctx)
+	verdict, pause, _ := p.probeEdge(ctx)
 	now := time.Now()
 	if p.cloudflare.settle(now, verdict, pause) {
 		p.saveStateSoon()
@@ -653,19 +655,26 @@ func (p *Proxy) probePausedEdge() {
 }
 
 // probeEdge requests the gateway URL with Sluice's own User-Agent and no credential. Only a refusal
-// of that request too shows that the edge blocks this IP.
-func (p *Proxy) probeEdge(ctx context.Context) (edgeVerdict, time.Duration) {
+// of that request too shows that the edge blocks this IP. The error says why a probe was
+// inconclusive.
+func (p *Proxy) probeEdge(ctx context.Context) (edgeVerdict, time.Duration, error) {
 	target := *p.discordURL
 	target.Path = "/api/v10/gateway"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil || !p.invalidRequests.reserve(time.Now()) {
-		return edgeInconclusive, 0
+	if err != nil {
+		return edgeInconclusive, 0, err
+	}
+	if !p.invalidRequests.reserve(time.Now()) {
+		return edgeInconclusive, 0, errInvalidRequestBudget
 	}
 	request.Header.Set("User-Agent", userAgent())
 	response, err := p.transport.RoundTrip(request)
 	if err != nil || response == nil {
 		p.invalidRequests.complete(time.Now(), false)
-		return edgeInconclusive, 0
+		if err == nil {
+			err = errors.New("upstream transport returned no response")
+		}
+		return edgeInconclusive, 0, err
 	}
 	if response.Body != nil {
 		defer func() { _ = response.Body.Close() }()
@@ -673,14 +682,14 @@ func (p *Proxy) probeEdge(ctx context.Context) (edgeVerdict, time.Duration) {
 	}
 	p.invalidRequests.complete(time.Now(), invalidDiscordResponse(response))
 	if isCloudflareBlock(response) {
-		return edgeBlocked, cloudflarePause(response.Header)
+		return edgeBlocked, cloudflarePause(response.Header), nil
 	}
 	// Only Discord's own success proves the edge passes requests again: an error page, a 5xx or
 	// an answer without Discord's Via may come from the edge itself.
 	if response.StatusCode/100 == 2 && response.Header.Get("Via") != "" {
-		return edgeClear, 0
+		return edgeClear, 0, nil
 	}
-	return edgeInconclusive, 0
+	return edgeInconclusive, 0, fmt.Errorf("the edge answered %d without Discord's success", response.StatusCode)
 }
 
 const (
