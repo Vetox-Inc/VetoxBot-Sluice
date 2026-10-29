@@ -20,6 +20,13 @@ and [Semantic Versioning](https://semver.org/).
 - `CLOUDFLARE_PROBE_INTERVAL`: while a block pauses traffic, Sluice probes the edge every 15 minutes by default,
   ending the pause early once Discord answers and re-arming it while the edge still refuses.
 
+### Fixed
+
+- A pause in force ends only after two probes in a row get Discord's own success, the second a minute after the
+  first: during a ban the edge lets the odd request through, and one such probe resumed every client. After an early
+  end, the next refusal can re-arm the pause at once. An answer that is not a refusal but not Discord's success
+  either, such as a 5xx or an error page without `Via`, no longer counts as the block lifting.
+
 ## 1.1.0 - 2026-10-04
 
 A request Discord answers is handled as in 1.0.1. This release is about the ones Sluice refuses: each is counted by

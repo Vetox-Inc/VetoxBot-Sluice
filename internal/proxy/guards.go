@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -32,6 +33,11 @@ const (
 	// pauses everything for its own Retry-After instead, so a route need not wait as long.
 	maxEdgeRouteBackoff = time.Hour
 	edgeProbeInterval   = 30 * time.Second
+	// edgeClearConfirmations clear probes in a row end a pause in force: during a ban the edge
+	// lets the odd request through, and one of them must not resume every client.
+	edgeClearConfirmations = 2
+	// edgeConfirmDelay is how soon a clear probe is confirmed, instead of the probe interval.
+	edgeConfirmDelay = time.Minute
 
 	// sharedLimitThreshold shared-scope 429s for one resource within sharedLimitWindow close it
 	// for at least minSharedLimitCooldown.
@@ -277,7 +283,9 @@ type cloudflareGuard struct {
 	blockedUntil time.Time
 	probing      bool
 	clearedAt    time.Time
-	revision     atomic.Uint64
+	// clears counts clear probes in a row during the pause in force.
+	clears   int
+	revision atomic.Uint64
 }
 
 // suspect reports whether the caller should start a probe. It does not while a probe or a block
@@ -315,26 +323,54 @@ func (g *cloudflareGuard) beginPausedProbe(now time.Time) bool {
 }
 
 // settle records a probe's verdict. A block pauses traffic for pause, or longer if a pause in
-// force already runs past it, so a refusal without Retry-After cannot cut a pause short. A clear
-// probe ends any pause, as the block lifted early, and holds off the next probe; an inconclusive
-// one changes nothing, so the next refusal probes again.
+// force already runs past it, so a refusal without Retry-After cannot cut a pause short. Without
+// a pause, a clear probe holds off the next one. A pause in force ends after
+// edgeClearConfirmations clear probes in a row, as the block lifted early, and without a
+// hold-off, so the first refusal after it can re-arm the pause at once. An inconclusive probe
+// changes nothing but the run of clear ones.
 func (g *cloudflareGuard) settle(now time.Time, verdict edgeVerdict, pause time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.probing = false
+	if verdict != edgeClear {
+		g.clears = 0
+	}
 	switch verdict {
 	case edgeClear:
-		g.clearedAt = now
-		if g.blockedUntil.After(now) {
-			g.blockedUntil = time.Time{}
-			g.revision.Add(1)
+		if !g.blockedUntil.After(now) {
+			g.clearedAt = now
+			g.clears = 0
+			return
 		}
+		g.clears++
+		if g.clears < edgeClearConfirmations {
+			return
+		}
+		g.clears = 0
+		g.blockedUntil = time.Time{}
+		g.revision.Add(1)
 	case edgeBlocked:
 		if until := now.Add(pause); until.After(g.blockedUntil) {
 			g.blockedUntil = until
 			g.revision.Add(1)
 		}
 	}
+}
+
+// confirming reports whether a clear probe during the pause in force awaits confirmation.
+func (g *cloudflareGuard) confirming() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.clears > 0
+}
+
+// nextProbe is the wait before the next paused-edge probe: interval, or edgeConfirmDelay when
+// a clear probe awaits confirmation and interval is longer.
+func (g *cloudflareGuard) nextProbe(interval time.Duration) time.Duration {
+	if g.confirming() {
+		return min(interval, edgeConfirmDelay)
+	}
+	return interval
 }
 
 // snapshot returns the end of the block in progress, or the zero time.
@@ -430,12 +466,13 @@ func (p *Proxy) suspectEdgeBlock(refusal *http.Response, route string) {
 // client request reaching the edge.
 func (p *Proxy) watchEdge(interval time.Duration) {
 	defer p.wg.Done()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			p.probePausedEdge()
+			timer.Reset(p.cloudflare.nextProbe(interval))
 		case <-p.ctx.Done():
 			return
 		}
@@ -453,10 +490,12 @@ func (p *Proxy) probePausedEdge() {
 	verdict, pause, _ := p.probeEdge(ctx)
 	now := time.Now()
 	p.cloudflare.settle(now, verdict, pause)
-	switch verdict {
-	case edgeClear:
+	switch {
+	case verdict == edgeClear && p.cloudflare.confirming():
+		logger.Warn("Discord answered a probe through the edge; confirming before resuming outbound requests", "in", edgeConfirmDelay.String())
+	case verdict == edgeClear:
 		logger.Warn("Discord's edge no longer blocks this IP; resuming outbound requests")
-	case edgeBlocked:
+	case verdict == edgeBlocked:
 		logger.Warn("Discord's edge still blocks this IP; outbound requests stay paused", "pause", p.cloudflare.retryAfter(now).Round(time.Second).String())
 	}
 }
@@ -491,5 +530,10 @@ func (p *Proxy) probeEdge(ctx context.Context) (edgeVerdict, time.Duration, erro
 	if isCloudflareBlock(response) {
 		return edgeBlocked, cloudflarePause(response.Header), nil
 	}
-	return edgeClear, 0, nil
+	// Only Discord's own success proves the edge passes requests again: an error page, a 5xx or
+	// an answer without Discord's Via may come from the edge itself.
+	if response.StatusCode/100 == 2 && response.Header.Get("Via") != "" {
+		return edgeClear, 0, nil
+	}
+	return edgeInconclusive, 0, fmt.Errorf("the edge answered %d without Discord's success", response.StatusCode)
 }
