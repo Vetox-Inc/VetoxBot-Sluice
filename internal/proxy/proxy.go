@@ -137,7 +137,8 @@ type Proxy struct {
 	retryCapture      *resourceBudget
 	failures          *failureLog
 	// saveRequests asks stateLoop to save STATE_FILE at once.
-	saveRequests chan struct{}
+	saveRequests        chan struct{}
+	directorySyncWarned atomic.Bool
 
 	reclaimMu   sync.Mutex
 	reclaimedAt time.Time

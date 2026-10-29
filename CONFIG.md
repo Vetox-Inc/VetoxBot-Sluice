@@ -272,8 +272,9 @@ in `sluice_refusal_guard_trips_total` and each answer as `refusal_rate` in `slui
 already in flight when refusals start can pass the ceiling, and only once. A trip is kept in `STATE_FILE`, so a
 restart resumes the 30 seconds of caution.
 
-In a cluster, each node gets the ceiling divided by `CLUSTER_MAX_NODES`, rounded down and never less than 1, as with
-the invalid-request budget.
+In a cluster, each node gets the ceiling divided by `CLUSTER_MAX_NODES`, rounded down, as with the invalid-request
+budget, but never less than 10, or than `MAX_REFUSALS_PER_SECOND` itself when that is lower: a smaller share would trip
+on the odd refusal of ordinary traffic. With the defaults, each of up to 32 nodes gets 10.
 
 ### `CLOUDFLARE_BAN_DETECTION`
 
@@ -321,10 +322,12 @@ count that is too low.
 
 Sluice reads the file when it starts, replaces it atomically every 5 seconds while its contents change, and writes it
 once more when it stops. It also writes it at once when a Cloudflare pause starts or changes, after every 100th invalid
-response and when the refusal ceiling trips, so even a `kill -9` in a flood loses little. Fields added since 1.0.0 are
-optional, and 1.0.0 still reads a file this version writes. The file holds no token, and webhooks appear only as hashes. A file Sluice cannot read is
-renamed with `.invalid` at the end rather than overwritten. A saved block is not restored while
-`CLOUDFLARE_BAN_DETECTION` is `false`.
+response and when the refusal ceiling trips, so even a `kill -9` in a flood loses little. After each rename it syncs the
+directory, so a power loss cannot bring back an older file, and at startup it removes temporary `.sluice-state-*` files
+older than a minute that a crash left behind. Fields added since 1.0.0 are optional, and 1.0.0 still reads a file this
+version writes. The file holds no token, and webhooks appear only as hashes. A file Sluice cannot read is renamed with
+`.invalid` at the end rather than overwritten. A saved block is not restored while `CLOUDFLARE_BAN_DETECTION` is
+`false`.
 
 The default is `sluice/state-<PORT>.json` in the user's cache directory, which is `~/.cache` on Linux and
 `%LocalAppData%` on Windows. An empty value keeps the state in memory only, and so does a process without a cache

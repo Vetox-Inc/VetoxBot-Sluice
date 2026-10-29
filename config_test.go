@@ -249,8 +249,9 @@ func TestClusterTLSRequiresAndValidatesPeerCertificates(t *testing.T) {
 	if config.proxy.InvalidRequestLimit != proxy.InvalidRequestSafetyLimit/32 {
 		t.Fatalf("cluster invalid-request limit = %d, want %d", config.proxy.InvalidRequestLimit, proxy.InvalidRequestSafetyLimit/32)
 	}
-	// Nodes share the egress the ceiling protects, as they share the invalid-request budget.
-	if want := max(1, proxy.DefaultMaxRefusalsPerSecond/32); config.proxy.MaxRefusalsPerSecond != want {
+	// Nodes share the egress the ceiling protects, as they share the invalid-request budget, but a
+	// node's share never drops below minNodeRefusalsPerSecond, so ordinary traffic cannot trip it.
+	if want := minNodeRefusalsPerSecond; config.proxy.MaxRefusalsPerSecond != want {
 		t.Fatalf("cluster refusal ceiling = %d, want %d", config.proxy.MaxRefusalsPerSecond, want)
 	}
 	withoutCertificate := config.clusterClientTLS.Clone()
@@ -439,6 +440,19 @@ func TestMaxRefusalsPerSecondDefaultsAndBounds(t *testing.T) {
 		}
 		if err != nil || config.proxy.MaxRefusalsPerSecond != test.want {
 			t.Errorf("MAX_REFUSALS_PER_SECOND=%q: limit = %d, err = %v, want %d", test.value, config.proxy.MaxRefusalsPerSecond, err, test.want)
+		}
+	}
+}
+
+func TestClusterRefusalCeilingHasAFloor(t *testing.T) {
+	for _, test := range []struct{ total, nodes, want int }{
+		{20, 32, minNodeRefusalsPerSecond},
+		{1000, 4, 250},
+		{5, 32, 5},
+		{20, 1, 20},
+	} {
+		if got := nodeRefusalsPerSecond(test.total, test.nodes); got != test.want {
+			t.Errorf("%d per second over %d nodes = %d per node, want %d", test.total, test.nodes, got, test.want)
 		}
 	}
 }
