@@ -201,7 +201,7 @@ func loadConfig() (appConfig, error) {
 	invalidRequestLimit := proxy.InvalidRequestSafetyLimit
 	if clusterEnabled {
 		invalidRequestLimit = max(1, proxy.InvalidRequestSafetyLimit/clusterMaxNodes)
-		maxRefusalsPerSecond = max(1, maxRefusalsPerSecond/clusterMaxNodes)
+		maxRefusalsPerSecond = nodeRefusalsPerSecond(maxRefusalsPerSecond, clusterMaxNodes)
 	}
 	clientAuthSecret := os.Getenv("CLIENT_AUTH_SECRET")
 	if clientAuthSecret != "" && utf8.RuneCountInString(clientAuthSecret) < 32 {
@@ -269,6 +269,16 @@ func loadConfig() (appConfig, error) {
 			StateFile:               stateFile,
 		},
 	}, nil
+}
+
+// minNodeRefusalsPerSecond is the least refusal ceiling a cluster node gets from dividing
+// MAX_REFUSALS_PER_SECOND: below it, the odd refusal of ordinary traffic would trip the guard.
+const minNodeRefusalsPerSecond = 10
+
+// nodeRefusalsPerSecond divides the refusal ceiling between nodes, never below
+// minNodeRefusalsPerSecond unless the ceiling itself is lower.
+func nodeRefusalsPerSecond(total, nodes int) int {
+	return max(min(total, minNodeRefusalsPerSecond), total/max(nodes, 1))
 }
 
 // stateFilePath is STATE_FILE, where an empty value turns the file off, or by default a file

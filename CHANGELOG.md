@@ -20,12 +20,12 @@ and [Semantic Versioning](https://semver.org/).
 - `CLOUDFLARE_PROBE_INTERVAL`: while a block pauses traffic, Sluice probes the edge every 15 minutes by default,
   ending the pause early once Discord answers and re-arming it while the edge still refuses.
 - `MAX_REFUSALS_PER_SECOND`, 20 by default: a ceiling on the 401, 403 and 429 responses, shared-scope ones included,
-  this IP collects per second. Past half of it, requests go out only while refusals plus requests in flight stay below
-  it; at it, Sluice answers every request with a `429` itself for 2 seconds. The invalid-request budget bounded only
-  the 10-minute total, which a flood could spend in a second. New metrics: `sluice_upstream_refusals`,
-  `sluice_refusal_guard_blocked`, `sluice_refusal_guard_trips_total`, `sluice_edge_provisional_pauses_total` and
-  `sluice_interaction_short_circuits_total`, and the `sluice_failures_total` reasons `refusal_rate`,
-  `upstream_rate_limit` and `shared_rate_limit_reclosed`.
+  this IP collects per second; a cluster node gets its share, but at least 10. Past half of it, requests go out only
+  while refusals plus requests in flight stay below it; at it, Sluice answers every request with a `429` itself for 2
+  seconds. The invalid-request budget bounded only the 10-minute total, which a flood could spend in a second. New
+  metrics: `sluice_upstream_refusals`, `sluice_refusal_guard_blocked`, `sluice_refusal_guard_trips_total`,
+  `sluice_edge_provisional_pauses_total` and `sluice_interaction_short_circuits_total`, and the `sluice_failures_total`
+  reasons `refusal_rate`, `upstream_rate_limit` and `shared_rate_limit_reclosed`.
 
 ### Fixed
 
@@ -48,7 +48,10 @@ and [Semantic Versioning](https://semver.org/).
   reaching Discord on every follow-up.
 - `STATE_FILE` is saved at once when a Cloudflare pause starts or changes, after every 100th invalid response and when
   the refusal guard trips, besides every 5 seconds: a crash during a flood could forget seconds of invalid responses.
-  Its format stays readable by 1.0.0.
+  Its format stays readable by 1.0.0. Each save also syncs the file's directory, and startup removes temporary files a
+  crash left behind; a save that keeps failing is logged once, not on every try.
+- A panic in an upstream attempt can no longer hold a refusal-guard slot, an invalid-request reservation or a
+  shared-limit trial for good.
 
 ## 1.1.0 - 2026-10-04
 

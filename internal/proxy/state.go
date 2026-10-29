@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -15,6 +16,10 @@ const (
 	stateSaveInterval = 5 * time.Second
 	// maxStateFileBytes is far above a full state, about 1 MiB with every webhook slot in use.
 	maxStateFileBytes = 16 << 20
+	stateTempPattern  = ".sluice-state-*"
+	// staleStateTempAge is how old a temp file must be before startup removes it: a younger one
+	// may belong to another instance saving into the same directory.
+	staleStateTempAge = time.Minute
 )
 
 // savedState is what STATE_FILE keeps across restarts: the memory that protects this IP from
@@ -44,6 +49,7 @@ func (p *Proxy) stateRevision() uint64 {
 }
 
 func (p *Proxy) loadState() {
+	removeStaleStateTemps(p.config.StateFile, time.Now())
 	data, err := readStateFile(p.config.StateFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return
@@ -111,7 +117,7 @@ func (p *Proxy) saveState() error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(directory, ".sluice-state-*")
+	temp, err := os.CreateTemp(directory, stateTempPattern)
 	if err != nil {
 		return err
 	}
@@ -127,7 +133,39 @@ func (p *Proxy) saveState() error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temp.Name(), p.config.StateFile)
+	if err := os.Rename(temp.Name(), p.config.StateFile); err != nil {
+		return err
+	}
+	p.syncStateDirectory(directory)
+	return nil
+}
+
+// syncStateDirectory makes the rename itself durable, so a power loss cannot bring back the
+// previous file. It never fails a save, and says so only once; Windows cannot sync a directory.
+func (p *Proxy) syncStateDirectory(directory string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	dir, err := os.Open(directory)
+	if err == nil {
+		err = dir.Sync()
+		if closeErr := dir.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil && p.directorySyncWarned.CompareAndSwap(false, true) {
+		logger.Warn("Could not sync STATE_FILE's directory; the file is saved, but a power loss may undo the last save", "directory", directory, "error", err)
+	}
+}
+
+// removeStaleStateTemps deletes temp files a process that died mid-save left next to STATE_FILE.
+func removeStaleStateTemps(stateFile string, now time.Time) {
+	names, _ := filepath.Glob(filepath.Join(filepath.Dir(stateFile), stateTempPattern))
+	for _, name := range names {
+		if info, err := os.Lstat(name); err == nil && info.Mode().IsRegular() && now.Sub(info.ModTime()) > staleStateTempAge {
+			_ = os.Remove(name)
+		}
+	}
 }
 
 // saveStateSoon asks stateLoop to save at once rather than at its next tick: a pause starting or

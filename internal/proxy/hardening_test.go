@@ -609,3 +609,64 @@ func TestStateFileStaysReadableByEarlierReleases(t *testing.T) {
 		t.Fatalf("1.0.0 would read %s as %+v (%v)", data, earlier, err)
 	}
 }
+
+func TestPanickingUpstreamReleasesItsSlotsAndTrial(t *testing.T) {
+	config := testConfig(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		panic("transport bug")
+	}))
+	proxy := newTestProxy(t, config)
+	const application = "203039963636301824"
+	path := followUpPath(application, 0)
+	key := sharedResourceKey(http.MethodPost, MetricsPathFromBucket(GetOptimisticBucketPath(path, http.MethodPost)), path)
+	now := time.Now()
+	for range sharedLimitThreshold {
+		proxy.sharedLimits.record(key, time.Second, now)
+	}
+	proxy.sharedLimits.mu.Lock()
+	proxy.sharedLimits.entries[key].Value.(*sharedLimitEntry).openUntil = now.Add(-time.Millisecond)
+	proxy.sharedLimits.mu.Unlock()
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the round tripper's panic did not reach the caller")
+			}
+		}()
+		serve(proxy, http.MethodPost, path, "", nil)
+	}()
+	proxy.refusals.mu.Lock()
+	inFlight := proxy.refusals.inFlight
+	proxy.refusals.mu.Unlock()
+	proxy.invalidRequests.mu.Lock()
+	reserved := proxy.invalidRequests.reserved
+	proxy.invalidRequests.mu.Unlock()
+	proxy.sharedLimits.mu.Lock()
+	trial := proxy.sharedLimits.entries[key].Value.(*sharedLimitEntry).trial
+	proxy.sharedLimits.mu.Unlock()
+	if inFlight != 0 || reserved != 0 || trial {
+		t.Fatalf("after a panic: refusal slots in flight %d, invalid-request reservations %d, trial out %v; want 0, 0, false", inFlight, reserved, trial)
+	}
+}
+
+func TestStaleStateTempFilesAreRemovedAtStart(t *testing.T) {
+	directory := t.TempDir()
+	stale, fresh := filepath.Join(directory, ".sluice-state-stale"), filepath.Join(directory, ".sluice-state-fresh")
+	for _, name := range []string{stale, fresh} {
+		if err := os.WriteFile(name, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(nil)
+	config.StateFile = filepath.Join(directory, "state.json")
+	newTestProxy(t, config)
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("a temp file an earlier process left behind is still there: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("a temp file another process may be writing was removed: %v", err)
+	}
+}
