@@ -38,21 +38,24 @@ const (
 
 // Config controls request scheduling, resource bounds, transport, and metrics.
 type Config struct {
-	OutboundIP             string
-	UpstreamTimeout        time.Duration
-	QueueTimeout           time.Duration
-	DisableHTTP2           bool
-	Disable401Lock         bool
-	EnableMetrics          bool
-	GlobalOverrides        string
-	MaxBearerClients       int
-	MaxBucketStates        int
-	MaxClientStates        int
-	MaxInFlightRequests    int
-	MaxQueueDepth          int
-	MaxRetryBodyBytes      int64
-	MaxRetryCaptureBytes   int64
-	InvalidRequestLimit    int
+	OutboundIP           string
+	UpstreamTimeout      time.Duration
+	QueueTimeout         time.Duration
+	DisableHTTP2         bool
+	Disable401Lock       bool
+	EnableMetrics        bool
+	GlobalOverrides      string
+	MaxBearerClients     int
+	MaxBucketStates      int
+	MaxClientStates      int
+	MaxInFlightRequests  int
+	MaxQueueDepth        int
+	MaxRetryBodyBytes    int64
+	MaxRetryCaptureBytes int64
+	InvalidRequestLimit  int
+	// MaxRefusalsPerSecond caps the 401, 403 and 429 responses, shared ones included, this node
+	// collects per second; 0 means DefaultMaxRefusalsPerSecond.
+	MaxRefusalsPerSecond   int
 	DiscordURL             string
 	CloudflareBanDetection bool
 	// CloudflareProbeInterval is how often, while a Cloudflare block pauses traffic, Sluice probes
@@ -96,6 +99,8 @@ type requestMetadata struct {
 	// by a webhook or interaction token in the path.
 	credentialScoped bool
 	webhookKey       string
+	// interactionKey identifies an interaction's token, on interaction routes only.
+	interactionKey string
 	// sharedLimitKey names the resource for sharedLimitGuard; see sharedResourceKey.
 	sharedLimitKey string
 }
@@ -120,14 +125,19 @@ type Proxy struct {
 	globalOverrides map[string]uint
 	botWideRoutes   map[string]bool
 	invalidRequests *invalidRequestGuard
+	refusals        *refusalGuard
 	webhooks        *webhookGuard
-	cloudflare      *cloudflareGuard
-	sharedLimits    *sharedLimitGuard
-	applications    *applicationSet
-	bucketSlots     *resourceBudget
-	inFlight        *resourceBudget
-	retryCapture    *resourceBudget
-	failures        *failureLog
+	// interactionTokens remembers interaction tokens Discord answered 401.
+	interactionTokens *webhookGuard
+	cloudflare        *cloudflareGuard
+	sharedLimits      *sharedLimitGuard
+	applications      *applicationSet
+	bucketSlots       *resourceBudget
+	inFlight          *resourceBudget
+	retryCapture      *resourceBudget
+	failures          *failureLog
+	// saveRequests asks stateLoop to save STATE_FILE at once.
+	saveRequests chan struct{}
 
 	reclaimMu   sync.Mutex
 	reclaimedAt time.Time
@@ -213,6 +223,7 @@ func (p *Proxy) resources() []resourceUse {
 // prepared is what New takes from a Config once it has checked it.
 type prepared struct {
 	invalidLimit  int
+	refusalLimit  int
 	overrides     map[string]uint
 	botWideRoutes map[string]bool
 	transport     http.RoundTripper
@@ -259,9 +270,15 @@ func (c Config) prepare() (prepared, error) {
 	if c.CloudflareProbeInterval < 0 {
 		return prepared{}, fmt.Errorf("Cloudflare probe interval cannot be negative")
 	}
-	ready := prepared{invalidLimit: c.InvalidRequestLimit, transport: c.Transport}
+	if c.MaxRefusalsPerSecond < 0 {
+		return prepared{}, fmt.Errorf("max refusals per second cannot be negative")
+	}
+	ready := prepared{invalidLimit: c.InvalidRequestLimit, refusalLimit: c.MaxRefusalsPerSecond, transport: c.Transport}
 	if ready.invalidLimit == 0 {
 		ready.invalidLimit = InvalidRequestSafetyLimit
+	}
+	if ready.refusalLimit == 0 {
+		ready.refusalLimit = DefaultMaxRefusalsPerSecond
 	}
 
 	var err error
@@ -289,28 +306,39 @@ func New(config Config) (*Proxy, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
-		config:          config,
-		ctx:             ctx,
-		cancel:          cancel,
-		bots:            make(map[[sha256.Size]byte]*clientState),
-		bearers:         make(map[[sha256.Size]byte]*clientState),
-		globalOverrides: ready.overrides,
-		botWideRoutes:   ready.botWideRoutes,
-		invalidRequests: newInvalidRequestGuard(ready.invalidLimit, invalidRequestWindow),
-		webhooks:        newWebhookGuard(),
-		cloudflare:      &cloudflareGuard{},
-		sharedLimits:    newSharedLimitGuard(),
-		applications:    newApplicationSet(),
-		bucketSlots:     newResourceBudget(int64(config.MaxBucketStates)),
-		inFlight:        newResourceBudget(int64(config.MaxInFlightRequests)),
-		retryCapture:    newResourceBudget(config.MaxRetryCaptureBytes),
-		failures:        newFailureLog(),
-		transport:       ready.transport,
-		discordURL:      ready.discordURL,
-		closeDone:       make(chan struct{}),
+		config:            config,
+		ctx:               ctx,
+		cancel:            cancel,
+		bots:              make(map[[sha256.Size]byte]*clientState),
+		bearers:           make(map[[sha256.Size]byte]*clientState),
+		globalOverrides:   ready.overrides,
+		botWideRoutes:     ready.botWideRoutes,
+		invalidRequests:   newInvalidRequestGuard(ready.invalidLimit, invalidRequestWindow),
+		refusals:          newRefusalGuard(ready.refusalLimit),
+		webhooks:          newWebhookGuard(),
+		interactionTokens: newInteractionTokenGuard(),
+		cloudflare:        &cloudflareGuard{},
+		sharedLimits:      newSharedLimitGuard(),
+		applications:      newApplicationSet(),
+		bucketSlots:       newResourceBudget(int64(config.MaxBucketStates)),
+		inFlight:          newResourceBudget(int64(config.MaxInFlightRequests)),
+		retryCapture:      newResourceBudget(config.MaxRetryCaptureBytes),
+		failures:          newFailureLog(),
+		saveRequests:      make(chan struct{}, 1),
+		transport:         ready.transport,
+		discordURL:        ready.discordURL,
+		closeDone:         make(chan struct{}),
 	}
 	p.noAuth = newClientState(identity{kind: authNone, label: "NoAuth"}, discordGlobalLimit, config.MaxQueueDepth, p.bucketSlots)
 	p.noAuth.reclaim = p.reclaimBuckets
+	p.refusals.onTrip = func(refusals int) {
+		logger.Warn("Discord refused too many requests from this IP within a second; answering requests locally",
+			"refusals", refusals, "limit", ready.refusalLimit, "cooldown", refusalCooldown.String())
+		if config.EnableMetrics {
+			RefusalGuardTrips.Inc()
+		}
+		p.saveStateSoon()
+	}
 	p.initReverseProxies()
 	p.wg.Add(1)
 	go p.sweepLoop()
@@ -508,6 +536,10 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	identity := identify(request.Header.Get("Authorization"))
 	interaction := isInteractionEndpoint(request.URL.Path) || p.applications.followUp(request.URL.Path)
 	webhookKey := webhookCredentialKey(request.URL.Path, interaction)
+	interactionKey := ""
+	if interaction {
+		interactionKey = interactionTokenKey(request.URL.Path)
+	}
 	credentialScoped := !interaction && webhookKey == ""
 	if identity.unsupported && credentialScoped {
 		// Discord rejects every other scheme with a 401 that counts against this IP.
@@ -558,6 +590,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		interaction:      interaction,
 		credentialScoped: credentialScoped,
 		webhookKey:       webhookKey,
+		interactionKey:   interactionKey,
 		sharedLimitKey:   sharedLimitKey,
 	}
 	ctx := context.WithValue(request.Context(), requestMetadataContextKey, metadata)

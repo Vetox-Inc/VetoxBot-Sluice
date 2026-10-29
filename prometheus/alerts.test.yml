@@ -59,6 +59,8 @@ tests:
         values: '0+0x60'
       - series: 'sluice_edge_refusals_total{instance="a", job="sluice"}'
         values: '0+0x60'
+      - series: 'sluice_refusal_guard_trips_total{instance="a", job="sluice"}'
+        values: '0+0x60'
       - series: 'sluice_warnings_total{instance="a", job="sluice"}'
         values: '0+0x60'
     alert_rule_test:
@@ -74,6 +76,7 @@ tests:
       - { eval_time: 30m, alertname: SluiceInvalidRequestsCritical, exp_alerts: [] }
       - { eval_time: 30m, alertname: SluiceCloudflareBlocked, exp_alerts: [] }
       - { eval_time: 30m, alertname: SluiceEdgeRefusals, exp_alerts: [] }
+      - { eval_time: 30m, alertname: SluiceRefusalCeilingReached, exp_alerts: [] }
       - { eval_time: 30m, alertname: SluiceSlowResponses, exp_alerts: [] }
       - { eval_time: 30m, alertname: SluiceLoggedWarnings, exp_alerts: [] }
 
@@ -321,6 +324,22 @@ tests:
             exp_annotations:
               summary: "Discord's edge blocks this IP"
               description: 'Sluice has paused all traffic until the block ends. A restart does not lift it.'
+
+  # A storm of refusals reaches the per-second ceiling three times.
+  - name: refusals reach the per-second ceiling
+    interval: 1m
+    input_series:
+      - series: 'sluice_refusal_guard_trips_total{instance="a", job="sluice"}'
+        values: '0+0x14 3+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SluiceRefusalCeilingReached
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Discord refused too many requests per second'
+              description: 'Refusals reached MAX_REFUSALS_PER_SECOND 3 times in 10 minutes; find the route that draws the 401s, 403s and 429s.'
 
   # One response in ten takes longer than a second.
   - name: slow answers from Discord

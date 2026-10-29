@@ -136,6 +136,16 @@ groups:
           summary: "Discord's edge is refusing requests"
           description: "{{ $value | printf \"%.0f\" }} responses in 10 minutes came from Discord's edge instead of Discord."
 
+      # Upstream 401s, 403s and 429s reached MAX_REFUSALS_PER_SECOND, so Sluice answered every request
+      # itself for a while: something is drawing refusals faster than Discord's edge tolerates.
+      - alert: SluiceRefusalCeilingReached
+        expr: sum(increase(sluice_refusal_guard_trips_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Discord refused too many requests per second'
+          description: "Refusals reached MAX_REFUSALS_PER_SECOND {{ $value | printf \"%.0f\" }} times in 10 minutes; find the route that draws the 401s, 403s and 429s."
+
       # More than one response in twenty takes over a second. This is Discord's time, not Sluice's.
       - alert: SluiceSlowResponses
         expr: histogram_quantile(0.95, sum by (le) (rate(sluice_requests_bucket[5m]))) > 1

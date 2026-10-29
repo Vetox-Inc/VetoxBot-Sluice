@@ -43,9 +43,10 @@ them in `golang:1.27` (not `-alpine`, which cannot run `-race`) and `golangci/go
 
 A reason of `sluice_failures_total` lives in three places that a test keeps equal: `failureReasons`, the `fail` calls
 and the tables in CONFIG.md. Every error Sluice answers a request with on its own goes through `Proxy.fail`; the
-exceptions are a health check's answer and the repeated answer for a webhook that is gone, which
-`sluice_webhook_short_circuits_total` counts. `prometheus/alerts.yml` is tied to the same list: a test fails when a
-rule names a reason or a metric the code does not export.
+exceptions are a health check's answer and the repeated answers for a webhook that is gone and for an interaction token
+Discord rejected, which `sluice_webhook_short_circuits_total` and `sluice_interaction_short_circuits_total` count.
+`prometheus/alerts.yml` is tied to the same list: a test fails when a rule names a reason or a metric the code does not
+export.
 
 `bench/` is a stand-alone command that the proxy never imports. `bench/run.sh` reproduces BENCHMARKS.md against a
 released image, or against `SLUICE_IMAGE`; a full run takes about 90 minutes and wants a machine doing nothing else,

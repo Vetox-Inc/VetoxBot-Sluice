@@ -16,9 +16,10 @@ const failureWarningInterval = 30 * time.Second
 var failureReasons = []string{
 	"bad_request", "bucket_limit", "client_auth", "client_closed", "client_limit", "cloudflare_pause",
 	"cluster_over_capacity", "cluster_routing", "deadline", "in_flight_limit", "invalid_request_budget",
-	"invalid_token", "peer_error", "queue_full", "queue_timeout", "rate_limit_deadline", "response_aborted",
-	"retry_capture_limit", "retry_preparation", "shared_rate_limit", "shared_rate_limit_breaker", "shutting_down",
-	"unknown_endpoint", "unsupported_authorization", "upstream_error", "upstream_timeout",
+	"invalid_token", "peer_error", "queue_full", "queue_timeout", "rate_limit_deadline", "refusal_rate", "response_aborted",
+	"retry_capture_limit", "retry_preparation", "shared_rate_limit", "shared_rate_limit_breaker",
+	"shared_rate_limit_reclosed", "shutting_down", "unknown_endpoint", "unsupported_authorization", "upstream_error",
+	"upstream_rate_limit", "upstream_timeout",
 }
 
 // failureWarnings says what to tell an operator about the failures they have to act on. Every

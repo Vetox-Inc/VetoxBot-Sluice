@@ -79,6 +79,9 @@ async function handle(req, res) {
     // A resource whose shared limit never lifts.
     case path === '/api/v10/channels/100000000000000011/messages':
       return respond(res, 429, { message: 'The resource is being rate limited.', retry_after: 0.5, global: false }, { 'Retry-After': '1', 'X-RateLimit-Limit': '5', 'X-RateLimit-Remaining': '4', 'X-RateLimit-Reset-After': '5', 'X-RateLimit-Bucket': 'm-11', 'X-RateLimit-Scope': 'shared' });
+    // Channels the bot cannot see.
+    case /^\/api\/v10\/channels\/7\d{17}\/messages$/.test(path):
+      return respond(res, 403, { message: 'Missing Access', code: 50001 });
     // Discord slower than REQUEST_TIMEOUT.
     case path === '/api/v10/channels/100000000000000004/messages':
       await sleep(7000);
@@ -148,6 +151,10 @@ const startSluice = async (extra = {}) => {
 const discordPort = await listen(discord);
 const sluice = await startSluice();
 const guarded = await startSluice({ CLIENT_AUTH_SECRET: SECRET });
+// The storm below collects refusals faster than MAX_REFUSALS_PER_SECOND allows, which its own
+// scenario covers; this instance raises the ceiling so that the storm reaches the resource guard.
+const stormy = await startSluice({ MAX_REFUSALS_PER_SECOND: '1000' });
+const ceiling = await startSluice({ MAX_REFUSALS_PER_SECOND: '5' });
 const rest = (options = {}) => new REST({ api: sluice.api, ...options }).setToken(TOKEN);
 
 // ---------- scenarios ----------
@@ -257,7 +264,7 @@ await scenario('Shared-scope 429: one reaction waits, the bucket stays open', as
 
 await scenario("Shared-limit storm: Sluice answers the resource itself, as a shared-scope 429", async () => {
   const route = Routes.channelMessages('100000000000000011');
-  const client = rest({ rejectOnRateLimit: () => true });
+  const client = new REST({ api: stormy.api, rejectOnRateLimit: () => true }).setToken(TOKEN);
   for (let index = 0; index < 20; index++) {
     const error = await thrown(client.post(route, { body: { content: 'x' } }));
     assert(error instanceof RateLimitError && error.scope === 'shared', `request ${index + 1}: ${error}`);
@@ -266,6 +273,22 @@ await scenario("Shared-limit storm: Sluice answers the resource itself, as a sha
   assert(closed instanceof RateLimitError && closed.scope === 'shared' && closed.retryAfter >= 9000, `after the storm: ${closed} (retryAfter ${closed.retryAfter})`);
   assert(count('POST /api/v10/channels/100000000000000011/messages') === 20, `Discord saw ${count('POST /api/v10/channels/100000000000000011/messages')} requests`);
   return `20 shared 429s from Discord, then Sluice's own with retryAfter ${closed.retryAfter}ms; Discord called 20 times`;
+});
+
+await scenario('Refusal ceiling: past MAX_REFUSALS_PER_SECOND, Sluice answers itself with a global 429', async () => {
+  const client = new REST({ api: ceiling.api, rejectOnRateLimit: () => true }).setToken(TOKEN);
+  const errors = [];
+  for (let index = 1; index <= 12; index++) {
+    errors.push(await thrown(client.get(Routes.channelMessages(String(700000000000000000n + BigInt(index))))));
+  }
+  const refused = errors.filter((error) => error instanceof DiscordAPIError && error.status === 403).length;
+  const local = errors.filter((error) => error instanceof RateLimitError && error.global).length;
+  const reached = seen.filter((entry) => /^GET \/api\/v10\/channels\/7\d{17}\/messages$/.test(entry.key)).length;
+  assert(refused === 5 && local === 7 && reached === 5, `${refused} 403s from Discord, ${local} global 429s from Sluice, Discord called ${reached} times`);
+  const metrics = await (await fetch(ceiling.metrics)).text();
+  assert(/sluice_refusal_guard_trips_total 1\b/.test(metrics), 'trip not counted');
+  assert(logs.join('').includes('answering requests locally'), 'no warning logged');
+  return `5 403s from Discord, then 7 RateLimitError(global) from Sluice; Discord called ${reached} times`;
 });
 
 await scenario("Sluice's errors are readable DiscordAPIErrors", async () => {
@@ -380,6 +403,8 @@ await scenario('Every answer of its own is in sluice_failures_total', async () =
 // ---------- report ----------
 sluice.child.kill();
 guarded.child.kill();
+stormy.child.kill();
+ceiling.child.kill();
 discord.close();
 for (const result of results) {
   console.log(`${result.ok ? 'PASS' : 'FAIL'}  ${result.name}  (${result.ms}ms)\n      ${result.detail.split('\n').join('\n      ')}`);

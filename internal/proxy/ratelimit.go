@@ -20,10 +20,13 @@ const (
 	// InvalidRequestSafetyLimit leaves headroom below Discord's 10,000-event threshold.
 	InvalidRequestSafetyLimit = 9500
 	invalidRequestWindow      = 10 * time.Minute
-	minimumRetryDelay         = 50 * time.Millisecond
-	rateLimitHeaderSlack      = 5 * time.Millisecond
-	globalPacingSlack         = 200
-	maximumRateLimitDelay     = 24 * time.Hour
+	// Every invalidSaveStep-th invalid response saves STATE_FILE at once, so a crash forgets at
+	// most about that many however fast they arrive.
+	invalidSaveStep       = 100
+	minimumRetryDelay     = 50 * time.Millisecond
+	rateLimitHeaderSlack  = 5 * time.Millisecond
+	globalPacingSlack     = 200
+	maximumRateLimitDelay = 24 * time.Hour
 )
 
 var errInvalidRequestBudget = fmt.Errorf("Discord invalid-request safety budget exhausted")
@@ -35,6 +38,8 @@ type invalidRequestGuard struct {
 	timestamps []time.Time
 	head       int
 	reserved   int
+	// recorded counts every invalid response, for invalidSaveStep.
+	recorded uint64
 	// revision changes with every recorded invalid response, telling the state file to save.
 	revision atomic.Uint64
 }
@@ -68,15 +73,20 @@ func (g *invalidRequestGuard) reserve(now time.Time) bool {
 	return true
 }
 
-func (g *invalidRequestGuard) complete(now time.Time, invalid bool) {
+// complete ends a reserved attempt, and reports whether its invalid response completed another
+// invalidSaveStep, which should be saved at once.
+func (g *invalidRequestGuard) complete(now time.Time, invalid bool) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.reserved--
-	if invalid {
-		g.timestamps = append(g.timestamps, now)
-		g.revision.Add(1)
-	}
 	g.prune(now)
+	if !invalid {
+		return false
+	}
+	g.timestamps = append(g.timestamps, now)
+	g.revision.Add(1)
+	g.recorded++
+	return g.recorded%invalidSaveStep == 0
 }
 
 // snapshot counts the invalid responses still in the window per unix second.

@@ -102,6 +102,7 @@ func scheduledRequest(t *testing.T, ctx context.Context, state *clientState, met
 		interaction:      interaction,
 		credentialScoped: !interaction && webhookCredentialKey(path, interaction) == "",
 		webhookKey:       webhookCredentialKey(path, interaction),
+		interactionKey:   map[bool]string{true: interactionTokenKey(path)}[interaction],
 		sharedLimitKey:   sharedResourceKey(method, MetricsPathFromBucket(bucketPath), path),
 	}
 	return request.WithContext(context.WithValue(request.Context(), requestMetadataContextKey, metadata))

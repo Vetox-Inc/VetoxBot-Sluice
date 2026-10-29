@@ -249,6 +249,10 @@ func TestClusterTLSRequiresAndValidatesPeerCertificates(t *testing.T) {
 	if config.proxy.InvalidRequestLimit != proxy.InvalidRequestSafetyLimit/32 {
 		t.Fatalf("cluster invalid-request limit = %d, want %d", config.proxy.InvalidRequestLimit, proxy.InvalidRequestSafetyLimit/32)
 	}
+	// Nodes share the egress the ceiling protects, as they share the invalid-request budget.
+	if want := max(1, proxy.DefaultMaxRefusalsPerSecond/32); config.proxy.MaxRefusalsPerSecond != want {
+		t.Fatalf("cluster refusal ceiling = %d, want %d", config.proxy.MaxRefusalsPerSecond, want)
+	}
 	withoutCertificate := config.clusterClientTLS.Clone()
 	withoutCertificate.Certificates = nil
 	withoutCertificate.ServerName = "127.0.0.1"
@@ -406,6 +410,35 @@ func TestCloudflareProbeIntervalDefaultsAndBounds(t *testing.T) {
 		}
 		if err != nil || config.proxy.CloudflareProbeInterval != test.want {
 			t.Errorf("CLOUDFLARE_PROBE_INTERVAL=%q: interval = %v, err = %v, want %v", test.value, config.proxy.CloudflareProbeInterval, err, test.want)
+		}
+	}
+}
+
+func TestMaxRefusalsPerSecondDefaultsAndBounds(t *testing.T) {
+	clearClusterEnvironment(t)
+	for _, test := range []struct {
+		value string
+		want  int
+		valid bool
+	}{
+		{"", proxy.DefaultMaxRefusalsPerSecond, true},
+		{"1", 1, true},
+		{"1000", 1000, true},
+		{"0", 0, false},
+		{"-1", 0, false},
+		{"1001", 0, false},
+		{"twenty", 0, false},
+	} {
+		t.Setenv("MAX_REFUSALS_PER_SECOND", test.value)
+		config, err := loadConfig()
+		if !test.valid {
+			if err == nil || !strings.Contains(err.Error(), "MAX_REFUSALS_PER_SECOND") {
+				t.Errorf("MAX_REFUSALS_PER_SECOND=%q: error = %v, want a MAX_REFUSALS_PER_SECOND error", test.value, err)
+			}
+			continue
+		}
+		if err != nil || config.proxy.MaxRefusalsPerSecond != test.want {
+			t.Errorf("MAX_REFUSALS_PER_SECOND=%q: limit = %d, err = %v, want %d", test.value, config.proxy.MaxRefusalsPerSecond, err, test.want)
 		}
 	}
 }

@@ -47,6 +47,10 @@ var (
 	WebhookShortCircuits prometheus.Counter
 	CloudflareBlocks     prometheus.Counter
 	EdgeRefusals         prometheus.Counter
+	// EdgeProvisionalPauses counts pauses taken on suspicion of a block, without a probe confirming it.
+	EdgeProvisionalPauses    prometheus.Counter
+	RefusalGuardTrips        prometheus.Counter
+	InteractionShortCircuits prometheus.Counter
 	// DeprecatedAPIRequests is labelled by version: v0 through v8, or none.
 	DeprecatedAPIRequests *prometheus.CounterVec
 
@@ -88,6 +92,9 @@ type metricSet struct {
 	webhookShortCircuits prometheus.Counter
 	cloudflareBlocks     prometheus.Counter
 	edgeRefusals         prometheus.Counter
+	provisionalPauses    prometheus.Counter
+	refusalTrips         prometheus.Counter
+	interactionShorts    prometheus.Counter
 	deprecatedAPI        *prometheus.CounterVec
 }
 
@@ -144,6 +151,18 @@ func newMetricSet(namespace string) metricSet {
 			Namespace: namespace, Name: "edge_refusals_total",
 			Help: "Responses from Discord's edge rather than Discord: a 429 or 403 without Via",
 		}),
+		provisionalPauses: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "edge_provisional_pauses_total",
+			Help: "Times outbound traffic was paused on suspicion of a Cloudflare block that no probe confirmed",
+		}),
+		refusalTrips: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "refusal_guard_trips_total",
+			Help: "Times upstream 401, 403 and 429 responses reached MAX_REFUSALS_PER_SECOND and requests were answered locally",
+		}),
+		interactionShorts: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "interaction_short_circuits_total",
+			Help: "Requests with an interaction token Discord rejected, answered without contacting Discord",
+		}),
 		deprecatedAPI: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "deprecated_api_requests_total",
 			Help: "Requests naming a deprecated or discontinued Discord API version, or none (Discord's default, v6)",
@@ -157,7 +176,7 @@ func newMetricSet(namespace string) metricSet {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		set.errors, set.warnings, set.failures, set.requests, set.queueWait, set.openConnections,
 		set.routedSent, set.routedReceived, set.routedError, set.webhookShortCircuits, set.cloudflareBlocks,
-		set.edgeRefusals, set.deprecatedAPI,
+		set.edgeRefusals, set.provisionalPauses, set.refusalTrips, set.interactionShorts, set.deprecatedAPI,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "invalid_requests",
 			Help: "Invalid Discord responses (401, 403, non-shared 429) in the rolling 10-minute window",
@@ -173,6 +192,24 @@ func newMetricSet(namespace string) metricSet {
 		}, func() float64 {
 			if p := activeProxy.Load(); p != nil {
 				return float64(p.invalidRequests.limit)
+			}
+			return 0
+		}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "upstream_refusals",
+			Help: "Upstream 401, 403 and 429 responses, shared-scope 429s included, in the last second",
+		}, func() float64 {
+			if p := activeProxy.Load(); p != nil {
+				return float64(p.refusals.count(time.Now()))
+			}
+			return 0
+		}),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "refusal_guard_blocked",
+			Help: "1 while the refusal guard answers every request locally",
+		}, func() float64 {
+			if p := activeProxy.Load(); p != nil && p.refusals.blocked(time.Now()) {
+				return 1
 			}
 			return 0
 		}),
@@ -249,6 +286,9 @@ func ConfigureMetrics(namespace string) {
 	WebhookShortCircuits = set.webhookShortCircuits
 	CloudflareBlocks = set.cloudflareBlocks
 	EdgeRefusals = set.edgeRefusals
+	EdgeProvisionalPauses = set.provisionalPauses
+	RefusalGuardTrips = set.refusalTrips
+	InteractionShortCircuits = set.interactionShorts
 	DeprecatedAPIRequests = set.deprecatedAPI
 }
 
