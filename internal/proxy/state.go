@@ -26,6 +26,9 @@ type savedState struct {
 	// EdgeBlockedUntil ends a confirmed Cloudflare block, in unix milliseconds.
 	EdgeBlockedUntil int64          `json:"edgeBlockedUntil,omitempty"`
 	Webhooks         []savedWebhook `json:"webhooks,omitempty"`
+	// RefusalGuardUntil ends the refusal guard's pressure after a trip, in unix milliseconds. Like
+	// any field added since 1.0.0 it is optional, so 1.0.0 still reads the file.
+	RefusalGuardUntil int64 `json:"refusalGuardUntil,omitempty"`
 }
 
 type savedWebhook struct {
@@ -69,6 +72,7 @@ func (p *Proxy) loadState() {
 		"invalidRequests", p.invalidRequests.restore(state.InvalidRequests, now),
 		"cloudflareBlocked", blocked,
 		"webhooks", p.webhooks.restore(state.Webhooks, now),
+		"refusalGuard", p.refusals.restore(time.UnixMilli(state.RefusalGuardUntil), now),
 	)
 }
 
@@ -95,6 +99,9 @@ func (p *Proxy) saveState() error {
 	}
 	if until := p.cloudflare.snapshot(now); !until.IsZero() {
 		state.EdgeBlockedUntil = until.UnixMilli()
+	}
+	if until := p.refusals.snapshot(now); !until.IsZero() {
+		state.RefusalGuardUntil = until.UnixMilli()
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -123,6 +130,15 @@ func (p *Proxy) saveState() error {
 	return os.Rename(temp.Name(), p.config.StateFile)
 }
 
+// saveStateSoon asks stateLoop to save at once rather than at its next tick: a pause starting or
+// changing, a step of invalid responses or a refusal-guard trip must survive a crash.
+func (p *Proxy) saveStateSoon() {
+	select {
+	case p.saveRequests <- struct{}{}:
+	default:
+	}
+}
+
 func (p *Proxy) stateLoop() {
 	defer p.wg.Done()
 	ticker := time.NewTicker(stateSaveInterval)
@@ -130,22 +146,25 @@ func (p *Proxy) stateLoop() {
 	saved := p.stateRevision()
 	lastError := ""
 	for {
+		urgent := false
 		select {
 		case <-ticker.C:
-			revision := p.stateRevision()
-			if revision == saved {
-				continue
-			}
-			if err := p.saveState(); err != nil {
-				if err.Error() != lastError {
-					lastError = err.Error()
-					logger.Warn("Could not save STATE_FILE", "file", p.config.StateFile, "error", err)
-				}
-				continue
-			}
-			saved, lastError = revision, ""
+		case <-p.saveRequests:
+			urgent = true
 		case <-p.ctx.Done():
 			return
 		}
+		revision := p.stateRevision()
+		if revision == saved && !urgent {
+			continue
+		}
+		if err := p.saveState(); err != nil {
+			if err.Error() != lastError {
+				lastError = err.Error()
+				logger.Warn("Could not save STATE_FILE", "file", p.config.StateFile, "error", err)
+			}
+			continue
+		}
+		saved, lastError = revision, ""
 	}
 }

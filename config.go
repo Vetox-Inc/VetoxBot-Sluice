@@ -28,7 +28,7 @@ var settingGroups = []struct {
 }{
 	{"Server and transport", []string{"LOG_LEVEL", "LOG_FORMAT", "BIND_IP", "PORT", "CLIENT_AUTH_SECRET", "OUTBOUND_IP", "REQUEST_TIMEOUT", "DISABLE_HTTP_2", "DISCORD_API_URL"}},
 	{"Scheduling and retries", []string{"QUEUE_TIMEOUT", "BOT_WIDE_ROUTES", "MAX_QUEUE_DEPTH", "MAX_IN_FLIGHT_REQUESTS", "MAX_RETRY_BODY_BYTES", "MAX_RETRY_CAPTURE_BYTES", "MAX_BEARER_COUNT", "MAX_CLIENT_STATES", "MAX_BUCKET_STATES"}},
-	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK", "CLOUDFLARE_BAN_DETECTION", "CLOUDFLARE_PROBE_INTERVAL", "STATE_FILE"}},
+	{"Global and invalid-request protection", []string{"BOT_RATELIMIT_OVERRIDES", "DISABLE_401_LOCK", "MAX_REFUSALS_PER_SECOND", "CLOUDFLARE_BAN_DETECTION", "CLOUDFLARE_PROBE_INTERVAL", "STATE_FILE"}},
 	{"Observability", []string{"ENABLE_METRICS", "METRICS_PORT", "METRICS_NAMESPACE", "ENABLE_PPROF", "PPROF_PORT"}},
 	{"Clustering", []string{"CLUSTER_PORT", "CLUSTER_PEER_PORT", "CLUSTER_ADVERTISE_ADDR", "CLUSTER_MAX_NODES", "CLUSTER_SECRET", "CLUSTER_CA_FILE", "CLUSTER_CERT_FILE", "CLUSTER_KEY_FILE", "CLUSTER_MEMBERS", "CLUSTER_DNS", "NODE_NAME"}},
 }
@@ -153,6 +153,10 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
+	maxRefusalsPerSecond, err := envInt("MAX_REFUSALS_PER_SECOND", proxy.DefaultMaxRefusalsPerSecond, 1, 1000)
+	if err != nil {
+		return appConfig{}, err
+	}
 	discordURL := envString("DISCORD_API_URL", proxy.DefaultDiscordURL)
 	if _, err := proxy.ParseDiscordURL(discordURL); err != nil {
 		return appConfig{}, fmt.Errorf("DISCORD_API_URL: %w", err)
@@ -186,6 +190,7 @@ func loadConfig() (appConfig, error) {
 	invalidRequestLimit := proxy.InvalidRequestSafetyLimit
 	if clusterEnabled {
 		invalidRequestLimit = max(1, proxy.InvalidRequestSafetyLimit/clusterMaxNodes)
+		maxRefusalsPerSecond = max(1, maxRefusalsPerSecond/clusterMaxNodes)
 	}
 	clientAuthSecret := os.Getenv("CLIENT_AUTH_SECRET")
 	if clientAuthSecret != "" && utf8.RuneCountInString(clientAuthSecret) < 32 {
@@ -227,6 +232,7 @@ func loadConfig() (appConfig, error) {
 			MaxRetryBodyBytes:       maxRetryBodyBytes,
 			MaxRetryCaptureBytes:    maxRetryCaptureBytes,
 			InvalidRequestLimit:     invalidRequestLimit,
+			MaxRefusalsPerSecond:    maxRefusalsPerSecond,
 			DiscordURL:              discordURL,
 			CloudflareBanDetection:  cloudflareBanDetection,
 			CloudflareProbeInterval: time.Duration(cloudflareProbeInterval) * time.Millisecond,

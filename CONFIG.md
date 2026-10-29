@@ -124,7 +124,7 @@ In stand-alone mode, Sluice stops new upstream attempts after recording 9,500 in
 
 In cluster mode, each node receives `max(1, floor(9500 / CLUSTER_MAX_NODES))` slots. With the default maximum of 32 nodes, that is 296 per node and at most 9,472 across the cluster. This static partition protects a shared-NAT budget only when every process using that egress is in this cluster, every node uses the same maximum, and the actual membership never exceeds it. Each node keeps its own rolling history across restarts in `STATE_FILE`.
 
-Sluice answers requests to a webhook that Discord reported as deleted (code 10015), or whose token it rejected (code 50027), itself for an hour, because Discord restricts IPs that keep calling such webhooks. Other 404s, such as a missing message, are never cached.
+Sluice answers requests to a webhook that Discord reported as deleted (code 10015), or whose token it rejected (code 50027), itself for an hour, because Discord restricts IPs that keep calling such webhooks. Other 404s, such as a missing message, are never cached. Likewise, once Discord answers an interaction token with a 401, as it does once the token expires, Sluice answers that token's further calls itself for 15 minutes, the token's whole life; they are counted in `sluice_interaction_short_circuits_total`.
 
 An `Authorization` header with a scheme other than `Bot`, `Bearer` or `Basic` gets a Discord-shaped `401` from Sluice on routes the credential authenticates, because Discord rejects every other scheme with a 401 that counts against the budget.
 
@@ -149,15 +149,27 @@ Limits must be positive integers. A bot-ID override takes precedence over a fing
 
 When `false`, the first ordinary authenticated 401 marks that credential invalid and later requests fail locally with Discord-shaped 401 responses. Interaction endpoints and webhook-token routes are excluded both ways: their 401s judge the token in the path rather than the credential, so they never mark it invalid and are never refused because of it. Default: `false`.
 
+Requests for the credential that are already queued when its first 401 arrives are answered the same way, since the lock is checked again before every attempt.
+
 Set this to `true` only if credentials can become valid again without changing their token. Cached validity is reclaimed after the credential has been inactive and unblocked for more than 10 minutes.
+
+### `MAX_REFUSALS_PER_SECOND`
+
+How many refusals this node may collect from upstream per second: every 401, 403 and 429, shared-scope 429s and edge refusals included, 404s not. The invalid-request budget bounds the 10-minute total, but a flood could spend it in a second, and shared-scope 429s are outside it although Discord's edge sees each one.
+
+Once the last second's refusals reach half the ceiling, Sluice sends a request only while those refusals plus the requests in flight stay below the ceiling; other requests wait for a slot within `QUEUE_TIMEOUT`, then get a `429` they can retry. This lasts 30 seconds past the last such second. When refusals reach the ceiling, Sluice answers every request itself for 2 seconds with a global `429` carrying `Retry-After` and `Generated-By-Proxy`, logs a warning, and counts the trip in `sluice_refusal_guard_trips_total` and each answer in `sluice_failures_total{reason="refusal_rate"}`. Only requests already in flight when refusals start can pass the ceiling, and only once. A trip is kept in `STATE_FILE`, so a restart resumes the 30 seconds of caution.
+
+In cluster mode each node gets `max(1, floor(MAX_REFUSALS_PER_SECOND / CLUSTER_MAX_NODES))`, as with the invalid-request budget. Valid values: 1 through 1,000. Default: `20`.
 
 ### `CLOUDFLARE_BAN_DETECTION`
 
 When `true`, a 429 or 403 without Discord's `Via` header means Discord's edge answered rather than Discord. Sluice passes that response to the client without retrying it, backs that client's route off for the response's `Retry-After` (60 seconds when it is absent, at most an hour), and requests `/api/v10/gateway` itself, with its own User-Agent and no credential, while other traffic continues:
 
 - If the edge refuses that request too, this IP is blocked. Every outbound request from this node pauses for the `Retry-After`, at most 25 hours, since Discord's edge can block an IP for a day; requests during the pause get a synthetic 429 without `Via`, so clients back off as they would for the real block; and `/sluice/health/upstream` reports 503. While the pause lasts, Sluice probes again every `CLOUDFLARE_PROBE_INTERVAL`.
-- If Discord answers it, the edge refused only that client's requests, for example over its User-Agent, and nothing else pauses. Sluice checks again no sooner than 30 seconds later.
-- If it gets no answer at all, which proves nothing, only the refused route backs off, and the next refusal checks again.
+- If Discord answers it, the edge refused only that client's requests, for example over its User-Agent, and nothing else pauses.
+- If it gets no answer, or one that is neither a refusal nor Discord's own success, the refusal stays unexplained: every outbound request pauses for a minute, provisionally.
+
+After a probe, whatever it found, the next refusal probes again no sooner than 30 seconds later. Refusals keep counting meanwhile: the tenth within those 30 seconds pauses every outbound request for a minute, provisionally, even if the probe found the edge clear or has not answered yet, since during a block the edge lets the odd request through. Each provisional pause logs a warning and counts in `sluice_edge_provisional_pauses_total`. So refusals cause at most one probe every 30 seconds, and a pause in force one every `CLOUDFLARE_PROBE_INTERVAL`, plus the confirming probe.
 
 Set `false` if an egress proxy between Sluice and Discord strips `Via`. Default: `true`.
 
@@ -167,7 +179,7 @@ While a Cloudflare block pauses outbound traffic, how often Sluice requests `/ap
 
 ### `STATE_FILE`
 
-Where Sluice keeps, across restarts, the memory that protects this IP: the invalid responses of the last 10 minutes, a Cloudflare block in progress, and the deleted or invalid webhooks of the last hour. Without it, a restart forgets what Discord still counts. Sluice reads the file at startup, rewrites it atomically every 5 seconds while something changes and again at shutdown. It holds no tokens: webhooks appear only as hashes. A file it cannot read is renamed with `.invalid` appended and never overwritten, and a saved block is not restored while `CLOUDFLARE_BAN_DETECTION` is `false`.
+Where Sluice keeps, across restarts, the memory that protects this IP: the invalid responses of the last 10 minutes, a Cloudflare pause in progress, the deleted or invalid webhooks of the last hour, and the refusal guard's caution after a trip. Without it, a restart forgets what Discord still counts. Sluice reads the file at startup and rewrites it atomically every 5 seconds while something changes, at once when a Cloudflare pause starts or changes, after every 100th invalid response and when the refusal guard trips, so even a `kill -9` loses little, and again at shutdown. Fields added since 1.0.0 are optional, so 1.0.0 still reads a file this version writes. It holds no tokens: webhooks appear only as hashes. A file it cannot read is renamed with `.invalid` appended and never overwritten, and a saved block is not restored while `CLOUDFLARE_BAN_DETECTION` is `false`.
 
 Default: `sluice/state-<PORT>.json` in the user cache directory, such as `~/.cache` on Linux and `%LocalAppData%` on Windows. An empty value keeps the state in memory only. Instances on one host that share a port on different addresses need a `STATE_FILE` each. A container keeps the default file across restarts but not when it is recreated, so point `STATE_FILE` at a volume, such as `/state/sluice.json` with a volume at `/state` that user 65532 can write.
 

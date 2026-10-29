@@ -248,7 +248,7 @@ func TestRateLimitResponseIsRetriedWithPOSTBody(t *testing.T) {
 	config.QueueTimeout = 2 * config.UpstreamTimeout
 	proxy := newTestProxy(t, config)
 	scheduled := &scheduledTransport{base: proxy.transport, proxy: proxy}
-	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, "/api/v10/channels/123/messages", strings.NewReader(payload), true)
+	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, "/api/v10/channels/123/messages", strings.NewReader(payload), false)
 
 	response, err := scheduled.RoundTrip(request)
 	if err != nil {
@@ -281,7 +281,7 @@ func TestRateLimitResponseIsRetriedWithoutBody(t *testing.T) {
 	config.QueueTimeout = 2 * config.UpstreamTimeout
 	proxy := newTestProxy(t, config)
 	scheduled := &scheduledTransport{base: proxy.transport, proxy: proxy}
-	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, "/api/v10/gateway", nil, true)
+	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, "/api/v10/gateway", nil, false)
 	response, err := scheduled.RoundTrip(request)
 	if err != nil {
 		t.Fatal(err)
@@ -791,7 +791,7 @@ func TestRateLimitRetryReentersLatestBucket(t *testing.T) {
 		err      error
 	}
 	results := make(chan result, 1)
-	request := scheduledRequest(t, context.Background(), state, http.MethodPost, path, nil, true)
+	request := scheduledRequest(t, context.Background(), state, http.MethodPost, path, nil, false)
 	go func() {
 		response, err := (&scheduledTransport{base: proxy.transport, proxy: proxy}).RoundTrip(request)
 		results <- result{response: response, err: err}
