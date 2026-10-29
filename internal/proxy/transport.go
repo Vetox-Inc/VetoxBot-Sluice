@@ -28,6 +28,8 @@ const (
 	// maxAttemptDuration caps an attempt however it progresses, so a slow upload cannot hold its
 	// bucket and an in-flight slot without end.
 	maxAttemptDuration = 10 * time.Minute
+	// maxInternalRetryAfter is the longest cooldown Sluice waits out to retry a 429 itself.
+	maxInternalRetryAfter = 5 * time.Second
 )
 
 var (
@@ -165,38 +167,40 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		return nil, fmt.Errorf("missing request scheduler metadata")
 	}
 	queuedAt := time.Now()
-	// Checked again before every attempt, so requests queued behind the one that found the
-	// webhook gone never reach Discord either.
-	shortCircuitWebhook := func(now time.Time) *http.Response {
-		if metadata.webhookKey == "" {
-			return nil
-		}
-		failure, blocked := t.proxy.webhooks.lookup(metadata.webhookKey, now)
-		if !blocked {
-			return nil
-		}
-		if t.proxy.config.EnableMetrics {
-			WebhookShortCircuits.Inc()
-		}
-		return failure.response(request)
-	}
-	// Checked again before every attempt too, so requests already queued when their resource
+	// Checked again before every attempt, so requests queued behind the one that found a webhook
+	// gone, an interaction token expired, the credential rejected, the edge blocking or a resource
 	// closed never reach Discord.
-	closedSharedLimit := func(now time.Time) *http.Response {
-		delay := t.proxy.sharedLimits.retryAfter(metadata.sharedLimitKey, now)
-		if delay <= 0 {
-			return nil
+	answerLocally := func(now time.Time) *http.Response {
+		if metadata.webhookKey != "" {
+			if failure, blocked := t.proxy.webhooks.lookup(metadata.webhookKey, now); blocked {
+				if t.proxy.config.EnableMetrics {
+					WebhookShortCircuits.Inc()
+				}
+				return failure.response(request)
+			}
 		}
-		ProxyFailures.WithLabelValues("shared_rate_limit_breaker").Inc()
-		return sharedLimitResponse(request, delay)
+		if metadata.interactionKey != "" {
+			if failure, blocked := t.proxy.interactionTokens.lookup(metadata.interactionKey, now); blocked {
+				if t.proxy.config.EnableMetrics {
+					InteractionShortCircuits.Inc()
+				}
+				return failure.response(request)
+			}
+		}
+		if pause := t.proxy.cloudflare.retryAfter(now); pause > 0 {
+			return cloudflarePauseResponse(request, pause)
+		}
+		if metadata.credentialScoped && metadata.state.validity.Load() == clientInvalid {
+			ProxyFailures.WithLabelValues("invalid_token").Inc()
+			return unauthorizedResponse(request)
+		}
+		if delay := t.proxy.sharedLimits.retryAfter(metadata.sharedLimitKey, now); delay > 0 {
+			ProxyFailures.WithLabelValues("shared_rate_limit_breaker").Inc()
+			return sharedLimitResponse(request, delay)
+		}
+		return nil
 	}
-	if response := shortCircuitWebhook(queuedAt); response != nil {
-		return response, nil
-	}
-	if pause := t.proxy.cloudflare.retryAfter(queuedAt); pause > 0 {
-		return cloudflarePauseResponse(request, pause), nil
-	}
-	if response := closedSharedLimit(queuedAt); response != nil {
+	if response := answerLocally(queuedAt); response != nil {
 		return response, nil
 	}
 	// Check before joining any rate-limit queue; reserve again immediately before
@@ -279,10 +283,6 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 	}()
 
-	if metadata.credentialScoped && metadata.state.validity.Load() == clientInvalid {
-		return unauthorizedResponse(request), nil
-	}
-
 	replay, err := newBodyReplay(request, t.proxy.config.MaxRetryBodyBytes, t.proxy.retryCapture)
 	if err != nil {
 		return nil, err
@@ -313,17 +313,51 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 		}
 
-		if response := shortCircuitWebhook(time.Now()); response != nil {
+		if response := answerLocally(time.Now()); response != nil {
 			return response, nil
 		}
-		if pause := t.proxy.cloudflare.retryAfter(time.Now()); pause > 0 {
-			return cloudflarePauseResponse(request, pause), nil
+		if delay, err := t.proxy.refusals.admit(queueContext); err != nil {
+			return missedTurn(err, bucket, false)
+		} else if delay > 0 {
+			ProxyFailures.WithLabelValues("refusal_rate").Inc()
+			return refusalGuardResponse(request, delay), nil
 		}
-		if response := closedSharedLimit(time.Now()); response != nil {
+		refusalSlotHeld := true
+		endRefusalSlot := func(refused bool) {
+			if refusalSlotHeld {
+				refusalSlotHeld = false
+				t.proxy.refusals.complete(time.Now(), refused)
+			}
+		}
+		// Deferred as well, so a panic below cannot keep the slot forever.
+		defer endRefusalSlot(false)
+		// The refusal guard may have kept the request waiting for a slot.
+		if response := answerLocally(time.Now()); response != nil {
+			endRefusalSlot(false)
 			return response, nil
 		}
+		// A resource whose closure has ended takes one trial request before the rest.
+		sharedDelay, trial := t.proxy.sharedLimits.admit(metadata.sharedLimitKey, time.Now())
+		if sharedDelay > 0 {
+			endRefusalSlot(false)
+			ProxyFailures.WithLabelValues("shared_rate_limit_breaker").Inc()
+			return sharedLimitResponse(request, sharedDelay), nil
+		}
+		settleTrial := func(response *http.Response, info rateLimitInfo) {
+			if !trial {
+				return
+			}
+			trial = false
+			if _, closed := t.proxy.sharedLimits.settleTrial(metadata.sharedLimitKey, time.Now(), response, info); closed {
+				ProxyFailures.WithLabelValues("shared_rate_limit_reclosed").Inc()
+			}
+		}
+		// A trial that never settles would keep its resource answering locally for good.
+		defer settleTrial(nil, rateLimitInfo{})
 		body, err := replay.body(attempt)
 		if err != nil {
+			endRefusalSlot(false)
+			settleTrial(nil, rateLimitInfo{})
 			return nil, fmt.Errorf("%w: %v", errRetryPreparation, err)
 		}
 		// An attempt is bounded by REQUEST_TIMEOUT without progress, not by the queue deadline, so
@@ -336,8 +370,19 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 				_ = body.Close()
 			}
 			endAttempt()
+			endRefusalSlot(false)
+			settleTrial(nil, rateLimitInfo{})
 			return nil, errInvalidRequestBudget
 		}
+		invalidReserved := true
+		completeInvalid := func(invalid bool) bool {
+			if !invalidReserved {
+				return false
+			}
+			invalidReserved = false
+			return t.proxy.invalidRequests.complete(time.Now(), invalid)
+		}
+		defer completeInvalid(false)
 		var started time.Time
 		if t.proxy.config.EnableMetrics {
 			started = time.Now()
@@ -347,7 +392,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		response, err := t.base.RoundTrip(outbound)
 		if err != nil {
-			t.proxy.invalidRequests.complete(time.Now(), false)
+			completeInvalid(false)
+			endRefusalSlot(false)
+			settleTrial(nil, rateLimitInfo{})
 			resultErr := contextCauseOrError(attemptContext, err)
 			endAttempt()
 			if response != nil && response.Body != nil {
@@ -356,7 +403,9 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			return nil, resultErr
 		}
 		if response == nil {
-			t.proxy.invalidRequests.complete(time.Now(), false)
+			completeInvalid(false)
+			endRefusalSlot(false)
+			settleTrial(nil, rateLimitInfo{})
 			endAttempt()
 			return nil, fmt.Errorf("upstream transport returned no response")
 		}
@@ -364,24 +413,31 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		if response.Body == nil {
 			response.Body = http.NoBody
 		}
-		t.proxy.invalidRequests.complete(time.Now(), invalidDiscordResponse(response))
+		if completeInvalid(invalidDiscordResponse(response)) {
+			t.proxy.saveStateSoon()
+		}
+		endRefusalSlot(isRefusal(response))
 
 		// An edge refusal never reached Discord: its headers say nothing about the bucket or the
 		// credential, and retrying it only prolongs a block.
 		edgeRefused := t.proxy.config.CloudflareBanDetection && isCloudflareBlock(response)
 		observedBucket := bucket
 		var info rateLimitInfo
+		retryAfter := ""
 		if edgeRefused {
 			if t.proxy.config.EnableMetrics {
 				EdgeRefusals.Inc()
 			}
+			settleTrial(nil, rateLimitInfo{})
 			bucket.blockUntil(time.Now().Add(min(cloudflarePause(response.Header), maxEdgeRouteBackoff)))
 			t.proxy.suspectEdgeBlock(response, metadata.metricsPath)
 		} else {
 			if metadata.webhookKey != "" {
 				t.proxy.webhooks.observe(metadata.webhookKey, response, time.Now())
 			}
-			retryAfter := ""
+			if metadata.interactionKey != "" {
+				t.proxy.interactionTokens.observeInteraction(metadata.interactionKey, response, time.Now())
+			}
 			if response.StatusCode == http.StatusTooManyRequests {
 				peeked, _ := peekBody(response)
 				retryAfter = discordRetryAfter(response.Header, peeked)
@@ -432,11 +488,13 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		sharedRefusal := response.StatusCode == http.StatusTooManyRequests && !edgeRefused && info.shared()
 		if sharedRefusal {
 			ProxyFailures.WithLabelValues("shared_rate_limit").Inc()
-			if closure, closed := t.proxy.sharedLimits.record(metadata.sharedLimitKey, info.retryAfter, time.Now()); closed {
+			// A trial's shared 429 closes the resource again in settleTrial.
+			if closure, closed := t.proxy.sharedLimits.record(metadata.sharedLimitKey, info.retryAfter, time.Now()); closed && !trial {
 				logger.Warn("Discord keeps refusing one resource with shared rate limits; answering its requests locally",
 					"method", metadata.metricsMethod, "route", metadata.metricsPath, "cooldown", closure.String())
 			}
 		}
+		settleTrial(response, info)
 		if response.StatusCode != http.StatusTooManyRequests || edgeRefused || sharedRefusal {
 			releaseBucket()
 			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
@@ -446,7 +504,14 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			queueCleanupPending = false
 			return response, nil
 		}
-		retryable, prepareErr := replay.prepareRetry()
+		// Sluice retries a 429 only where a retry cannot multiply refusals: never for an interaction
+		// or webhook token, whose clients follow up at once and whose limits Discord keeps per token,
+		// at most once per request, and only after a short cooldown Discord stated.
+		retryable := attempt == 0 && !metadata.interaction && metadata.webhookKey == "" && shortRetryAfter(retryAfter)
+		var prepareErr error
+		if retryable {
+			retryable, prepareErr = replay.prepareRetry()
+		}
 		if prepareErr != nil {
 			endAttempt()
 			_ = response.Body.Close()
@@ -460,6 +525,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 		}
 		if !retryable {
+			ProxyFailures.WithLabelValues("upstream_rate_limit").Inc()
 			releaseBucket()
 			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
 				endAttempt()
@@ -480,6 +546,16 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		bucketHeld = true
 	}
+}
+
+// shortRetryAfter reports whether Discord stated a cooldown for a 429 short enough for Sluice to
+// wait it out and retry, at most maxInternalRetryAfter.
+func shortRetryAfter(retryAfter string) bool {
+	if retryAfter == "" {
+		return false
+	}
+	delay, err := parseRateLimitSeconds(retryAfter)
+	return err == nil && delay <= maxInternalRetryAfter
 }
 
 func contextCauseOrError(ctx context.Context, err error) error {

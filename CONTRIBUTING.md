@@ -61,8 +61,9 @@ A change must not break these. If one has to bend, say so in the pull request.
   down, and an attempt ends once it goes `REQUEST_TIMEOUT` without progress, or after 10 minutes.
 - **All state is bounded.** Clients, buckets, queues, retained bodies, fail-fast entries, known applications and metric
   labels each have a cap.
-- **The invalid-request budget is never spent carelessly.** Sluice stops at 9,500 invalid responses per 10 minutes,
-  pauses entirely while Discord's edge blocks its IP, and remembers both across restarts.
+- **The invalid-request budget is never spent carelessly.** Sluice keeps refusals under `MAX_REFUSALS_PER_SECOND`,
+  never lets one request reach Discord more than twice, stops at 9,500 invalid responses per 10 minutes,
+  pauses entirely while Discord's edge blocks its IP, and remembers all of it across restarts.
 - **Requests reach Discord as sent:** path encoding, query, headers and body, apart from the documented rewrites.
 - **Responses Sluice generates are marked** with `generated-by-proxy: true` and `Via: 1.1 sluice`. The one exception is
   the Cloudflare-pause 429, which omits `Via` on purpose.

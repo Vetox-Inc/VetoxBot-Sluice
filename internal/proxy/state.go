@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -15,6 +16,10 @@ const (
 	stateSaveInterval = 5 * time.Second
 	// maxStateFileBytes is far above a full state, about 1 MiB with every webhook slot in use.
 	maxStateFileBytes = 16 << 20
+	stateTempPattern  = ".sluice-state-*"
+	// staleStateTempAge is how old a temp file must be before startup removes it: a younger one
+	// may belong to another instance saving into the same directory.
+	staleStateTempAge = time.Minute
 )
 
 // savedState is what STATE_FILE keeps across restarts: the memory that protects this IP from
@@ -26,6 +31,9 @@ type savedState struct {
 	// EdgeBlockedUntil ends a confirmed Cloudflare block, in unix milliseconds.
 	EdgeBlockedUntil int64          `json:"edgeBlockedUntil,omitempty"`
 	Webhooks         []savedWebhook `json:"webhooks,omitempty"`
+	// RefusalGuardUntil ends the refusal guard's pressure after a trip, in unix milliseconds. Like
+	// any field added since 1.0.0 it is optional, so 1.0.0 still reads the file.
+	RefusalGuardUntil int64 `json:"refusalGuardUntil,omitempty"`
 }
 
 type savedWebhook struct {
@@ -41,6 +49,7 @@ func (p *Proxy) stateRevision() uint64 {
 }
 
 func (p *Proxy) loadState() {
+	removeStaleStateTemps(p.config.StateFile, time.Now())
 	data, err := readStateFile(p.config.StateFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return
@@ -69,6 +78,7 @@ func (p *Proxy) loadState() {
 		"invalidRequests", p.invalidRequests.restore(state.InvalidRequests, now),
 		"cloudflareBlocked", blocked,
 		"webhooks", p.webhooks.restore(state.Webhooks, now),
+		"refusalGuard", p.refusals.restore(time.UnixMilli(state.RefusalGuardUntil), now),
 	)
 }
 
@@ -96,6 +106,9 @@ func (p *Proxy) saveState() error {
 	if until := p.cloudflare.snapshot(now); !until.IsZero() {
 		state.EdgeBlockedUntil = until.UnixMilli()
 	}
+	if until := p.refusals.snapshot(now); !until.IsZero() {
+		state.RefusalGuardUntil = until.UnixMilli()
+	}
 	data, err := json.Marshal(state)
 	if err != nil {
 		return err
@@ -104,7 +117,7 @@ func (p *Proxy) saveState() error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(directory, ".sluice-state-*")
+	temp, err := os.CreateTemp(directory, stateTempPattern)
 	if err != nil {
 		return err
 	}
@@ -120,7 +133,48 @@ func (p *Proxy) saveState() error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temp.Name(), p.config.StateFile)
+	if err := os.Rename(temp.Name(), p.config.StateFile); err != nil {
+		return err
+	}
+	p.syncStateDirectory(directory)
+	return nil
+}
+
+// syncStateDirectory makes the rename itself durable, so a power loss cannot bring back the
+// previous file. It never fails a save, and says so only once; Windows cannot sync a directory.
+func (p *Proxy) syncStateDirectory(directory string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	dir, err := os.Open(directory)
+	if err == nil {
+		err = dir.Sync()
+		if closeErr := dir.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil && p.directorySyncWarned.CompareAndSwap(false, true) {
+		logger.Warn("Could not sync STATE_FILE's directory; the file is saved, but a power loss may undo the last save", "directory", directory, "error", err)
+	}
+}
+
+// removeStaleStateTemps deletes temp files a process that died mid-save left next to STATE_FILE.
+func removeStaleStateTemps(stateFile string, now time.Time) {
+	names, _ := filepath.Glob(filepath.Join(filepath.Dir(stateFile), stateTempPattern))
+	for _, name := range names {
+		if info, err := os.Lstat(name); err == nil && info.Mode().IsRegular() && now.Sub(info.ModTime()) > staleStateTempAge {
+			_ = os.Remove(name)
+		}
+	}
+}
+
+// saveStateSoon asks stateLoop to save at once rather than at its next tick: a pause starting or
+// changing, a step of invalid responses or a refusal-guard trip must survive a crash.
+func (p *Proxy) saveStateSoon() {
+	select {
+	case p.saveRequests <- struct{}{}:
+	default:
+	}
 }
 
 func (p *Proxy) stateLoop() {
@@ -128,24 +182,33 @@ func (p *Proxy) stateLoop() {
 	ticker := time.NewTicker(stateSaveInterval)
 	defer ticker.Stop()
 	saved := p.stateRevision()
-	lastError := ""
+	failing := false
 	for {
+		urgent := false
 		select {
 		case <-ticker.C:
-			revision := p.stateRevision()
-			if revision == saved {
-				continue
-			}
-			if err := p.saveState(); err != nil {
-				if err.Error() != lastError {
-					lastError = err.Error()
-					logger.Warn("Could not save STATE_FILE", "file", p.config.StateFile, "error", err)
-				}
-				continue
-			}
-			saved, lastError = revision, ""
+		case <-p.saveRequests:
+			urgent = true
 		case <-p.ctx.Done():
 			return
 		}
+		revision := p.stateRevision()
+		if revision == saved && !urgent {
+			continue
+		}
+		if err := p.saveState(); err != nil {
+			// Said once, when saving starts to fail: every try names a new temporary file, so
+			// no two errors read the same.
+			if !failing {
+				failing = true
+				logger.Warn("Could not save STATE_FILE; trying again every few seconds", "file", p.config.StateFile, "error", err)
+			}
+			continue
+		}
+		if failing {
+			failing = false
+			logger.Info("Saving STATE_FILE works again", "file", p.config.StateFile)
+		}
+		saved = revision
 	}
 }

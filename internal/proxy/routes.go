@@ -352,6 +352,18 @@ func webhookCredentialKey(path string, interaction bool) string {
 	return hex.EncodeToString(digest[:16])
 }
 
+// interactionTokenKey identifies the token of an interaction route, a follow-up under
+// /webhooks/{application}/{token} or a callback under /interactions/{id}/{token}, by a hash, so the
+// token itself is never kept.
+func interactionTokenKey(path string) string {
+	parts := cleanAPIPath(path)
+	if len(parts) < 3 || parts[0] != majorWebhooks && parts[0] != majorInteractions {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(parts[2]))
+	return hex.EncodeToString(digest[:16])
+}
+
 // sharedResourceKey names, as closely as a path shows it, the resource a shared-scope 429 limits:
 // the method and route with every identifier collapsed, plus the channel, guild or webhook acted
 // on. Discord does not say which resource a shared limit covers, and a follow-up's path names its
