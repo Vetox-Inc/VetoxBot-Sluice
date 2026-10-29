@@ -173,4 +173,9 @@ func TestSharedResourceKeyLeavesTokensOut(t *testing.T) {
 	if key(http.MethodPost, "/api/v10/channels/1/messages") == key(http.MethodGet, "/api/v10/channels/1/messages") {
 		t.Error("methods share a key")
 	}
+	// A client that swapped a webhook's ID and token puts the token where the ID belongs.
+	swapped := key(http.MethodPost, "/api/v10/webhooks/"+interactionTokenPrefix+"swapped/123456789012345678")
+	if strings.Contains(swapped, interactionTokenPrefix) {
+		t.Errorf("key %q carries a token sent in the ID slot", swapped)
+	}
 }

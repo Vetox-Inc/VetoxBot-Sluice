@@ -44,8 +44,9 @@ groups:
           description: '{{ $value | printf "%.0f" }} requests in 10 minutes failed before Discord answered.'
 
       # A limit of Sluice's own, or the invalid-request budget, is used up and requests get a 503.
+      # Named one by one: shared_rate_limit also ends in _limit but is Discord's own 429, passed on.
       - alert: SluiceRefusingRequests
-        expr: sum by (reason) (increase(sluice_failures_total{reason=~".+_limit|invalid_request_budget"}[10m])) > 0
+        expr: sum by (reason) (increase(sluice_failures_total{reason=~"bucket_limit|client_limit|in_flight_limit|retry_capture_limit|invalid_request_budget"}[10m])) > 0
         labels:
           severity: critical
         annotations:

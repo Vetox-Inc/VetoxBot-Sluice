@@ -180,7 +180,7 @@ default. Their names start with `sluice_`, or with whatever `METRICS_NAMESPACE` 
 | `sluice_requests` | `method`, `status`, `route`, `clientId` | Histogram of Discord responses, one per attempt |
 | `sluice_queue_wait_seconds` | `method`, `route` | Wait for the bucket and global limit, until a request is sent or Sluice answers it |
 | `sluice_open_connections` | `method`, `route` | Requests being handled now, not TCP sockets |
-| `sluice_failures_total` | `reason` | Requests Sluice answered with an error of its own, or whose client left |
+| `sluice_failures_total` | `reason` | Requests Sluice answered with an error of its own, or whose client left; `shared_rate_limit` counts Discord's own shared-scope 429s, passed on unretried |
 | `sluice_error` | none | Errors logged, which a failed request is not |
 | `sluice_warnings_total` | none | Warnings logged |
 | `sluice_resource_usage`, `sluice_resource_limit` | `resource` | Clients, bearer tokens, buckets, requests in flight and retry copies: in use, and their `MAX_` limit |

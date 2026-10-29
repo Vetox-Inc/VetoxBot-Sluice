@@ -380,7 +380,7 @@ func sharedResourceKey(method, route, path string) string {
 	if parts := cleanAPIPath(path); len(parts) >= 2 {
 		switch parts[0] {
 		case majorChannels, majorGuilds, majorWebhooks:
-			major = parts[0] + ":" + parts[1]
+			major = parts[0] + ":" + identifierSlot(parts[0], parts[1])
 		}
 	}
 	return method + " " + route + " " + major

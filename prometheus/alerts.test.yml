@@ -27,6 +27,9 @@ tests:
         values: '0+1x60'
       - series: 'sluice_failures_total{instance="a", job="sluice", reason="invalid_token"}'
         values: '0+0x60'
+      # Discord's own shared-scope 429s, passed through: routine for reactions.
+      - series: 'sluice_failures_total{instance="a", job="sluice", reason="shared_rate_limit"}'
+        values: '0+2x60'
       - series: 'sluice_resource_usage{instance="a", job="sluice", resource="bucket_states"}'
         values: '9000+0x60'
       - series: 'sluice_resource_limit{instance="a", job="sluice", resource="bucket_states"}'
