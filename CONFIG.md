@@ -163,7 +163,7 @@ Set `false` if an egress proxy between Sluice and Discord strips `Via`. Default:
 
 ### `CLOUDFLARE_PROBE_INTERVAL`
 
-While a Cloudflare block pauses outbound traffic, how often Sluice requests `/api/v10/gateway` itself, as it does to confirm a block, to learn whether the block still holds. An answer from Discord ends the pause early; a refusal re-arms it from that refusal's `Retry-After`, never shortening it; and no answer at all leaves it as it is. One probe runs at a time, and client requests stay paused throughout. `0` turns the probe off, so every pause lasts its whole `Retry-After`. Valid values: `0`, or 1,000 through 86,400,000 milliseconds. Default: `900000` (15 minutes).
+While a Cloudflare block pauses outbound traffic, how often Sluice requests `/api/v10/gateway` itself, as it does to confirm a block, to learn whether the block still holds. Discord's own success (a 2xx with Discord's `Via`) twice in a row, the second probe a minute after the first, ends the pause early: during a ban the edge lets the odd request through, so one is not enough, and any other non-refusal proves nothing and leaves the pause as it is. A refusal re-arms it from that refusal's `Retry-After`, never shortening it; and no answer at all leaves it as it is. One probe runs at a time, and client requests stay paused throughout. `0` turns the probe off, so every pause lasts its whole `Retry-After`. Valid values: `0`, or 1,000 through 86,400,000 milliseconds. Default: `900000` (15 minutes).
 
 ### `STATE_FILE`
 

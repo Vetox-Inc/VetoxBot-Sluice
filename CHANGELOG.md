@@ -21,6 +21,13 @@ and [Semantic Versioning](https://semver.org/). Earlier history is in nirn-proxy
 - `CLOUDFLARE_PROBE_INTERVAL`: while a block pauses traffic, Sluice probes the edge every 15 minutes by default,
   ending the pause early once Discord answers and re-arming it while the edge still refuses.
 
+### Fixed
+
+- A pause in force ends only after two probes in a row get Discord's own success, the second a minute after the
+  first: during a ban the edge lets the odd request through, and one such probe resumed every client. After an early
+  end, the next refusal can re-arm the pause at once. An answer that is not a refusal but not Discord's success
+  either, such as a 5xx or an error page without `Via`, no longer counts as the block lifting.
+
 ## 1.0.0 - 2026-10-03
 
 The first release as Sluice, continuing nirn-proxy 1.3.3 on Melonly-Moderation's engine rewrite.
