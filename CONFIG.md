@@ -197,7 +197,7 @@ Enables Prometheus metrics and serves them on `/metrics`. When `false`, Sluice d
 
 ### Health endpoints
 
-`/sluice/healthz` is liveness: 200 unless the proxy is draining for shutdown, shutting down, or the cluster exceeds `CLUSTER_MAX_NODES`. nirn-proxy's `/nirn/healthz` still answers the same way, but it is deprecated and will be removed in Sluice 2.0; Sluice logs a warning the first time it is used. `/sluice/health/upstream` answers 503 while a Cloudflare block is active or at least 80% of the invalid-request budget is used; use it for alerting, not for restarts.
+`/sluice/healthz` is liveness: 200 unless the proxy is draining for shutdown, shutting down, or the cluster exceeds `CLUSTER_MAX_NODES`. nirn-proxy's `/nirn/healthz` still answers the same way, but it is deprecated and will be removed in Sluice 2.0; Sluice logs a warning the first time it is used. `/sluice/health/upstream` answers 503 while a Cloudflare block is active or at least 80% of the invalid-request budget is used; use it for alerting, not for restarts. Its 200 carries `Sluice-Edge-Clear-For`, the whole seconds since the last edge pause ended or, if none has since, since the node started.
 
 On `SIGTERM` or `SIGINT`, Sluice drains: liveness answers 503, the node leaves its cluster, the listeners close, and requests already admitted get up to 15 seconds to finish (in a cluster, including up to 5 to leave it) before the rest are cancelled with `503`. A second signal stops Sluice at once. Give your process manager at least 20 seconds to stop Sluice, for example `--stop-timeout 20` for Docker or `kill_timeout: 20000` for PM2.
 
