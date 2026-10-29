@@ -874,3 +874,109 @@ func TestShutdownReleasesQueuedRequests(t *testing.T) {
 		t.Fatal("queued request was not released at shutdown")
 	}
 }
+
+// edgeProbeAnswers serves the paused-edge probe from answers, one per probe, repeating the last.
+func edgeProbeAnswers(answers ...func(*http.Request) *http.Response) http.RoundTripper {
+	var next atomic.Int64
+	return roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		i := min(int(next.Add(1))-1, len(answers)-1)
+		return answers[i](request), nil
+	})
+}
+
+func discordGateway(request *http.Request) *http.Response {
+	return jsonResponse(request, http.StatusOK, `{"url": "wss://gateway.discord.gg"}`)
+}
+
+func refused(request *http.Request) *http.Response { return edgeRefusal(request, "72000") }
+
+func TestOneClearProbeDoesNotLiftAPause(t *testing.T) {
+	config := testConfig(edgeProbeAnswers(discordGateway, refused))
+	config.CloudflareBanDetection = true
+	proxy := newTestProxy(t, config)
+	proxy.cloudflare.settle(time.Now(), edgeBlocked, 20*time.Hour)
+
+	proxy.probePausedEdge()
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 19*time.Hour {
+		t.Fatalf("one probe the edge let through cut the pause to %v", pause)
+	}
+	if !proxy.cloudflare.confirming() {
+		t.Fatal("a clear probe during a pause did not ask for a confirming probe")
+	}
+	proxy.probePausedEdge()
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 19*time.Hour || proxy.cloudflare.confirming() {
+		t.Fatalf("a refusal after one clear probe left pause %v, confirming %v", pause, proxy.cloudflare.confirming())
+	}
+}
+
+func TestTwoClearProbesLiftAPauseWithoutHoldingOffDetection(t *testing.T) {
+	output := captureLogs(t)
+	config := testConfig(edgeProbeAnswers(discordGateway))
+	config.CloudflareBanDetection = true
+	proxy := newTestProxy(t, config)
+	proxy.cloudflare.settle(time.Now(), edgeBlocked, 20*time.Hour)
+
+	proxy.probePausedEdge()
+	proxy.probePausedEdge()
+	if pause := proxy.cloudflare.retryAfter(time.Now()); pause != 0 {
+		t.Fatalf("two clear probes left a pause of %v", pause)
+	}
+	// The edge let two probes through, not the IP's whole traffic: the next refusal must be
+	// able to re-arm the pause at once.
+	if !proxy.cloudflare.suspect(time.Now()) {
+		t.Fatal("after an early lift the next refusal cannot probe for edgeProbeInterval")
+	}
+	logs := output.String()
+	if strings.Count(logs, "no longer blocks this IP") != 1 || !strings.Contains(logs, "confirming") {
+		t.Fatalf("lift warnings missing or repeated:\n%s", logs)
+	}
+}
+
+func TestOnlyDiscordsOwnAnswerClearsAPause(t *testing.T) {
+	inconclusive := map[string]func(*http.Request) *http.Response{
+		"503 without Via": func(r *http.Request) *http.Response {
+			return testResponse(r, http.StatusServiceUnavailable, http.Header{}, http.NoBody)
+		},
+		"404 without Via": func(r *http.Request) *http.Response {
+			return testResponse(r, http.StatusNotFound, http.Header{}, http.NoBody)
+		},
+		"520 from Cloudflare": func(r *http.Request) *http.Response {
+			return testResponse(r, 520, testHeaders(map[string]string{"Server": "cloudflare"}), http.NoBody)
+		},
+		"200 without Via": func(r *http.Request) *http.Response {
+			return testResponse(r, http.StatusOK, http.Header{}, http.NoBody)
+		},
+		"Discord's own 500": func(r *http.Request) *http.Response {
+			return jsonResponse(r, http.StatusInternalServerError, `{}`)
+		},
+	}
+	for name, answer := range inconclusive {
+		t.Run(name, func(t *testing.T) {
+			config := testConfig(edgeProbeAnswers(answer))
+			config.CloudflareBanDetection = true
+			proxy := newTestProxy(t, config)
+			proxy.cloudflare.settle(time.Now(), edgeBlocked, 20*time.Hour)
+			for range 3 {
+				proxy.probePausedEdge()
+			}
+			if pause := proxy.cloudflare.retryAfter(time.Now()); pause < 19*time.Hour || proxy.cloudflare.confirming() {
+				t.Fatalf("%s left pause %v, confirming %v", name, pause, proxy.cloudflare.confirming())
+			}
+		})
+	}
+}
+
+func TestPausedProbeCadenceShortensOnlyToConfirm(t *testing.T) {
+	var guard cloudflareGuard
+	if next := guard.nextProbe(15 * time.Minute); next != 15*time.Minute {
+		t.Fatalf("an unconfirmed pause probes after %v", next)
+	}
+	guard.settle(time.Now(), edgeBlocked, time.Hour)
+	guard.settle(time.Now(), edgeClear, 0)
+	if next := guard.nextProbe(15 * time.Minute); next != edgeConfirmDelay {
+		t.Fatalf("a clear probe is confirmed after %v, want %v", next, edgeConfirmDelay)
+	}
+	if next := guard.nextProbe(time.Second); next != time.Second {
+		t.Fatalf("a probe interval shorter than the confirmation delay was lengthened to %v", next)
+	}
+}
