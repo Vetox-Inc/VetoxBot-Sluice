@@ -383,8 +383,12 @@ type cloudflareGuard struct {
 	probedAt   time.Time
 	suspicions int
 	// clears counts clear probes in a row during the pause in force.
-	clears   int
-	revision atomic.Uint64
+	clears int
+	// clearSince is when a pause last ended early, or when this node started: before that it
+	// cannot tell whether the edge let it through. A pause that ran its course ends at
+	// blockedUntil instead.
+	clearSince time.Time
+	revision   atomic.Uint64
 }
 
 type suspicion uint8
@@ -479,6 +483,7 @@ func (g *cloudflareGuard) settle(now time.Time, verdict edgeVerdict, pause time.
 		}
 		g.clears = 0
 		g.blockedUntil = time.Time{}
+		g.clearSince = now
 		g.probedAt = time.Time{}
 		g.revision.Add(1)
 		return true
@@ -536,6 +541,22 @@ func (g *cloudflareGuard) restore(until, now time.Time) bool {
 	defer g.mu.Unlock()
 	g.blockedUntil = until
 	return true
+}
+
+// clearFor reports how long this node has run without an edge pause, and false while one is in
+// force. Clients waiting out a ban use it to tell a lift that holds from a leak the next
+// refusal ends, without probing Discord themselves.
+func (g *cloudflareGuard) clearFor(now time.Time) (time.Duration, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.blockedUntil.After(now) {
+		return 0, false
+	}
+	since := g.clearSince
+	if g.blockedUntil.After(since) {
+		since = g.blockedUntil
+	}
+	return max(now.Sub(since), 0), true
 }
 
 func (g *cloudflareGuard) retryAfter(now time.Time) time.Duration {
