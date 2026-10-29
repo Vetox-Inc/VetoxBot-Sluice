@@ -271,8 +271,10 @@ Set it to `false` when something between Sluice and Discord removes `Via`, such 
 ### `CLOUDFLARE_PROBE_INTERVAL`
 
 How often, while a Cloudflare block pauses traffic, Sluice asks the edge whether the block still holds, with the same
-request it confirmed the block with. An answer from Discord ends the pause there and then, so a block that lifts
-early costs at most one interval. A refusal re-arms the pause from its own `Retry-After` and never shortens it. No
+request it confirmed the block with. Discord's own success (a 2xx with Discord's `Via`) twice in a row, the second check a minute after the first, ends
+the pause: during a ban the edge lets the odd request through, so one is not enough, and any other answer that is not
+a refusal proves nothing and leaves the pause as it is. A block that lifts early costs at most one interval and a
+minute. A refusal re-arms the pause from its own `Retry-After` and never shortens it. No
 answer at all leaves the pause as it is. One check runs at a time, and client requests stay paused throughout.
 
 `0` turns the checks off, and a pause then lasts its whole `Retry-After`. A value under 1,000 milliseconds is refused,
